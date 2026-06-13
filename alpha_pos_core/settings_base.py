@@ -41,6 +41,15 @@ if not DEBUG and SECRET_KEY == _DEV_SECRET_KEY:
         "real SECRET_KEY (production) or DEBUG=True (development)."
     )
 
+# Dedicated signing key for public QR self-order table tokens (printed once on
+# table stickers). notifications/services/qr_order_service.py reads this and falls
+# back to SECRET_KEY when blank. Set a STABLE value (e.g. via config_store on the
+# desktop) so rotating SECRET_KEY — or a self-update that regenerates it — does NOT
+# invalidate every already-printed sticker. Blank by default = signed with
+# SECRET_KEY (the historic behaviour; a factory reset then correctly kills old
+# stickers for resale).
+QR_SIGNING_KEY = os.environ.get('QR_SIGNING_KEY', '')
+
 if DEBUG:
     ALLOWED_HOSTS = ['*']
 else:
