@@ -89,7 +89,14 @@ class ShiftTemplateService:
 class ShiftService:
     @staticmethod
     def list(page=1, per_page=20, user_id=None, status=None, date_from=None, date_to=None):
-        qs = ShiftRepository.get_all().select_related('user', 'shift_template')
+        # _serialize_shift reads reconciliation(+reconciled_by) per row. select_related
+        # on a reverse one-to-one does NOT cache ABSENCE (Django re-queries per shift
+        # that has no reconciliation -> O(rows)), so prefetch it instead: one extra
+        # query for the whole page that DOES cache the empty result. (The rich metrics
+        # are likewise batched into O(1) by _batch_list_extras.)
+        qs = (ShiftRepository.get_all()
+              .select_related('user', 'shift_template')
+              .prefetch_related('reconciliation', 'reconciliation__reconciled_by'))
 
         if user_id:
             qs = qs.filter(user_id=user_id)
@@ -101,7 +108,15 @@ class ShiftService:
             qs = qs.filter(start_time__lte=date_to)
 
         page_obj, paginator = ShiftRepository.paginate(qs, page, per_page)
-        data = [ShiftService._serialize_shift(s) for s in page_obj]
+        shifts = list(page_obj)
+        # Precompute the rich list metrics for the whole page in O(1) queries,
+        # then attach per row — instead of running aggregates per shift (N+1).
+        # One shared `now` so a live row's total_revenue window (in _serialize_shift)
+        # and its batched payment_mix window (in _batch_list_extras) are identical.
+        now = timezone.now()
+        extras_map = ShiftService._batch_list_extras(shifts, now=now)
+        data = [ShiftService._serialize_shift(s, extras=extras_map.get(s.id), now=now)
+                for s in shifts]
         return ServiceResponse.success(data={
             'shifts': data,
             'pagination': {
@@ -497,14 +512,186 @@ class ShiftService:
             }
 
     @staticmethod
-    def _serialize_shift(shift, detail=False):
+    def _batch_list_extras(shifts, now=None):
+        """Per-shift LIST metrics for a WHOLE PAGE in O(1) queries (not O(rows)).
+
+        The manager dashboard shows these on every shift card: payment mix
+        (amount + order count per tender), items sold, avg prep, peak hour, drawer
+        expenses, and cancelled-order figures. Order has no shift FK, so orders
+        attribute to a shift by cashier_id + the shift's [start_time, end] window
+        (end = now for a live ACTIVE shift), bucketed in Python. A FIXED set of
+        grouped queries runs for the entire page regardless of row count.
+
+        Returns {shift_id: {expenses_total, cancelled_orders_count,
+        cancelled_orders_value, payment_mix, items_sold, avg_prep_seconds,
+        peak_hour}}. net_revenue is added by _serialize_shift, which knows the
+        row's live/stored total_revenue. Best-effort: on any failure returns the
+        all-empty map so the list still renders its base fields.
+        """
+        from collections import defaultdict
+        from base.models import OrderItem
+        from cashbox.models import CashboxExpense
+
+        zero = Decimal('0.00')
+
+        def _empty():
+            return {
+                'expenses_total': '0.00',
+                'cancelled_orders_count': 0,
+                'cancelled_orders_value': '0.00',
+                'payment_mix': {},
+                'items_sold': 0,
+                'avg_prep_seconds': None,
+                'peak_hour': None,
+            }
+
+        out = {s.id: _empty() for s in shifts}
+        valid = [s for s in shifts if s.start_time]
+        if not valid:
+            return out
+        try:
+            now = now or timezone.now()
+            # Per-cashier window list sorted by start. Each window END matches
+            # _serialize_shift's effective_end EXACTLY using the SAME shared `now`,
+            # so the paid_at-bucketed payment_mix reconciles to the row's
+            # total_revenue by construction. Only a genuinely live shift (ACTIVE +
+            # no end_time) extends to now; any OTHER null-end shift (e.g. ABANDONED)
+            # gets a degenerate window so it can't scoop a later shift's orders
+            # while its own serialized totals read frozen-zero.
+            by_cashier = defaultdict(list)   # cashier_id -> [(start, end, shift_id)]
+            for s in valid:
+                if s.end_time:
+                    end = s.end_time
+                elif s.status == 'ACTIVE':
+                    end = now
+                else:
+                    end = s.start_time       # non-active, no end_time -> empty window
+                by_cashier[s.user_id].append((s.start_time, end, s.id))
+            for cid in by_cashier:
+                by_cashier[cid].sort(key=lambda t: t[0])
+
+            def bucket(cid, ts):
+                if ts is None:
+                    return None
+                found = None
+                for start, end, sid in by_cashier.get(cid, ()):  # sorted asc
+                    if start <= ts <= end:
+                        found = sid                              # last match = latest start
+                return found
+
+            cashier_ids = list(by_cashier.keys())
+            min_start = min(s.start_time for s in valid)
+            max_end = max((s.end_time or now) for s in valid)
+
+            # Payment mix + counts: paid, non-cancelled, bucketed by paid_at so the
+            # mix reconciles to total_revenue (which is itself paid_at-based).
+            mix_acc = defaultdict(lambda: defaultdict(lambda: [Decimal('0.00'), 0]))
+            money_rows = Order.objects.filter(
+                is_deleted=False, cashier_id__in=cashier_ids, is_paid=True,
+                paid_at__gte=min_start, paid_at__lte=max_end,
+            ).exclude(status='CANCELED').values_list(
+                'cashier_id', 'paid_at', 'total_amount', 'payment_method')
+            for cid, paid_at, amt, method in money_rows:
+                sid = bucket(cid, paid_at)
+                if sid is None:
+                    continue
+                slot = mix_acc[sid][method or 'CASH']   # NULL/legacy method -> CASH
+                slot[0] += (amt or zero)
+                slot[1] += 1
+
+            # Cancelled orders (count + lost value) by created_at.
+            canc_cnt = defaultdict(int)
+            canc_val = defaultdict(lambda: Decimal('0.00'))
+            for cid, created_at, amt in Order.objects.filter(
+                is_deleted=False, cashier_id__in=cashier_ids, status='CANCELED',
+                created_at__gte=min_start, created_at__lte=max_end,
+            ).values_list('cashier_id', 'created_at', 'total_amount'):
+                sid = bucket(cid, created_at)
+                if sid is None:
+                    continue
+                canc_cnt[sid] += 1
+                canc_val[sid] += (amt or zero)
+
+            # Peak hour + avg prep over the SOLD set (non-cancelled) by created_at.
+            hour_cnt = defaultdict(lambda: defaultdict(int))
+            prep_sum = defaultdict(float)
+            prep_n = defaultdict(int)
+            for cid, created_at, ready_at in Order.objects.filter(
+                is_deleted=False, cashier_id__in=cashier_ids,
+                created_at__gte=min_start, created_at__lte=max_end,
+            ).exclude(status='CANCELED').values_list(
+                'cashier_id', 'created_at', 'ready_at'):
+                sid = bucket(cid, created_at)
+                if sid is None:
+                    continue
+                # localtime() -> project-tz wall-clock hour (matches analytics).
+                hour_cnt[sid][timezone.localtime(created_at).hour] += 1
+                if ready_at is not None:
+                    # clamp: clock skew across synced branches can make ready_at < created_at
+                    prep_sum[sid] += max(0.0, (ready_at - created_at).total_seconds())
+                    prep_n[sid] += 1
+
+            # Items sold: line quantities on non-cancelled orders, via the order's window.
+            units = defaultdict(int)
+            for cid, created_at, qty in OrderItem.objects.filter(
+                is_deleted=False, order__is_deleted=False,
+                order__cashier_id__in=cashier_ids,
+                order__created_at__gte=min_start, order__created_at__lte=max_end,
+            ).exclude(order__status='CANCELED').values_list(
+                'order__cashier_id', 'order__created_at', 'quantity'):
+                sid = bucket(cid, created_at)
+                if sid is None:
+                    continue
+                units[sid] += int(qty or 0)
+
+            # Drawer expenses: CashboxExpense HAS a shift FK -> DB GROUP BY, no bucketing.
+            exp_total = defaultdict(lambda: Decimal('0.00'))
+            for r in (CashboxExpense.objects
+                      .filter(shift_id__in=list(out.keys()), is_deleted=False)
+                      .values('shift_id')
+                      .annotate(t=Coalesce(Sum('amount'), zero, output_field=DecimalField()))):
+                exp_total[r['shift_id']] = r['t'] or zero
+
+            def money(d):
+                return str((d or zero).quantize(zero))   # always 2dp, e.g. "100.00"
+
+            for sid in out:
+                pm = {m: {'amount': money(v[0]), 'count': v[1]}
+                      for m, v in mix_acc.get(sid, {}).items()}
+                hc = hour_cnt.get(sid)
+                if hc:
+                    # busiest hour; tie -> earliest hour (matches order_by('-c','hour')).
+                    hour, cnt = min(hc.items(), key=lambda kv: (-kv[1], kv[0]))
+                    peak_hour = {'hour': int(hour), 'orders': int(cnt)}
+                else:
+                    peak_hour = None
+                n = prep_n.get(sid)
+                out[sid] = {
+                    'expenses_total': money(exp_total.get(sid)),
+                    'cancelled_orders_count': int(canc_cnt.get(sid, 0)),
+                    'cancelled_orders_value': money(canc_val.get(sid)),
+                    'payment_mix': pm,
+                    'items_sold': int(units.get(sid, 0)),
+                    'avg_prep_seconds': int(round(prep_sum.get(sid, 0.0) / n)) if n else None,
+                    'peak_hour': peak_hour,
+                }
+        except Exception:
+            logger.exception('shift list extras batch failed (%s shifts)', len(shifts))
+            return {s.id: _empty() for s in shifts}
+        return out
+
+    @staticmethod
+    def _serialize_shift(shift, detail=False, extras=None, now=None):
         # A shift's stored totals are only written when end_shift runs, so an
         # in-progress (ACTIVE) shift would otherwise serialize as all-zero
         # "no stats". Compute them live for ACTIVE shifts (clock running to
         # now); COMPLETED/ABANDONED shifts keep their frozen end-of-shift
         # numbers. This is why stats now show before the shift is finalized.
+        # `now` is threaded from list() so a live row's total_revenue window and
+        # the batched payment_mix window share the SAME instant (they must match).
+        now = now or timezone.now()
         is_live = shift.status == 'ACTIVE' and not shift.end_time
-        effective_end = shift.end_time or timezone.now()
+        effective_end = shift.end_time or now
         if is_live:
             total_orders, total_revenue, cash_collected = ShiftService._live_totals(
                 shift, effective_end)
@@ -560,10 +747,23 @@ class ShiftService:
             'duration_minutes': duration_minutes,
             'reconciliation': reconciliation,
         }
-        # The shift DETAIL page gets the rich breakdowns (payment mix, products
-        # sold, category stats, peak hour, avg prep) + the per-tender
-        # cashier-vs-manager settlement comparison. Kept off the list serializer
-        # so paging shifts doesn't run these aggregates per row.
+        # Per-shift LIST metrics (payment mix, items sold, prep, peak hour, drawer
+        # expenses, cancelled orders) precomputed in ONE batched pass by
+        # ShiftService.list (O(1) queries for the whole page). net_revenue is
+        # derived here from the row's own live/stored total_revenue, per the FE
+        # formula: total_revenue - expenses_total - cancelled_orders_value.
+        if extras is not None:
+            result.update(extras)
+            try:
+                net = (Decimal(str(total_revenue))
+                       - Decimal(result['expenses_total'])
+                       - Decimal(result['cancelled_orders_value']))
+            except (InvalidOperation, TypeError):
+                net = Decimal(str(total_revenue))
+            result['net_revenue'] = str(net.quantize(Decimal('0.01')))
+        # The shift DETAIL page additionally gets the HEAVY breakdowns kept off the
+        # list (per-product/category stats + the per-tender cashier-vs-manager
+        # settlement comparison) so paging shifts doesn't run those per row.
         if detail:
             result['stats'] = ShiftService._shift_stats(shift, effective_end)
             result['settlement'] = ShiftService._shift_settlement(shift)
