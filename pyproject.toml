@@ -20,7 +20,7 @@ dependencies = [
     "redis==7.3.0",
     "django-redis==6.0.0",
     "requests==2.32.5",
-    "cryptography==48.0.0",     # licensing crypto + heartbeat HMAC
+    "cryptography>=48,<50",     # licensing crypto + heartbeat HMAC (loosened for daphne/twisted)
     "psycopg[binary]>=3.2",     # Postgres driver v3 (Django 6 preferred; has 3.13/3.14 wheels)
     "django-cors-headers==4.9.0",
     "whitenoise==6.8.2",

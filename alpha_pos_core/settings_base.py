@@ -62,8 +62,8 @@ DJANGO_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
 ]
-THIRD_PARTY_APPS = ['corsheaders']
-SHARED_APPS = ['base', 'stock', 'hr', 'discounts', 'notifications', 'fiscalization', 'cashbox']
+THIRD_PARTY_APPS = ['corsheaders', 'channels']
+SHARED_APPS = ['base', 'stock', 'hr', 'discounts', 'notifications', 'fiscalization', 'cashbox', 'core.realtime']
 # Licensing stays last; its kill-switch middleware is required on both editions.
 LICENSING_APPS = ['licensing']
 
@@ -127,7 +127,7 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = os.environ.get('WSGI_APPLICATION', 'config.wsgi.application')
-ASGI_APPLICATION = os.environ.get('ASGI_APPLICATION', 'config.asgi.application')
+ASGI_APPLICATION = os.environ.get('ASGI_APPLICATION', 'alpha_pos_core.asgi.application')
 
 
 if os.environ.get('DB_ENGINE'):
