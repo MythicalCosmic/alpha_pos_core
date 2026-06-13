@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alpha_pos_core"
+version = "0.1.0"
+description = "Shared spine for Alpha POS: core models, auth, the sync engine, and the business apps used by BOTH the server and local (desktop) editions."
+requires-python = ">=3.11"
+
+# Runtime deps the shared apps need. Editions add their own on top:
+#   server: gunicorn, channels-redis, uvicorn[standard]
+#   local:  uvicorn, embedded-Postgres tooling, PyInstaller (build-time)
+dependencies = [
+    "Django==6.0.3",
+    "asgiref==3.11.1",
+    "sqlparse==0.5.5",
+    "tzdata==2025.2",
+    "channels>=4.1",            # NEW: websockets (replaces polling)
+    "redis==7.3.0",
+    "django-redis==6.0.0",
+    "requests==2.32.5",
+    "cryptography==48.0.0",     # licensing crypto + heartbeat HMAC
+    "psycopg2-binary==2.9.10",  # Postgres on BOTH editions now
+    "django-cors-headers==4.9.0",
+    "whitenoise==6.8.2",
+    "anthropic==0.74.0",        # base/services/llm.py (stock assistant / forecaster)
+    "google-genai==2.7.0",
+]
+
+[tool.setuptools.packages.find]
+# Each Django app is a top-level package so `from base.models import …` keeps working
+# unchanged in both editions once core is installed (editable) / on sys.path.
+include = [
+    "base*", "stock*", "discounts*", "cashbox*", "fiscalization*",
+    "licensing*", "notifications*", "core*", "alpha_pos_core*",
+]
+
+[tool.setuptools.package-data]
+# Ship templates / migrations data / static / fixtures with the packages.
+"*" = ["*.html", "*.json", "*.txt", "*.css", "*.js", "*.png", "*.ico", "*.svg"]

@@ -1,0 +1,8 @@
+-r requirements.txt
+
+pytest==8.3.4
+pytest-django==4.9.0
+
+# Lint and dependency audit run in CI. Pinned for reproducibility.
+ruff==0.7.4
+pip-audit==2.7.3

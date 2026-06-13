@@ -1,0 +1,2342 @@
+{
+ "categories": [
+  {
+   "name": "ichimliklar",
+   "slug": "ichimliklar",
+   "description": "",
+   "sort_order": 0,
+   "status": "ACTIVE",
+   "colors": []
+  },
+  {
+   "name": "Hot doglar",
+   "slug": "hot-doglar",
+   "description": "",
+   "sort_order": 0,
+   "status": "ACTIVE",
+   "colors": []
+  },
+  {
+   "name": "Burgerlar",
+   "slug": "burgerlar",
+   "description": "",
+   "sort_order": 0,
+   "status": "ACTIVE",
+   "colors": []
+  },
+  {
+   "name": "Pitsalar",
+   "slug": "pitsalar",
+   "description": "",
+   "sort_order": 0,
+   "status": "ACTIVE",
+   "colors": []
+  },
+  {
+   "name": "Non burgerlar",
+   "slug": "non-burgerlar",
+   "description": "",
+   "sort_order": 0,
+   "status": "ACTIVE",
+   "colors": []
+  },
+  {
+   "name": "Lavashlar",
+   "slug": "lavashlar",
+   "description": "",
+   "sort_order": 0,
+   "status": "ACTIVE",
+   "colors": []
+  },
+  {
+   "name": "Tovuq",
+   "slug": "tovuq",
+   "description": "",
+   "sort_order": 0,
+   "status": "ACTIVE",
+   "colors": []
+  },
+  {
+   "name": "Souslar",
+   "slug": "souslar",
+   "description": "",
+   "sort_order": 0,
+   "status": "ACTIVE",
+   "colors": []
+  },
+  {
+   "name": "Boshqalar",
+   "slug": "boshqalar",
+   "description": "",
+   "sort_order": 0,
+   "status": "ACTIVE",
+   "colors": []
+  },
+  {
+   "name": "Choylar",
+   "slug": "choylar",
+   "description": "",
+   "sort_order": 0,
+   "status": "ACTIVE",
+   "colors": []
+  },
+  {
+   "name": "Suvlar",
+   "slug": "suvlar",
+   "description": "",
+   "sort_order": 0,
+   "status": "ACTIVE",
+   "colors": []
+  },
+  {
+   "name": "Kombolar",
+   "slug": "kombolar",
+   "description": "",
+   "sort_order": 0,
+   "status": "ACTIVE",
+   "colors": []
+  },
+  {
+   "name": "Shirinliklar",
+   "slug": "shirinliklar",
+   "description": "",
+   "sort_order": 0,
+   "status": "ACTIVE",
+   "colors": []
+  },
+  {
+   "name": "WAFFLE",
+   "slug": "SHIRNLIK",
+   "description": "",
+   "sort_order": 0,
+   "status": "ACTIVE",
+   "colors": [
+    "#36db33"
+   ]
+  },
+  {
+   "name": "TASHQI BAR",
+   "slug": "tashqi_bar",
+   "description": "",
+   "sort_order": 0,
+   "status": "ACTIVE",
+   "colors": []
+  }
+ ],
+ "products": [
+  {
+   "name": "Lavash katta",
+   "description": "",
+   "price": "36000",
+   "category_slug": "lavashlar",
+   "colors": []
+  },
+  {
+   "name": "Lavash kichik",
+   "description": "",
+   "price": "32000",
+   "category_slug": "lavashlar",
+   "colors": []
+  },
+  {
+   "name": "Lavash sirli",
+   "description": "",
+   "price": "38000",
+   "category_slug": "lavashlar",
+   "colors": []
+  },
+  {
+   "name": "Tandir Lavash",
+   "description": "",
+   "price": "38000",
+   "category_slug": "lavashlar",
+   "colors": []
+  },
+  {
+   "name": "Lavash halapino",
+   "description": "",
+   "price": "36000",
+   "category_slug": "lavashlar",
+   "colors": []
+  },
+  {
+   "name": "Toster",
+   "description": "",
+   "price": "28000",
+   "category_slug": "lavashlar",
+   "colors": []
+  },
+  {
+   "name": "Lester",
+   "description": "",
+   "price": "20000",
+   "category_slug": "lavashlar",
+   "colors": []
+  },
+  {
+   "name": "Non kabob kichik",
+   "description": "",
+   "price": "31000",
+   "category_slug": "non-burgerlar",
+   "colors": []
+  },
+  {
+   "name": "Non kabob standart",
+   "description": "",
+   "price": "38000",
+   "category_slug": "non-burgerlar",
+   "colors": []
+  },
+  {
+   "name": "Non kabob big",
+   "description": "",
+   "price": "56000",
+   "category_slug": "non-burgerlar",
+   "colors": []
+  },
+  {
+   "name": "Non burger kichik",
+   "description": "",
+   "price": "32000",
+   "category_slug": "non-burgerlar",
+   "colors": []
+  },
+  {
+   "name": "Non burger standart",
+   "description": "",
+   "price": "36000",
+   "category_slug": "non-burgerlar",
+   "colors": []
+  },
+  {
+   "name": "Non burger sirli",
+   "description": "",
+   "price": "38000",
+   "category_slug": "non-burgerlar",
+   "colors": []
+  },
+  {
+   "name": "Non burger achchiq",
+   "description": "",
+   "price": "38000",
+   "category_slug": "non-burgerlar",
+   "colors": []
+  },
+  {
+   "name": "Non burger halapeno",
+   "description": "",
+   "price": "36000",
+   "category_slug": "non-burgerlar",
+   "colors": []
+  },
+  {
+   "name": "Non burger tovuq",
+   "description": "",
+   "price": "30000",
+   "category_slug": "non-burgerlar",
+   "colors": []
+  },
+  {
+   "name": "Non burger tovuq sirli",
+   "description": "",
+   "price": "32000",
+   "category_slug": "non-burgerlar",
+   "colors": []
+  },
+  {
+   "name": "Hot Dog sirli",
+   "description": "",
+   "price": "18000",
+   "category_slug": "hot-doglar",
+   "colors": []
+  },
+  {
+   "name": "Hot Dog Halapeno",
+   "description": "",
+   "price": "18000",
+   "category_slug": "hot-doglar",
+   "colors": []
+  },
+  {
+   "name": "Hot Dog qazili",
+   "description": "",
+   "price": "30000",
+   "category_slug": "hot-doglar",
+   "colors": []
+  },
+  {
+   "name": "Hot Dog Kanada",
+   "description": "",
+   "price": "15000",
+   "category_slug": "hot-doglar",
+   "colors": []
+  },
+  {
+   "name": "Hot Dog dabl",
+   "description": "",
+   "price": "19000",
+   "category_slug": "hot-doglar",
+   "colors": []
+  },
+  {
+   "name": "Hot Dog karalevskiy",
+   "description": "",
+   "price": "28000",
+   "category_slug": "hot-doglar",
+   "colors": []
+  },
+  {
+   "name": "Hot Dog mini",
+   "description": "",
+   "price": "12000",
+   "category_slug": "hot-doglar",
+   "colors": []
+  },
+  {
+   "name": "Hot Dog smart",
+   "description": "",
+   "price": "22000",
+   "category_slug": "hot-doglar",
+   "colors": []
+  },
+  {
+   "name": "Hot Dog achchiq",
+   "description": "",
+   "price": "17000",
+   "category_slug": "hot-doglar",
+   "colors": []
+  },
+  {
+   "name": "Hot Dog go'shtli",
+   "description": "",
+   "price": "28000",
+   "category_slug": "hot-doglar",
+   "colors": []
+  },
+  {
+   "name": "Burger donarli",
+   "description": "",
+   "price": "33000",
+   "category_slug": "burgerlar",
+   "colors": []
+  },
+  {
+   "name": "Burger",
+   "description": "",
+   "price": "30000",
+   "category_slug": "burgerlar",
+   "colors": []
+  },
+  {
+   "name": "Dabl Burger",
+   "description": "",
+   "price": "40000",
+   "category_slug": "burgerlar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa donarli  kichik",
+   "description": "",
+   "price": "64000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa donarli  o'rta",
+   "description": "",
+   "price": "83000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa donarli katta",
+   "description": "",
+   "price": "109000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa goshtli kichik",
+   "description": "",
+   "price": "64000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa goshtli orta",
+   "description": "",
+   "price": "83000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa goshtli katta",
+   "description": "",
+   "price": "109000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa qazili kichik",
+   "description": "",
+   "price": "84000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa qazili orta",
+   "description": "",
+   "price": "106000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa qazili katta",
+   "description": "",
+   "price": "119000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa Ikki karra pepperoni kichik",
+   "description": "",
+   "price": "59000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa ikki karra pepperoni orta",
+   "description": "",
+   "price": "80000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa ikki karra pepperoni katta",
+   "description": "",
+   "price": "95000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa rimiskaya kichik",
+   "description": "",
+   "price": "59000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa rimiskaya orta",
+   "description": "",
+   "price": "78000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa rimiskaya katta",
+   "description": "",
+   "price": "90000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa pepperoni kichik",
+   "description": "",
+   "price": "54000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa pepperoni orta",
+   "description": "",
+   "price": "73000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa pepperoni katta",
+   "description": "",
+   "price": "85000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa tovuqli kichik",
+   "description": "",
+   "price": "64000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa tovuqli orta",
+   "description": "",
+   "price": "72000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa tovuqli katta",
+   "description": "",
+   "price": "85000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa smart kichik",
+   "description": "",
+   "price": "54000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa smart orta",
+   "description": "",
+   "price": "73000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa smart katta",
+   "description": "",
+   "price": "85000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa milano kichik",
+   "description": "",
+   "price": "54000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa milano orta",
+   "description": "",
+   "price": "73000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa milano katta",
+   "description": "",
+   "price": "85000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa margaritta kichik",
+   "description": "",
+   "price": "54000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa margaritta orta",
+   "description": "",
+   "price": "73000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa margaritta katta",
+   "description": "",
+   "price": "85000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa vegetarian kichik",
+   "description": "",
+   "price": "54000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa vegetarian orta",
+   "description": "",
+   "price": "73000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa vegetarian katta",
+   "description": "",
+   "price": "85000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa pishloqli kichik",
+   "description": "",
+   "price": "49000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa pishloqli orta",
+   "description": "",
+   "price": "65000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa pishloqli katta",
+   "description": "",
+   "price": "79000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Hachapuri",
+   "description": "",
+   "price": "32000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Hachapuri dabl",
+   "description": "",
+   "price": "60000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Sous sirniy",
+   "description": "",
+   "price": "2000",
+   "category_slug": "souslar",
+   "colors": []
+  },
+  {
+   "name": "Sous chisnochniy",
+   "description": "",
+   "price": "3000",
+   "category_slug": "souslar",
+   "colors": []
+  },
+  {
+   "name": "Sous ketchup",
+   "description": "",
+   "price": "2000",
+   "category_slug": "souslar",
+   "colors": []
+  },
+  {
+   "name": "Sous chili",
+   "description": "",
+   "price": "3000",
+   "category_slug": "souslar",
+   "colors": []
+  },
+  {
+   "name": "Sous halapino",
+   "description": "",
+   "price": "3000",
+   "category_slug": "souslar",
+   "colors": []
+  },
+  {
+   "name": "Kartoshka fri",
+   "description": "",
+   "price": "15000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Donar",
+   "description": "",
+   "price": "48000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Strips 3ta",
+   "description": "",
+   "price": "16000",
+   "category_slug": "tovuq",
+   "colors": []
+  },
+  {
+   "name": "Strips 8ta",
+   "description": "",
+   "price": "38000",
+   "category_slug": "tovuq",
+   "colors": []
+  },
+  {
+   "name": "Strips 10ta",
+   "description": "",
+   "price": "43000",
+   "category_slug": "tovuq",
+   "colors": []
+  },
+  {
+   "name": "Qanotcha 3ta",
+   "description": "",
+   "price": "18000",
+   "category_slug": "tovuq",
+   "colors": []
+  },
+  {
+   "name": "Qanotcha 5ta",
+   "description": "",
+   "price": "28000",
+   "category_slug": "tovuq",
+   "colors": []
+  },
+  {
+   "name": "Qanotcha 8 ta",
+   "description": "",
+   "price": "44000",
+   "category_slug": "tovuq",
+   "colors": []
+  },
+  {
+   "name": "Qanotcha 10 ta",
+   "description": "",
+   "price": "53000",
+   "category_slug": "tovuq",
+   "colors": []
+  },
+  {
+   "name": "Smart strips 3ta",
+   "description": "",
+   "price": "14000",
+   "category_slug": "tovuq",
+   "colors": []
+  },
+  {
+   "name": "Smart strips 5ta",
+   "description": "",
+   "price": "22000",
+   "category_slug": "tovuq",
+   "colors": []
+  },
+  {
+   "name": "Smart strips 8ta",
+   "description": "",
+   "price": "34000",
+   "category_slug": "tovuq",
+   "colors": []
+  },
+  {
+   "name": "Smart strips 10ta",
+   "description": "",
+   "price": "40000",
+   "category_slug": "tovuq",
+   "colors": []
+  },
+  {
+   "name": "Naggetsi 3ta",
+   "description": "",
+   "price": "14000",
+   "category_slug": "tovuq",
+   "colors": []
+  },
+  {
+   "name": "Naggetsi 6ta",
+   "description": "",
+   "price": "26000",
+   "category_slug": "tovuq",
+   "colors": []
+  },
+  {
+   "name": "Naggetsi 8ta",
+   "description": "",
+   "price": "32000",
+   "category_slug": "tovuq",
+   "colors": []
+  },
+  {
+   "name": "Naggetsi 10ta",
+   "description": "",
+   "price": "38000",
+   "category_slug": "tovuq",
+   "colors": []
+  },
+  {
+   "name": "File 3ta",
+   "description": "",
+   "price": "13000",
+   "category_slug": "tovuq",
+   "colors": []
+  },
+  {
+   "name": "File 5ta",
+   "description": "",
+   "price": "21000",
+   "category_slug": "tovuq",
+   "colors": []
+  },
+  {
+   "name": "File 8ta",
+   "description": "",
+   "price": "32000",
+   "category_slug": "tovuq",
+   "colors": []
+  },
+  {
+   "name": "File 10ta",
+   "description": "",
+   "price": "38000",
+   "category_slug": "tovuq",
+   "colors": []
+  },
+  {
+   "name": "Chicken big",
+   "description": "",
+   "price": "90000",
+   "category_slug": "tovuq",
+   "colors": []
+  },
+  {
+   "name": "Sirniy palochki 3ta",
+   "description": "",
+   "price": "15000",
+   "category_slug": "tovuq",
+   "colors": []
+  },
+  {
+   "name": "Sirniy palochki 5ta",
+   "description": "",
+   "price": "22000",
+   "category_slug": "tovuq",
+   "colors": []
+  },
+  {
+   "name": "Sirniy palochki 8ta",
+   "description": "",
+   "price": "35000",
+   "category_slug": "tovuq",
+   "colors": []
+  },
+  {
+   "name": "Sirniy palochki 10ta",
+   "description": "",
+   "price": "38000",
+   "category_slug": "tovuq",
+   "colors": []
+  },
+  {
+   "name": "Sirniy shariki 3ta",
+   "description": "",
+   "price": "12000",
+   "category_slug": "tovuq",
+   "colors": []
+  },
+  {
+   "name": "Sirniy shariki 5ta",
+   "description": "",
+   "price": "18000",
+   "category_slug": "tovuq",
+   "colors": []
+  },
+  {
+   "name": "Sirniy shariki 8ta",
+   "description": "",
+   "price": "25000",
+   "category_slug": "tovuq",
+   "colors": []
+  },
+  {
+   "name": "Sirniy shariki 10ta",
+   "description": "",
+   "price": "29000",
+   "category_slug": "tovuq",
+   "colors": []
+  },
+  {
+   "name": "Strips 0.5kg",
+   "description": "",
+   "price": "65000",
+   "category_slug": "tovuq",
+   "colors": []
+  },
+  {
+   "name": "Strips 1kg",
+   "description": "",
+   "price": "120000",
+   "category_slug": "tovuq",
+   "colors": []
+  },
+  {
+   "name": "Malinali choy",
+   "description": "",
+   "price": "15000",
+   "category_slug": "choylar",
+   "colors": []
+  },
+  {
+   "name": "Limon imbirli choy",
+   "description": "",
+   "price": "15000",
+   "category_slug": "choylar",
+   "colors": []
+  },
+  {
+   "name": "Karak zanjabil choy",
+   "description": "",
+   "price": "15000",
+   "category_slug": "choylar",
+   "colors": []
+  },
+  {
+   "name": "Novvot choy",
+   "description": "",
+   "price": "15000",
+   "category_slug": "choylar",
+   "colors": []
+  },
+  {
+   "name": "Limonli choy",
+   "description": "",
+   "price": "8000",
+   "category_slug": "choylar",
+   "colors": []
+  },
+  {
+   "name": "Qora choy",
+   "description": "",
+   "price": "4000",
+   "category_slug": "choylar",
+   "colors": []
+  },
+  {
+   "name": "Kok choy",
+   "description": "",
+   "price": "4000",
+   "category_slug": "choylar",
+   "colors": []
+  },
+  {
+   "name": "Saqich 2ta",
+   "description": "",
+   "price": "1000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Limon choy",
+   "description": "",
+   "price": "12000",
+   "category_slug": "choylar",
+   "colors": []
+  },
+  {
+   "name": "Cofe qora",
+   "description": "",
+   "price": "8000",
+   "category_slug": "choylar",
+   "colors": []
+  },
+  {
+   "name": "Cofe malochniy",
+   "description": "",
+   "price": "8000",
+   "category_slug": "choylar",
+   "colors": []
+  },
+  {
+   "name": "Cofe kapuchino",
+   "description": "",
+   "price": "8000",
+   "category_slug": "choylar",
+   "colors": []
+  },
+  {
+   "name": "Milliy cola 0.5",
+   "description": "",
+   "price": "7000",
+   "category_slug": "suvlar",
+   "colors": []
+  },
+  {
+   "name": "Milliy cola 1",
+   "description": "",
+   "price": "10000",
+   "category_slug": "suvlar",
+   "colors": []
+  },
+  {
+   "name": "Milliy cola 1.5",
+   "description": "",
+   "price": "12000",
+   "category_slug": "suvlar",
+   "colors": []
+  },
+  {
+   "name": "Dastavka",
+   "description": "",
+   "price": "5000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Limoo 0.5",
+   "description": "",
+   "price": "7000",
+   "category_slug": "suvlar",
+   "colors": []
+  },
+  {
+   "name": "Limoo 1",
+   "description": "",
+   "price": "9000",
+   "category_slug": "suvlar",
+   "colors": []
+  },
+  {
+   "name": "Limoo 1.5",
+   "description": "",
+   "price": "11000",
+   "category_slug": "suvlar",
+   "colors": []
+  },
+  {
+   "name": "Dena katta",
+   "description": "",
+   "price": "14000",
+   "category_slug": "suvlar",
+   "colors": []
+  },
+  {
+   "name": "Dena kichik",
+   "description": "",
+   "price": "8000",
+   "category_slug": "suvlar",
+   "colors": []
+  },
+  {
+   "name": "Dena zavrik",
+   "description": "",
+   "price": "5000",
+   "category_slug": "suvlar",
+   "colors": []
+  },
+  {
+   "name": "Dena apelsin",
+   "description": "",
+   "price": "17000",
+   "category_slug": "suvlar",
+   "colors": []
+  },
+  {
+   "name": "Maxito 0.45",
+   "description": "",
+   "price": "12000",
+   "category_slug": "suvlar",
+   "colors": []
+  },
+  {
+   "name": "Party",
+   "description": "",
+   "price": "6000",
+   "category_slug": "suvlar",
+   "colors": []
+  },
+  {
+   "name": "Suv 1",
+   "description": "",
+   "price": "4000",
+   "category_slug": "suvlar",
+   "colors": []
+  },
+  {
+   "name": "Suv 0.5",
+   "description": "",
+   "price": "3000",
+   "category_slug": "suvlar",
+   "colors": []
+  },
+  {
+   "name": "Go'shtlik kombo pitsa 3X",
+   "description": "",
+   "price": "149000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pepperoni pitsa kombo",
+   "description": "",
+   "price": "149000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Student kombo",
+   "description": "",
+   "price": "42000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Donarli kombo pitsa 3X",
+   "description": "",
+   "price": "149000",
+   "category_slug": "kombolar",
+   "colors": []
+  },
+  {
+   "name": "Vegetarian kombo pitsa 3X",
+   "description": "",
+   "price": "149000",
+   "category_slug": "kombolar",
+   "colors": []
+  },
+  {
+   "name": "Goshtli pitsa kombo orta 2X",
+   "description": "",
+   "price": "156000",
+   "category_slug": "kombolar",
+   "colors": []
+  },
+  {
+   "name": "Donarli pitsa kombo orta 2X",
+   "description": "",
+   "price": "150000",
+   "category_slug": "kombolar",
+   "colors": []
+  },
+  {
+   "name": "Pepperoni pitsa kombo orta 2x",
+   "description": "",
+   "price": "129000",
+   "category_slug": "kombolar",
+   "colors": []
+  },
+  {
+   "name": "Tovuqli pitsa kombo super",
+   "description": "",
+   "price": "140000",
+   "category_slug": "kombolar",
+   "colors": []
+  },
+  {
+   "name": "Stakan",
+   "description": "",
+   "price": "0",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Pepperoni long pitsa kombo",
+   "description": "",
+   "price": "62000",
+   "category_slug": "kombolar",
+   "colors": []
+  },
+  {
+   "name": "Assarti long pitsa kombo",
+   "description": "",
+   "price": "68000",
+   "category_slug": "kombolar",
+   "colors": []
+  },
+  {
+   "name": "Qazili long pitsa kombo",
+   "description": "",
+   "price": "70000",
+   "category_slug": "kombolar",
+   "colors": []
+  },
+  {
+   "name": "Tovuqli long pitsa kombo",
+   "description": "",
+   "price": "54000",
+   "category_slug": "kombolar",
+   "colors": []
+  },
+  {
+   "name": "Donarli long pitsa kombo",
+   "description": "",
+   "price": "68000",
+   "category_slug": "kombolar",
+   "colors": []
+  },
+  {
+   "name": "Long pitsa pishloqli",
+   "description": "",
+   "price": "28000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Long pitsa pepperoni",
+   "description": "",
+   "price": "28000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Long pitsa assarti",
+   "description": "",
+   "price": "34000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Long pitsa qazili",
+   "description": "",
+   "price": "36000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Long pitsa tovuqli",
+   "description": "",
+   "price": "28000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Long pitsa vegetarian",
+   "description": "",
+   "price": "32000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Muzqaymoq sharik",
+   "description": "",
+   "price": "8000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "Long pitsa smart",
+   "description": "",
+   "price": "28000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Maxrovi",
+   "description": "",
+   "price": "15000",
+   "category_slug": "shirinliklar",
+   "colors": []
+  },
+  {
+   "name": "Maxrovi fistyashkali",
+   "description": "",
+   "price": "16000",
+   "category_slug": "shirinliklar",
+   "colors": []
+  },
+  {
+   "name": "Kit kat",
+   "description": "",
+   "price": "16000",
+   "category_slug": "shirinliklar",
+   "colors": []
+  },
+  {
+   "name": "Medovik shokoladli",
+   "description": "",
+   "price": "16000",
+   "category_slug": "shirinliklar",
+   "colors": []
+  },
+  {
+   "name": "Medovik",
+   "description": "",
+   "price": "13000",
+   "category_slug": "shirinliklar",
+   "colors": []
+  },
+  {
+   "name": "Trayfil",
+   "description": "",
+   "price": "15000",
+   "category_slug": "shirinliklar",
+   "colors": []
+  },
+  {
+   "name": "Dastavka 1km +",
+   "description": "",
+   "price": "8000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Bozorboshi",
+   "description": "",
+   "price": "6000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Shoshilinch",
+   "description": "",
+   "price": "8000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Chilon",
+   "description": "",
+   "price": "13000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Kalelin tatar maxalla",
+   "description": "",
+   "price": "8000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Kalelin 2chi",
+   "description": "",
+   "price": "10000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Kalelin 3chi",
+   "description": "",
+   "price": "12000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Kalelin 4chi",
+   "description": "",
+   "price": "14000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Kalelin 5chi",
+   "description": "",
+   "price": "15000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Kalelin 6chi",
+   "description": "",
+   "price": "16000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Kalelin 7chi",
+   "description": "",
+   "price": "17000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Kalelin 8chi",
+   "description": "",
+   "price": "20000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Vadakanal",
+   "description": "",
+   "price": "8000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Buyuk maskan",
+   "description": "",
+   "price": "10000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Shomat tort kocha",
+   "description": "",
+   "price": "10000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Shomat ichkari",
+   "description": "",
+   "price": "13000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Shukur mergan",
+   "description": "",
+   "price": "18000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Roxat",
+   "description": "",
+   "price": "15000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Sverdilif 3kocha",
+   "description": "",
+   "price": "11000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Sverdilif ichkari",
+   "description": "",
+   "price": "14000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Paxtakor 4kocha",
+   "description": "",
+   "price": "13000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Paxtakor ichkari",
+   "description": "",
+   "price": "17000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Lavash tovuqli",
+   "description": "",
+   "price": "30000",
+   "category_slug": "lavashlar",
+   "colors": []
+  },
+  {
+   "name": "Kamsomol 24-maktab",
+   "description": "",
+   "price": "15000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Kamsomol jiyda mozor",
+   "description": "",
+   "price": "17000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Qarsildoq strips 1kg",
+   "description": "",
+   "price": "110000",
+   "category_slug": "tovuq",
+   "colors": []
+  },
+  {
+   "name": "Longer",
+   "description": "",
+   "price": "18000",
+   "category_slug": "hot-doglar",
+   "colors": []
+  },
+  {
+   "name": "pitsa meksikano kichik",
+   "description": "",
+   "price": "54000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "pitsa meksikano orta",
+   "description": "",
+   "price": "73000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "pitsa meksikano katta",
+   "description": "",
+   "price": "85000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "pitsa burgerli kichik",
+   "description": "",
+   "price": "64000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "pitsa burgerli orta",
+   "description": "",
+   "price": "83000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "pitsa burgerli katta",
+   "description": "",
+   "price": "109000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "kamunar",
+   "description": "",
+   "price": "8000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "chapayev",
+   "description": "",
+   "price": "14000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Lavash achchiq",
+   "description": "",
+   "price": "36000",
+   "category_slug": "lavashlar",
+   "colors": []
+  },
+  {
+   "name": "dena shaftoli",
+   "description": "",
+   "price": "14000",
+   "category_slug": "ichimliklar",
+   "colors": []
+  },
+  {
+   "name": "dena olma",
+   "description": "",
+   "price": "14000",
+   "category_slug": "ichimliklar",
+   "colors": []
+  },
+  {
+   "name": "dena behi",
+   "description": "",
+   "price": "14000",
+   "category_slug": "ichimliklar",
+   "colors": []
+  },
+  {
+   "name": "dena smarodina",
+   "description": "",
+   "price": "14000",
+   "category_slug": "ichimliklar",
+   "colors": []
+  },
+  {
+   "name": "dena multifrukt",
+   "description": "",
+   "price": "14000",
+   "category_slug": "ichimliklar",
+   "colors": []
+  },
+  {
+   "name": "dena maxito malinoviy",
+   "description": "",
+   "price": "14000",
+   "category_slug": "ichimliklar",
+   "colors": []
+  },
+  {
+   "name": "dena maxito klasichiskiy",
+   "description": "",
+   "price": "14000",
+   "category_slug": "ichimliklar",
+   "colors": []
+  },
+  {
+   "name": "Bolichka",
+   "description": "",
+   "price": "4000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Chicken burger",
+   "description": "",
+   "price": "29000",
+   "category_slug": "burgerlar",
+   "colors": []
+  },
+  {
+   "name": "Chicken chiz burger",
+   "description": "",
+   "price": "30000",
+   "category_slug": "burgerlar",
+   "colors": []
+  },
+  {
+   "name": "Lester chiz",
+   "description": "",
+   "price": "22000",
+   "category_slug": "lavashlar",
+   "colors": []
+  },
+  {
+   "name": "Toster chiz",
+   "description": "",
+   "price": "30000",
+   "category_slug": "lavashlar",
+   "colors": []
+  },
+  {
+   "name": "Burger chiz",
+   "description": "",
+   "price": "33000",
+   "category_slug": "burgerlar",
+   "colors": []
+  },
+  {
+   "name": "Dabl burger chiz",
+   "description": "",
+   "price": "44000",
+   "category_slug": "burgerlar",
+   "colors": []
+  },
+  {
+   "name": "Qorabogish",
+   "description": "",
+   "price": "20000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "LONGER CHIZ",
+   "description": "",
+   "price": "19000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Mango marakuya",
+   "description": "",
+   "price": "15000",
+   "category_slug": "choylar",
+   "colors": []
+  },
+  {
+   "name": "Qulupnay choy",
+   "description": "",
+   "price": "15000",
+   "category_slug": "choylar",
+   "colors": []
+  },
+  {
+   "name": "Shaftoli choy",
+   "description": "",
+   "price": "15000",
+   "category_slug": "choylar",
+   "colors": []
+  },
+  {
+   "name": "Mango choy",
+   "description": "",
+   "price": "15000",
+   "category_slug": "choylar",
+   "colors": []
+  },
+  {
+   "name": "Lavanda choy",
+   "description": "",
+   "price": "15000",
+   "category_slug": "choylar",
+   "colors": []
+  },
+  {
+   "name": "Multi meva choy",
+   "description": "",
+   "price": "15000",
+   "category_slug": "choylar",
+   "colors": []
+  },
+  {
+   "name": "Boboxoroson",
+   "description": "",
+   "price": "20000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Lavash combo",
+   "description": "",
+   "price": "52000",
+   "category_slug": "kombolar",
+   "colors": []
+  },
+  {
+   "name": "Burger combo",
+   "description": "",
+   "price": "59000",
+   "category_slug": "kombolar",
+   "colors": []
+  },
+  {
+   "name": "Donar burger combo",
+   "description": "",
+   "price": "50000",
+   "category_slug": "kombolar",
+   "colors": []
+  },
+  {
+   "name": "Chicken combo",
+   "description": "",
+   "price": "43000",
+   "category_slug": "kombolar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa combo",
+   "description": "",
+   "price": "90000",
+   "category_slug": "kombolar",
+   "colors": []
+  },
+  {
+   "name": "Lanchbox",
+   "description": "",
+   "price": "57000",
+   "category_slug": "kombolar",
+   "colors": []
+  },
+  {
+   "name": "Combo top",
+   "description": "",
+   "price": "50000",
+   "category_slug": "kombolar",
+   "colors": []
+  },
+  {
+   "name": "Combo premium",
+   "description": "",
+   "price": "52000",
+   "category_slug": "kombolar",
+   "colors": []
+  },
+  {
+   "name": "Big combo",
+   "description": "",
+   "price": "52000",
+   "category_slug": "kombolar",
+   "colors": []
+  },
+  {
+   "name": "Student combo",
+   "description": "",
+   "price": "45000",
+   "category_slug": "kombolar",
+   "colors": []
+  },
+  {
+   "name": "Combo ikkilik",
+   "description": "",
+   "price": "86000",
+   "category_slug": "kombolar",
+   "colors": []
+  },
+  {
+   "name": "Ilich",
+   "description": "",
+   "price": "20000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Ilich idora",
+   "description": "",
+   "price": "22000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Qoraqorgon",
+   "description": "",
+   "price": "25000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Sergu",
+   "description": "",
+   "price": "25000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Smart burger",
+   "description": "",
+   "price": "45000",
+   "category_slug": "burgerlar",
+   "colors": []
+  },
+  {
+   "name": "Ormon mevali choy",
+   "description": "",
+   "price": "15000",
+   "category_slug": "choylar",
+   "colors": []
+  },
+  {
+   "name": "Strips 5ta",
+   "description": "",
+   "price": "25000",
+   "category_slug": "tovuq",
+   "colors": []
+  },
+  {
+   "name": "Pitsa asarti kichik",
+   "description": "",
+   "price": "64000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Hot dog asarti",
+   "description": "",
+   "price": "30000",
+   "category_slug": "hot-doglar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa asarti orta",
+   "description": "",
+   "price": "83000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa asarti katta",
+   "description": "",
+   "price": "109000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "hasanmergan",
+   "description": "",
+   "price": "20000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Lavash big",
+   "description": "",
+   "price": "45000",
+   "category_slug": "lavashlar",
+   "colors": []
+  },
+  {
+   "name": "Non",
+   "description": "",
+   "price": "4000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Sous qalampir",
+   "description": "",
+   "price": "5000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Milliy cola 1 BONUS",
+   "description": "",
+   "price": "0",
+   "category_slug": "suvlar",
+   "colors": []
+  },
+  {
+   "name": "Chapayev ichkari",
+   "description": "",
+   "price": "15000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Tort MATILDA",
+   "description": "",
+   "price": "45000",
+   "category_slug": "shirinliklar",
+   "colors": []
+  },
+  {
+   "name": "Kalelin 1",
+   "description": "",
+   "price": "12000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "AK45",
+   "description": "",
+   "price": "12000",
+   "category_slug": "suvlar",
+   "colors": []
+  },
+  {
+   "name": "Gankongskiy waffle assartiy",
+   "description": "",
+   "price": "70000",
+   "category_slug": "SHIRNLIK",
+   "colors": [
+    "#366411"
+   ]
+  },
+  {
+   "name": "Pitsa pepperoni + tovuqli kichik",
+   "description": "",
+   "price": "54000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa pepperoni + tovuqli orta",
+   "description": "",
+   "price": "73000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Pitsa pepperoni + tovuqli katta",
+   "description": "",
+   "price": "87000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Hot dog combo 42 ming",
+   "description": "",
+   "price": "42000",
+   "category_slug": "hot-doglar",
+   "colors": []
+  },
+  {
+   "name": "Hot dog combo 45 ming",
+   "description": "",
+   "price": "45000",
+   "category_slug": "hot-doglar",
+   "colors": []
+  },
+  {
+   "name": "MUZQAYMOQ 5000",
+   "description": "",
+   "price": "5000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "MUZQAYMOQ 8000",
+   "description": "",
+   "price": "8000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "MUZQAYMOQ  1 KG",
+   "description": "",
+   "price": "60000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "MUZQAYMOQ 0,5 KG",
+   "description": "",
+   "price": "30000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "YUQORI ROVOT",
+   "description": "",
+   "price": "30000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Rovot",
+   "description": "",
+   "price": "25000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Non kabob achchiq",
+   "description": "",
+   "price": "37000",
+   "category_slug": "non-burgerlar",
+   "colors": []
+  },
+  {
+   "name": "Non kabob halapino",
+   "description": "",
+   "price": "38000",
+   "category_slug": "non-burgerlar",
+   "colors": []
+  },
+  {
+   "name": "Tashqi smart strips 10 ta",
+   "description": "",
+   "price": "37000",
+   "category_slug": "tovuq",
+   "colors": []
+  },
+  {
+   "name": "Moxito ocean",
+   "description": "",
+   "price": "15000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "Moxito laym",
+   "description": "",
+   "price": "15000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "Moxito classik",
+   "description": "",
+   "price": "15000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "Moxito qulupnay",
+   "description": "",
+   "price": "15000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "Moxito ormon meva",
+   "description": "",
+   "price": "15000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "Moxito kiwi",
+   "description": "",
+   "price": "15000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "Moxito marakuyya",
+   "description": "",
+   "price": "15000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "Moxito mango",
+   "description": "",
+   "price": "15000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "Moxito mango marakuyya",
+   "description": "",
+   "price": "15000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "Moxito yovvoyi olcha",
+   "description": "",
+   "price": "15000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "Kokteyl malina",
+   "description": "",
+   "price": "20000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "Kokteyl shokoland",
+   "description": "",
+   "price": "20000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "Kokteyl banan",
+   "description": "",
+   "price": "20000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "Kokteyl qulupnay",
+   "description": "",
+   "price": "20000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "Kokteyl mango marakuyya",
+   "description": "",
+   "price": "20000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "Kokteyl marakuyya",
+   "description": "",
+   "price": "20000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "Kokteyl apelsin",
+   "description": "",
+   "price": "20000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "Kokteyl shaftoli",
+   "description": "",
+   "price": "20000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "Moxito waffle_ 35.000",
+   "description": "",
+   "price": "35000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "Moxito waffle_45.000",
+   "description": "",
+   "price": "45000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "Kokteyl waffle_35.000",
+   "description": "",
+   "price": "35000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "Kokteyl waffle_45.000",
+   "description": "",
+   "price": "45000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "Moxito+kokteyl+waffle 55.000",
+   "description": "",
+   "price": "55000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "Moxito+kokteyl+waffle 65.000",
+   "description": "",
+   "price": "65000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "Gankong waffle   35,000",
+   "description": "",
+   "price": "35000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "Gankong waffle 50,000",
+   "description": "",
+   "price": "50000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "Gankong waffle 60,000",
+   "description": "",
+   "price": "60000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "Gankong waffle 70.000",
+   "description": "",
+   "price": "70000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "Gankong waffle 80.000",
+   "description": "",
+   "price": "80000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "Ilich marks",
+   "description": "",
+   "price": "18000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Kalelin eshon mahalla",
+   "description": "",
+   "price": "25000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Alif saqich 5 ming",
+   "description": "",
+   "price": "5000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "Qarsildoq srtips 1 KG",
+   "description": "",
+   "price": "87000",
+   "category_slug": "tovuq",
+   "colors": []
+  },
+  {
+   "name": "Qorgoncha",
+   "description": "",
+   "price": "16000",
+   "category_slug": "boshqalar",
+   "colors": []
+  },
+  {
+   "name": "Muzqaymoq 10.000",
+   "description": "",
+   "price": "10000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "Smart long pitsa kombo",
+   "description": "",
+   "price": "54000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Tushonka pitsa kichik",
+   "description": "",
+   "price": "49000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Tushonka pitsa orta",
+   "description": "",
+   "price": "67000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Tushonka pitsa katta",
+   "description": "",
+   "price": "80000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Tushonka pitsa kombo super",
+   "description": "",
+   "price": "140000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Asarti long pitsa combo",
+   "description": "",
+   "price": "68000",
+   "category_slug": "pitsalar",
+   "colors": []
+  },
+  {
+   "name": "Aloe vera 0.5",
+   "description": "",
+   "price": "11000",
+   "category_slug": "suvlar",
+   "colors": []
+  },
+  {
+   "name": "Moxito BONUS",
+   "description": "",
+   "price": "0",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "KURASAN OZI",
+   "description": "",
+   "price": "20000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "KURASAN MUVA",
+   "description": "",
+   "price": "30000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "KURASAN MUVA+MUZQAYMOQ",
+   "description": "",
+   "price": "40000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "MUZ",
+   "description": "",
+   "price": "6000",
+   "category_slug": "tashqi_bar",
+   "colors": []
+  },
+  {
+   "name": "Be Fresh 450 mi",
+   "description": "",
+   "price": "12000",
+   "category_slug": "suvlar",
+   "colors": []
+  },
+  {
+   "name": "SAKURA chay 450 ml",
+   "description": "",
+   "price": "10000",
+   "category_slug": "suvlar",
+   "colors": []
+  },
+  {
+   "name": "Toza hudud",
+   "description": "",
+   "price": "10000",
+   "category_slug": "boshqalar",
+   "colors": []
+  }
+ ]
+}

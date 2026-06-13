@@ -1,0 +1,4 @@
+from discounts.repositories.discount_type import DiscountTypeRepository
+from discounts.repositories.discount import DiscountRepository
+from discounts.repositories.order_discount import OrderDiscountRepository
+from discounts.repositories.discount_usage import DiscountUsageRepository
