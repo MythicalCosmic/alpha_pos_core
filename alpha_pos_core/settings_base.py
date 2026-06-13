@@ -271,6 +271,13 @@ GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash')
 # updates). Generate with: python -c "import secrets; print(secrets.token_urlsafe(32))"
 TELEGRAM_WEBHOOK_SECRET = os.environ.get('TELEGRAM_WEBHOOK_SECRET', '')
 
+# --- Customer-facing Telegram bot (SERVER edition) — a SEPARATE bot/token from the
+# staff notifications bot. Stripped to: greet in Uzbek + a button that opens the
+# ordering web app. See notifications/services/customer_bot.py.
+CUSTOMER_BOT_TOKEN = os.environ.get('CUSTOMER_BOT_TOKEN', '')
+CUSTOMER_WEBHOOK_SECRET = os.environ.get('CUSTOMER_WEBHOOK_SECRET', '')
+CUSTOMER_WEBAPP_URL = os.environ.get('CUSTOMER_WEBAPP_URL', 'https://example.com')
+
 REDIS_URL = os.environ.get('REDIS_URL', 'redis://127.0.0.1:6379/0')
 
 if os.environ.get('USE_REDIS', '').lower() in ('true', '1', 'yes'):
