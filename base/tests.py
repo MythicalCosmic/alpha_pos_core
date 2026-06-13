@@ -3,6 +3,7 @@ from datetime import timedelta
 from decimal import Decimal
 
 import pytest
+from django.apps import apps
 from django.test import override_settings
 from django.utils import timezone
 
@@ -465,6 +466,7 @@ class TestChefQueueNumber:
         assert 'display_id' not in data
 
 
+@pytest.mark.skipif(not apps.is_installed('customers'), reason='exercises customers.product_service - runs on the local edition')
 class TestPopularProductsFilter:
     """popular=True (default) orders products by recent sales; popular=False
     falls back to the requested ordering."""

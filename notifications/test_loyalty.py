@@ -12,6 +12,7 @@ idempotent.
 import json
 
 import pytest
+from django.apps import apps
 from django.test import Client
 
 from base.repositories.session import SessionRepository
@@ -124,6 +125,7 @@ class TestLoyaltyServiceRedeem:
 
 # ---- order-service hook --------------------------------------------------
 
+@pytest.mark.skipif(not apps.is_installed('admins'), reason='exercises admins.order_service - runs on the server edition')
 class TestOrderHookAccrual:
     def test_mark_as_paid_then_complete_credits_stamps(
         self, order_factory, cashier_user, regular_user,

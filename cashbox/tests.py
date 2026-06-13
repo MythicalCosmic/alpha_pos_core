@@ -80,7 +80,7 @@ class TestCashboxExpenseRecipients:
 class TestShiftSettlement:
     def test_close_and_confirm_posts_to_treasury(self):
         from base.models import TreasuryAccount
-        from admins.services.shift_service import ShiftService
+        from core.shifts.service import ShiftService
         from cashbox.models import ShiftPaymentTotal
         u = _user(); s = _shift(u)
         _paid_cash_order(u, Decimal('100000'), 'CASH')

@@ -37,5 +37,6 @@ include = [
 ]
 
 [tool.setuptools.package-data]
-# Ship templates / migrations data / static / fixtures with the packages.
-"*" = ["*.html", "*.json", "*.txt", "*.css", "*.js", "*.png", "*.ico", "*.svg"]
+# Ship templates / static / fixtures with the packages (recursive — covers nested
+# dirs like stock/templates/admin/stock/*.html and base/management/commands/*.json).
+"*" = ["**/*.html", "**/*.json", "**/*.txt", "**/*.css", "**/*.js", "**/*.png", "**/*.ico", "**/*.svg"]
