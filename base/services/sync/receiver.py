@@ -182,6 +182,14 @@ class CloudReceiver:
 
         sync_version = data.pop('sync_version', 1)
         is_deleted = data.pop('is_deleted', False)
+        # is_deleted is popped out of `data`, so _strip_denied never sees it.
+        # Without this gate a branch token could push is_deleted=True for a model
+        # that lists it in SYNC_DENY_FROM_BRANCH (e.g. User) and soft-delete cloud
+        # users/admins — exactly the from-branch protection the denylist promises.
+        # Gate only the UPDATE paths; CREATE still honours it (matches _strip_denied's
+        # create-time exception, and a brand-new tombstone is harmless).
+        _del_denied = ('is_deleted' in model_class._effective_denylist()) \
+            if hasattr(model_class, '_effective_denylist') else False
         # Ignore any branch_id in the payload — the receive endpoint binds
         # the auth token to one branch (BRANCH_TOKEN_MAP), so honoring a
         # per-record branch_id would let a branch-token holder write records
@@ -283,7 +291,8 @@ class CloudReceiver:
                     setattr(instance, fk_field, fk_instance)
 
                 instance.sync_version = sync_version
-                instance.is_deleted = is_deleted
+                if not _del_denied:           # SYNC_DENY_FROM_BRANCH guard (e.g. User.is_deleted)
+                    instance.is_deleted = is_deleted
                 instance.synced_at = timezone.now()
                 # Preserve the record's OWNER on update. Overwriting branch_id
                 # with the pushing branch stole ownership of a cloud-owned record
@@ -318,7 +327,8 @@ class CloudReceiver:
                     for fk_field, fk_instance in resolved_fks.items():
                         setattr(instance, fk_field, fk_instance)
                     instance.sync_version = sync_version
-                    instance.is_deleted = is_deleted
+                    if not _del_denied:       # SYNC_DENY_FROM_BRANCH guard (e.g. User.is_deleted)
+                        instance.is_deleted = is_deleted
                     instance.synced_at = timezone.now()
                     # Reconcile = update of an existing row: preserve its owner
                     # (see the update branch above). Only tag if untagged.
