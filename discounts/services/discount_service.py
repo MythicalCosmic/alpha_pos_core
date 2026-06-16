@@ -22,6 +22,7 @@ def _serialize_discount(discount):
         'description': discount.description,
         'value': str(discount.value),
         'min_order_amount': str(discount.min_order_amount) if discount.min_order_amount else None,
+        'is_staff_only': discount.is_staff_only,
         'max_discount_amount': str(discount.max_discount_amount) if discount.max_discount_amount else None,
         'applies_to': discount.applies_to,
         'target_product_ids': discount.target_product_ids,
@@ -175,7 +176,7 @@ class DiscountService:
         # mass-assignment. Mirrors the allowlist in update().
         allowed_fields = {
             'name', 'code', 'description', 'value', 'min_order_amount',
-            'max_discount_amount', 'applies_to', 'target_product_ids',
+            'is_staff_only', 'max_discount_amount', 'applies_to', 'target_product_ids',
             'target_category_ids', 'buy_quantity', 'get_quantity',
             'free_product', 'free_product_id', 'secret_word', 'usage_limit',
             'usage_per_user', 'start_date', 'end_date', 'is_stackable',
@@ -217,7 +218,7 @@ class DiscountService:
 
         allowed_fields = {
             'name', 'code', 'description', 'value', 'min_order_amount',
-            'max_discount_amount', 'applies_to', 'target_product_ids',
+            'is_staff_only', 'max_discount_amount', 'applies_to', 'target_product_ids',
             'target_category_ids', 'buy_quantity', 'get_quantity',
             'free_product', 'free_product_id', 'secret_word', 'usage_limit',
             'usage_per_user', 'start_date', 'end_date', 'is_stackable',
@@ -445,6 +446,11 @@ class DiscountService:
             return ServiceResponse.error(
                 f"Minimum order amount of {discount.min_order_amount} is required"
             )
+
+        # Staff-only discount: only an order attributed to an is_staff customer
+        # qualifies (employee personal orders). Open discounts skip this.
+        if discount.is_staff_only and not (order.customer and order.customer.is_staff):
+            return ServiceResponse.error("This discount is available to staff customers only")
 
         # Check if discount already applied
         existing = OrderDiscountRepository.get_for_order(order_id).filter(

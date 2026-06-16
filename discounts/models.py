@@ -46,6 +46,9 @@ class Discount(SyncMixin, models.Model):
     min_order_amount = models.DecimalField(
         max_digits=12, decimal_places=2, null=True, blank=True,
     )
+    # Staff-only: this discount applies only to an order whose customer is
+    # flagged is_staff (employee personal orders). Default False = open to all.
+    is_staff_only = models.BooleanField(default=False)
     max_discount_amount = models.DecimalField(
         max_digits=12, decimal_places=2, null=True, blank=True,
     )
