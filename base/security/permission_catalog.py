@@ -55,6 +55,9 @@ DEFAULT_ROLE_PERMISSIONS = {
     'WAITER': [
         'order.create', 'order.update',
     ],
+    # Kitchen label, created without a password and can't log in (no picker
+    # entry) — so it holds no POS permissions.
+    'CHEF': [],
     'USER': [],
 }
 

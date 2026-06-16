@@ -473,6 +473,10 @@ class User(SyncMixin, models.Model):
         # (settings, etc.). Gated server-side via role_required('MANAGER').
         MANAGER = "MANAGER", "Manager"
         WAITER = "WAITER", "Waiter"
+        # Kitchen staff. Created without a password (non-login label — used for
+        # kitchen attribution / KDS), so it never appears in the cashier login
+        # picker (get_pos_staff admits only CASHIER/MANAGER) and can't sign in.
+        CHEF = "CHEF", "Chef"
 
     class UserStatus(models.TextChoices):
         ACTIVE = "ACTIVE", "Active"
@@ -848,6 +852,34 @@ class Table(SyncMixin, models.Model):
         return f"Table {self.number} ({self.place.name})"
 
 
+class Customer(SyncMixin, models.Model):
+    """A client/customer an order can be attributed to — created from the
+    desktop POS (by phone) AND reconciled from the Telegram mini-app
+    (smartfood.Customer) at dispatch. Syncs branch<->cloud by uuid like
+    DeliveryPerson, so the client id on an order is visible everywhere.
+
+    `is_staff` marks a customer who is also a staff member (e.g. an employee
+    placing a personal order) — used for staff-discount / reporting splits."""
+    name = models.CharField(max_length=120, blank=True, default='')
+    phone_number = models.CharField(max_length=20, blank=True, default='', db_index=True)
+    email = models.EmailField(blank=True, default='')
+    # Links a base.Customer back to the Telegram mini-app customer it came from,
+    # so the server can reconcile smartfood orders onto the same client.
+    telegram_id = models.BigIntegerField(null=True, blank=True, db_index=True)
+    # A customer who is also staff (employee personal orders, staff pricing).
+    is_staff = models.BooleanField(default=False, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    objects = SyncManager()
+
+    class Meta:
+        ordering = ['-id']
+
+    def __str__(self):
+        return self.name or self.phone_number or f'Customer #{self.pk}'
+
+
 class Order(SyncMixin, models.Model):
     class Status(models.TextChoices):
         OPEN = "OPEN", "Open"
@@ -891,6 +923,16 @@ class Order(SyncMixin, models.Model):
         null=True,
         blank=True,
         related_name="handled_orders",
+    )
+    # The client this order is for (desktop: by phone; Telegram: reconciled from
+    # smartfood.Customer at dispatch). Nullable — legacy/walk-in orders have none.
+    customer = models.ForeignKey(
+        'Customer',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="orders",
+        db_index=True,
     )
 
     display_id = models.IntegerField(default=1)
@@ -974,6 +1016,7 @@ class Order(SyncMixin, models.Model):
         data['delivery_person_uuid'] = str(self.delivery_person.uuid) if self.delivery_person else None
         data['place_uuid'] = str(self.place.uuid) if self.place else None
         data['table_uuid'] = str(self.table.uuid) if self.table else None
+        data['customer_uuid'] = str(self.customer.uuid) if self.customer else None
         return data
 
     @classmethod
@@ -985,6 +1028,7 @@ class Order(SyncMixin, models.Model):
         user_uuid = data.pop('user_uuid', None)
         cashier_uuid = data.pop('cashier_uuid', None)
         delivery_person_uuid = data.pop('delivery_person_uuid', None)
+        customer_uuid = data.pop('customer_uuid', None)
         uuid_val = data.pop('uuid')
         sync_version = data.pop('sync_version', 1)
         is_deleted = data.pop('is_deleted', False)
@@ -1025,6 +1069,16 @@ class Order(SyncMixin, models.Model):
             except DeliveryPerson.DoesNotExist:
                 delivery_unresolved = True
 
+        # Optional client link — same soft-FK rule as cashier/delivery_person: a
+        # uuid not yet synced locally must not wipe an existing link on update.
+        customer = None
+        customer_unresolved = False
+        if customer_uuid:
+            try:
+                customer = Customer.objects.get(uuid=customer_uuid)
+            except Customer.DoesNotExist:
+                customer_unresolved = True
+
         if not user:
             # Required FK (Order.user) not present yet — defer for retry after
             # the rest of the pull lands the user, instead of erroring it away.
@@ -1057,6 +1111,8 @@ class Order(SyncMixin, models.Model):
                 instance.cashier = cashier
             if not delivery_unresolved:
                 instance.delivery_person = delivery_person
+            if not customer_unresolved:
+                instance.customer = customer
             instance.sync_version = sync_version
             instance.is_deleted = is_deleted
             instance.synced_at = timezone.now()
@@ -1075,6 +1131,7 @@ class Order(SyncMixin, models.Model):
                 user=user,
                 cashier=cashier,
                 delivery_person=delivery_person,
+                customer=customer,
             )
             for key, value in cls._strip_sync_denied(data, creating=True).items():
                 if hasattr(instance, key):
