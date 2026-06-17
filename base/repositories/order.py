@@ -144,8 +144,15 @@ class OrderRepository(BaseSyncRepository):
     def build_filtered_queryset(cls, statuses=None, payment_status=None,
                                  category_ids=None, user_id=None, cashier_id=None,
                                  order_type=None, date_from=None, date_to=None,
-                                 order_by='-created_at', include_deleted=False):
+                                 order_by='-created_at', include_deleted=False,
+                                 customer_id=None):
         qs = cls.get_with_relations(include_deleted=include_deleted)
+
+        # Scope to one client (base.Customer) — powers the returning-client history
+        # lookup. customer_id is the client, distinct from user_id (the staff
+        # operator who rang the order).
+        if customer_id:
+            qs = qs.filter(customer_id=customer_id)
 
         if payment_status:
             payment_status = payment_status.strip().upper()

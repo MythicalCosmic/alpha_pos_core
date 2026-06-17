@@ -879,6 +879,63 @@ class Customer(SyncMixin, models.Model):
     def __str__(self):
         return self.name or self.phone_number or f'Customer #{self.pk}'
 
+    @staticmethod
+    def normalize_phone(phone):
+        """Reduce a phone to a comparable key: digits only, with the UZ country
+        code. '+998 90 123-45-67', '998901234567', and '901234567' all collapse
+        to '998901234567', so the same human matches across desktop + Telegram."""
+        if not phone:
+            return ''
+        digits = ''.join(ch for ch in str(phone) if ch.isdigit())
+        if len(digits) == 9:            # bare national number -> add the UZ code
+            digits = '998' + digits
+        return digits
+
+    @classmethod
+    def resolve(cls, phone=None, telegram_id=None, name=None):
+        """Find-or-create the ONE master client for this person, converging the
+        in-store (phone) and Telegram (telegram_id) identities onto a single row.
+
+        Match priority: telegram_id, then exact phone, then normalized phone. On a
+        match we backfill whichever key/name is missing (never clobbering existing
+        data) so the next lookup from either channel hits the same row. This is the
+        join that lets a walk-in's in-store orders + a bot login share one history.
+        Returns (customer, created)."""
+        name = (name or '').strip()[:120]
+        phone = (str(phone).strip()[:20] if phone else '')
+        norm = cls.normalize_phone(phone)
+        qs = cls.objects.filter(is_deleted=False)
+
+        # Phone is the cross-channel key, so match it FIRST: a Telegram login that
+        # shares its number converges onto the in-store walk-in row (created by
+        # phone on the desktop) rather than spawning a second telegram-only row.
+        customer = None
+        if phone:
+            customer = qs.filter(phone_number=phone).order_by('id').first()    # fast exact (indexed)
+        if customer is None and norm:
+            # Normalized fallback: a stored variant of the same number ('+998…', spaces).
+            for cid, cphone in qs.exclude(phone_number='').values_list('id', 'phone_number'):
+                if cls.normalize_phone(cphone) == norm:
+                    customer = cls.objects.get(id=cid)
+                    break
+        if customer is None and telegram_id:
+            customer = qs.filter(telegram_id=telegram_id).order_by('id').first()
+
+        if customer is None:
+            return cls.objects.create(
+                name=name, phone_number=phone, telegram_id=telegram_id or None), True
+
+        changed = False
+        if telegram_id and not customer.telegram_id:
+            customer.telegram_id = telegram_id; changed = True
+        if phone and not customer.phone_number:
+            customer.phone_number = phone; changed = True
+        if name and not customer.name:
+            customer.name = name; changed = True
+        if changed:
+            customer.save()
+        return customer, False
+
 
 class Order(SyncMixin, models.Model):
     class Status(models.TextChoices):
