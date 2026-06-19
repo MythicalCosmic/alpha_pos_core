@@ -16,6 +16,7 @@ Both backends return (text, error) where error is None on success, or one of
 those codes identically regardless of provider, so switching is a config change.
 """
 import logging
+import time
 
 from django.conf import settings
 
@@ -29,6 +30,24 @@ except ImportError:
 # Current Sonnet — same price as 4.5, 1M context. Override via ANTHROPIC_MODEL.
 DEFAULT_CLAUDE_MODEL = 'claude-sonnet-4-6'
 DEFAULT_GEMINI_MODEL = 'gemini-2.5-flash'
+
+# If the configured Gemini model is overloaded (503 'high demand'), fall back to a
+# model on a different capacity pool before giving up — the flash models spike
+# independently. Tried in order after the configured one.
+GEMINI_FALLBACK_MODELS = ('gemini-2.0-flash',)
+
+# Provider-side overloads worth retrying rather than surfacing as a hard failure:
+# Gemini flash 503 UNAVAILABLE 'high demand', 429 quota spikes, Anthropic 529
+# overloaded. Matched (case-insensitively) against the SDK's error string.
+_TRANSIENT_MARKERS = (
+    '503', '529', 'unavailable', 'overloaded', 'high demand',
+    '429', 'resource_exhausted', 'rate limit', 'try again',
+)
+
+
+def _is_transient(err) -> bool:
+    e = (err or '').lower()
+    return any(m in e for m in _TRANSIENT_MARKERS)
 
 
 def _timeout_seconds():
@@ -55,11 +74,23 @@ def key_missing():
     return not (getattr(settings, 'ANTHROPIC_API_KEY', '') or '')
 
 
-def call_ai(prompt, system=None, max_tokens=2048):
-    """Dispatch to the configured provider. Returns (text, error)."""
-    if get_provider() == 'gemini':
-        return _call_gemini(prompt, system, max_tokens)
-    return _call_claude(prompt, system, max_tokens)
+def call_ai(prompt, system=None, max_tokens=2048, retries=2):
+    """Dispatch to the configured provider, retrying transient provider overloads
+    (Gemini flash 503 'high demand' / 429) with backoff. A 503 returns fast, so the
+    retries cost little and turn a transient spike into a successful answer instead
+    of 'AI assistant temporarily unavailable'. Returns (text, error)."""
+    fn = _call_gemini if get_provider() == 'gemini' else _call_claude
+    delay = 1.0
+    text, err = fn(prompt, system, max_tokens)
+    for attempt in range(retries):
+        if err is None or not _is_transient(err):
+            break
+        logger.warning('LLM transient overload (retry %d/%d): %s',
+                       attempt + 1, retries, str(err)[:120])
+        time.sleep(delay)
+        delay = min(delay * 2, 8)
+        text, err = fn(prompt, system, max_tokens)
+    return text, err
 
 
 def _call_claude(prompt, system, max_tokens):
@@ -112,12 +143,24 @@ def _call_gemini(prompt, system, max_tokens):
             )
         except (TypeError, AttributeError):
             client = genai.Client(api_key=api_key)
-        resp = client.models.generate_content(
-            model=model,
-            contents=contents,
-            config=types.GenerateContentConfig(max_output_tokens=max_tokens),
-        )
-        return resp.text, None
-    except Exception as e:  # noqa: BLE001
+        # Try the configured model, then fall back to a model on a different
+        # capacity pool if the primary is overloaded (503). A non-transient error
+        # (bad key / bad request) stops immediately — a fallback won't help.
+        candidates = [model] + [m for m in GEMINI_FALLBACK_MODELS if m != model]
+        last_err = None
+        cfg = types.GenerateContentConfig(max_output_tokens=max_tokens)
+        for m in candidates:
+            try:
+                resp = client.models.generate_content(model=m, contents=contents, config=cfg)
+                if m != model:
+                    logger.info('gemini: answered via fallback model %s', m)
+                return resp.text, None
+            except Exception as e:  # noqa: BLE001
+                last_err = str(e)
+                logger.warning('gemini model %s failed: %s', m, last_err[:160])
+                if not _is_transient(last_err):
+                    return None, last_err
+        return None, last_err
+    except Exception as e:  # noqa: BLE001 — client construction / unexpected
         logger.exception('gemini call failed')
         return None, str(e)
