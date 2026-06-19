@@ -198,20 +198,28 @@ class ShiftService:
         if shift.status != 'ACTIVE':
             return ServiceResponse.error("Shift is not active")
 
-        # A shift can't be closed while it still has work in flight: an order the
-        # cashier opened this shift that hasn't been served or cancelled. Closing
-        # over an open order would freeze the drawer mid-sale and orphan the order
-        # on the kitchen line. The cashier must complete or cancel them first.
-        open_orders = Order.objects.filter(
+        # Only a genuinely in-progress sale blocks the close: an OPEN cart that is
+        # still UNPAID (the cashier is mid-transaction and no money has entered the
+        # drawer for it). Everything else carries over and must NOT make the till
+        # impossible to close:
+        #   - PAID orders are settled — their cash is attributed by paid_at, so they
+        #     belong to this shift's totals whether or not the kitchen has finished.
+        #   - Orders already sent to the kitchen (PREPARING/READY) are committed; they
+        #     stay on the line and hand over to the kitchen / next shift.
+        # The old guard blocked on ANY OPEN/PREPARING/READY order regardless of
+        # payment, so paid orders the kitchen never marked COMPLETED piled up and the
+        # shift could never be closed at all (the bug this fixes).
+        blocking = Order.objects.filter(
             is_deleted=False,
             cashier_id=shift.user_id,
             created_at__gte=shift.start_time,
-            status__in=[Order.Status.OPEN, Order.Status.PREPARING, Order.Status.READY],
+            is_paid=False,
+            status=Order.Status.OPEN,
         ).count()
-        if open_orders:
+        if blocking:
             return ServiceResponse.error(
-                f"Cannot close shift while {open_orders} order(s) are still open. "
-                "Complete or cancel them first."
+                f"Cannot close shift while {blocking} unpaid order(s) are still open. "
+                "Take payment or cancel them first."
             )
 
         now = timezone.now()
