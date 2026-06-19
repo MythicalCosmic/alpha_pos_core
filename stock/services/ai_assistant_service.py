@@ -113,6 +113,27 @@ When giving business advice, base it on the analytics data provided:
 You will receive real-time database data in JSON format including pre-computed analytics. Analyze it and respond accurately based ONLY on the provided data."""
 
 
+# When the active provider is Claude the assistant is given read-only tools to
+# query the live database itself, so it is no longer limited to a fixed snapshot.
+# This addendum tells it those tools exist and to use them for full detail.
+TOOLS_SYSTEM_PROMPT = SYSTEM_PROMPT + """
+
+=== LIVE DATA TOOLS ===
+You have read-only tools to query the live database directly. You can see EVERYTHING:
+every order (and exactly what is inside each order), every line item, every payment,
+open and closed shifts, every cashier, every product, all stock, and any date range.
+
+- Call get_datetime first for any relative date ("today", "this week", "yesterday").
+- Use list_orders to find orders by date / cashier / status / product / customer, then
+  get_order to see the full line-item and payment breakdown of a specific order.
+- Use get_open_shifts for who is working right now; get_shift / list_shifts for shift detail.
+- Use list_cashiers / get_cashier for staff; list_products and list_stock for catalog/inventory;
+  sales_report for revenue over any date range; business_analytics for ABC/XYZ/menu/etc.
+- ALWAYS call tools to get real numbers — never guess or invent data. Call as many tools as
+  you need (you may call several at once). Page with offset or narrow with filters if a list
+  is capped. Base every figure in your answer on tool results. Follow all language/format rules."""
+
+
 class AIStockAssistant:
 
     # The model + key live in base.services.llm (ANTHROPIC_MODEL /
@@ -334,7 +355,7 @@ class AIStockAssistant:
         thirty_days_ago = today - timedelta(days=30)
 
         levels = StockLevel.objects.filter(
-            stock_item__is_active=True
+            is_deleted=False, stock_item__is_active=True
         ).select_related("stock_item", "location", "stock_item__base_unit")
 
         stock_items = []
@@ -371,6 +392,7 @@ class AIStockAssistant:
                 out_of_stock.append(item_data)
 
         expiring = StockBatch.objects.filter(
+            is_deleted=False,
             expiry_date__lte=today + timedelta(days=14),
             expiry_date__gt=today,
             current_quantity__gt=0
@@ -388,6 +410,7 @@ class AIStockAssistant:
         } for b in expiring]
 
         expired = StockBatch.objects.filter(
+            is_deleted=False,
             expiry_date__lt=today,
             current_quantity__gt=0
         ).select_related("stock_item", "location")[:20]
@@ -404,6 +427,7 @@ class AIStockAssistant:
         } for b in expired]
 
         consumption = StockTransaction.objects.filter(
+            is_deleted=False,
             movement_type__in=["SALE_OUT", "PRODUCTION_OUT"],
             created_at__date__gte=thirty_days_ago
         ).values("stock_item__name", "stock_item__base_unit__short_name").annotate(
@@ -474,7 +498,7 @@ class AIStockAssistant:
             for ing in r.ingredients.all():
                 cost = float(ing.stock_item.avg_cost_price * ing.quantity)
                 total_cost += cost
-                avail = StockLevel.objects.filter(stock_item=ing.stock_item).aggregate(t=Sum("quantity"))["t"] or 0
+                avail = StockLevel.objects.filter(is_deleted=False, stock_item=ing.stock_item).aggregate(t=Sum("quantity"))["t"] or 0
                 ingredients.append({
                     "item": ing.stock_item.name,
                     "qty": float(ing.quantity),
@@ -528,6 +552,7 @@ class AIStockAssistant:
         cutoff = timezone.now().date() - timedelta(days=days)
 
         consumption = StockTransaction.objects.filter(
+            is_deleted=False,
             movement_type__in=["SALE_OUT", "PRODUCTION_OUT"],
             created_at__date__gte=cutoff
         ).values(
@@ -596,6 +621,7 @@ class AIStockAssistant:
         num_weeks = max(days // 7, 1)
 
         weekly_consumption = StockTransaction.objects.filter(
+            is_deleted=False,
             movement_type__in=["SALE_OUT", "PRODUCTION_OUT"],
             created_at__date__gte=cutoff
         ).annotate(
@@ -893,11 +919,12 @@ class AIStockAssistant:
         cutoff = timezone.now().date() - timedelta(days=days)
 
         levels = StockLevel.objects.filter(
-            stock_item__is_active=True
+            is_deleted=False, stock_item__is_active=True
         ).select_related("stock_item", "stock_item__base_unit", "location")
 
         consumption = dict(
             StockTransaction.objects.filter(
+                is_deleted=False,
                 movement_type__in=["SALE_OUT", "PRODUCTION_OUT"],
                 created_at__date__gte=cutoff
             ).values("stock_item_id").annotate(
@@ -906,13 +933,14 @@ class AIStockAssistant:
         )
 
         last_movement = dict(
-            StockTransaction.objects.values("stock_item_id").annotate(
+            StockTransaction.objects.filter(is_deleted=False).values("stock_item_id").annotate(
                 last=Max("created_at")
             ).values_list("stock_item_id", "last")
         )
 
         waste = dict(
             StockTransaction.objects.filter(
+                is_deleted=False,
                 movement_type__in=["WASTE", "SPOILAGE"],
                 created_at__date__gte=cutoff
             ).values("stock_item_id").annotate(
@@ -1123,35 +1151,60 @@ class AIStockAssistant:
                 "response": f"Daily AI query quota exceeded ({quota} per day).",
             }
         try:
-            stock_data = cls._get_all_stock_data()
-            sales_data = cls._get_sales_data()
+            from base.services.llm import call_ai, call_ai_tools, can_use_tools
 
-            combined_data = {
-                "date": timezone.now().date().isoformat(),
-                "sales_and_business": sales_data,
-                "stock_and_inventory": stock_data,
-            }
+            if can_use_tools():
+                # Claude path: hand the model read-only tools so it can drill into
+                # any order/shift/date/cashier/product itself — true "see everything"
+                # detail that never fits in a single pre-computed snapshot.
+                from stock.services.ai_tools_service import AIToolbox
+                overview = AIToolbox.execute('get_overview', {}, location_id)
+                prompt = f"""USER QUERY: {query}
 
-            if cls._needs_analytics(query):
-                combined_data["business_analytics"] = {
-                    "abc_analysis": cls._get_abc_analysis(),
-                    "xyz_analysis": cls._get_xyz_analysis(),
-                    "abc_xyz_matrix": cls._get_abc_xyz_matrix(),
-                    "menu_engineering": cls._get_menu_engineering(),
-                    "profitability": cls._get_profitability_analysis(),
-                    "inventory_health": cls._get_inventory_health(),
-                    "sales_velocity": cls._get_sales_velocity(),
+QUICK OVERVIEW (call tools for anything more specific):
+{overview}
+
+Answer the user's query in full, specific detail. Use your tools to look up exact
+orders, line items, shifts, cashiers, products, stock and any dates you need. Base
+every number on tool results. Follow all language and formatting rules."""
+                text, err = call_ai_tools(
+                    prompt,
+                    system=TOOLS_SYSTEM_PROMPT,
+                    tools=AIToolbox.TOOLS,
+                    tool_executor=lambda n, a: AIToolbox.execute(n, a, location_id),
+                    max_tokens=4096,
+                )
+            else:
+                # Snapshot path (Gemini, or the Claude SDK isn't installed): one big
+                # pre-computed context in a single call, no live drill-down.
+                stock_data = cls._get_all_stock_data()
+                sales_data = cls._get_sales_data()
+
+                combined_data = {
+                    "date": timezone.now().date().isoformat(),
+                    "sales_and_business": sales_data,
+                    "stock_and_inventory": stock_data,
                 }
 
-            prompt = f"""USER QUERY: {query}
+                if cls._needs_analytics(query):
+                    combined_data["business_analytics"] = {
+                        "abc_analysis": cls._get_abc_analysis(),
+                        "xyz_analysis": cls._get_xyz_analysis(),
+                        "abc_xyz_matrix": cls._get_abc_xyz_matrix(),
+                        "menu_engineering": cls._get_menu_engineering(),
+                        "profitability": cls._get_profitability_analysis(),
+                        "inventory_health": cls._get_inventory_health(),
+                        "sales_velocity": cls._get_sales_velocity(),
+                    }
+
+                prompt = f"""USER QUERY: {query}
 
 CURRENT DATABASE STATE:
 {json.dumps(combined_data, indent=2, default=str, ensure_ascii=False)}
 
 Respond to the user's query based on this data. Follow all language and formatting rules from your instructions."""
 
-            from base.services.llm import call_ai
-            text, err = call_ai(prompt, system=SYSTEM_PROMPT, max_tokens=2048)
+                text, err = call_ai(prompt, system=SYSTEM_PROMPT, max_tokens=2048)
             if err == 'llm_key_missing':
                 return {
                     "success": False,

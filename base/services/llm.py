@@ -93,6 +93,111 @@ def call_ai(prompt, system=None, max_tokens=2048, retries=2):
     return text, err
 
 
+def can_use_tools() -> bool:
+    """True when the agentic (tool-use) path is available: the Claude provider is
+    selected and the anthropic SDK is importable. Tool use lets the assistant
+    drill into any order/shift/date/cashier/product on demand instead of being
+    limited to a fixed pre-computed snapshot — only Claude implements it here."""
+    return get_provider() == 'claude' and anthropic is not None
+
+
+def call_ai_tools(prompt, system=None, tools=None, tool_executor=None,
+                  max_tokens=4096, max_iterations=10, retries=2):
+    """Run Claude in a tool-use loop so it can read the live database in full
+    detail. `tools` is a list of Anthropic tool schemas; `tool_executor(name,
+    input_dict)` executes one tool call and returns its result as a string
+    (typically JSON). The loop feeds tool results back until the model answers
+    with text or the iteration budget is spent.
+
+    Only the Claude provider runs tools. If the provider is not Claude, the SDK
+    is missing, or no tools/executor were supplied, this falls back to a single
+    `call_ai()` so the caller never has to branch. Returns (text, error) with the
+    same error codes as `call_ai` ('llm_key_missing' / 'llm_sdk_missing' / raw)."""
+    if (not can_use_tools() or not tools or tool_executor is None):
+        return call_ai(prompt, system=system, max_tokens=max_tokens, retries=retries)
+
+    api_key = getattr(settings, 'ANTHROPIC_API_KEY', '') or ''
+    if not api_key:
+        return None, 'llm_key_missing'
+    model = getattr(settings, 'ANTHROPIC_MODEL', '') or DEFAULT_CLAUDE_MODEL
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key, timeout=_timeout_seconds())
+    except Exception as e:  # noqa: BLE001
+        logger.exception('claude client init failed')
+        return None, str(e)
+
+    messages = [{'role': 'user', 'content': prompt}]
+
+    def _create(include_tools):
+        # One create() call, retrying transient provider overloads (529 / 'high
+        # demand') with backoff — same policy as call_ai's single-shot path.
+        kwargs = {'model': model, 'max_tokens': max_tokens, 'messages': messages}
+        if system:
+            kwargs['system'] = system
+        if include_tools:
+            kwargs['tools'] = tools
+        delay = 1.0
+        last_err = None
+        for attempt in range(retries + 1):
+            try:
+                return client.messages.create(**kwargs), None
+            except Exception as e:  # noqa: BLE001
+                last_err = str(e)
+                if attempt < retries and _is_transient(last_err):
+                    logger.warning('claude transient overload (retry %d/%d): %s',
+                                   attempt + 1, retries, last_err[:120])
+                    time.sleep(delay)
+                    delay = min(delay * 2, 8)
+                    continue
+                return None, last_err
+        return None, last_err
+
+    def _text(resp):
+        return ''.join(
+            b.text for b in resp.content if getattr(b, 'type', None) == 'text'
+        )
+
+    try:
+        for _ in range(max_iterations):
+            resp, err = _create(include_tools=True)
+            if err:
+                return None, err
+            if getattr(resp, 'stop_reason', None) != 'tool_use':
+                return _text(resp), None
+
+            # Echo the assistant turn (incl. tool_use blocks), then run every
+            # requested tool and return all results in one user turn.
+            messages.append({'role': 'assistant', 'content': resp.content})
+            results = []
+            for block in resp.content:
+                if getattr(block, 'type', None) != 'tool_use':
+                    continue
+                try:
+                    out = tool_executor(block.name, dict(block.input or {}))
+                    results.append({
+                        'type': 'tool_result', 'tool_use_id': block.id,
+                        'content': out if isinstance(out, str) else str(out),
+                    })
+                except Exception as e:  # noqa: BLE001
+                    logger.exception('AI tool %s failed', getattr(block, 'name', '?'))
+                    results.append({
+                        'type': 'tool_result', 'tool_use_id': block.id,
+                        'content': f'Tool error: {e}', 'is_error': True,
+                    })
+            messages.append({'role': 'user', 'content': results})
+
+        # Iteration budget spent while still calling tools: ask once more with
+        # tools withheld so the model must answer from what it has gathered.
+        resp, err = _create(include_tools=False)
+        if err:
+            return None, err
+        return _text(resp), None
+    except Exception as e:  # noqa: BLE001
+        logger.exception('claude tool loop failed')
+        return None, str(e)
+
+
 def _call_claude(prompt, system, max_tokens):
     if anthropic is None:
         return None, 'llm_sdk_missing'

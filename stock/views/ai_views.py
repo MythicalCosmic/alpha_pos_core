@@ -55,10 +55,12 @@ def ai_query(request):
         'rate_limited': 429,
         'quota_exceeded': 429,
         'invalid_query': 422,
-        'empty_query': 422,
+        'query_too_long': 422,
         'no_api_key': 503,
-        'gemini_error': 502,
-        'ai_unavailable': 503,
+        # Provider unavailable / SDK missing / unexpected error — a server-side
+        # failure, so return 5xx (not a client 400) and the desktop panel + infra
+        # alerting can tell an outage apart from a bad request.
+        'internal_error': 503,
     }
     status = status_map.get(error_code, 200 if result.get('success') else 400)
     return JsonResponse(result, status=status)
