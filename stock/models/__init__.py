@@ -15,6 +15,7 @@ from stock.models.production import ProductionOrder, ProductionOrderIngredient, 
 from stock.models.transfers import StockTransfer, StockTransferItem
 from stock.models.counts import VarianceReasonCode, StockCount, StockCountItem
 from stock.models.settings import StockSettings, StockAlertConfig
+from stock.models.ai_chat import AIChat, AIMessage
 
 __all__ = [
     'StockLocation',
@@ -50,4 +51,6 @@ __all__ = [
     'StockCountItem',
     'StockSettings',
     'StockAlertConfig',
+    'AIChat',
+    'AIMessage',
 ]

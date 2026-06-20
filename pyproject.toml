@@ -26,6 +26,7 @@ dependencies = [
     "whitenoise==6.8.2",
     "anthropic==0.74.0",        # base/services/llm.py (stock assistant / forecaster)
     "google-genai==2.7.0",
+    "openai==2.43.0",           # base/services/llm.py — OpenAI provider (gpt-5.4-mini)
 ]
 
 [tool.setuptools.packages.find]

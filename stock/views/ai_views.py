@@ -7,6 +7,7 @@ from base.helpers.response import json_response, ServiceResponse
 from base.security.rate_limit import rate_limit
 from base.security.permissions import admin_required
 from stock.services.ai_assistant_service import AIStockAssistant
+from stock.services.ai_chat_service import AIChatService
 
 
 # Each query runs a batch of heavy aggregate ORM queries AND a billable Gemini
@@ -40,10 +41,13 @@ def ai_query(request):
             errors={'query': 'Query is required'},
         ))
 
-    result = AIStockAssistant.process_query(
-        query=query,
-        context=data.get('context'),
+    # Persisted, multi-turn: pass chat_id to continue a conversation (history is
+    # replayed to the model), or omit it to start a new chat. The response carries
+    # back chat_id so the client can keep the thread going.
+    result = AIChatService.send(
         user_id=request.user.id,
+        query=query,
+        chat_id=data.get('chat_id'),
         location_id=data.get('location_id'),
     )
     # Map service-layer error codes to real HTTP status codes so clients can
@@ -134,5 +138,55 @@ def ai_quick_actions(request):
         {'id': 'forecast', 'label': 'Forecast', 'icon': 'crystal-ball', 'query': 'When will items run out?'},
     ]
     return JsonResponse({'success': True, 'actions': actions})
+
+
+# ── Chat history ──
+# The assistant now keeps persisted, per-operator conversations. The client sends
+# chat_id with /ai/query/ to continue a thread; these endpoints list/open/delete
+# the saved chats. All admin-gated like the rest of the AI surface.
+
+@csrf_exempt
+@require_GET
+@admin_required
+def ai_chats(request):
+    """List the signed-in operator's saved chats (most-recent first)."""
+    return JsonResponse({'success': True, 'chats': AIChatService.list_chats(request.user.id)})
+
+
+@csrf_exempt
+@require_GET
+@admin_required
+def ai_chat_messages(request, chat_id):
+    """The full message history of one chat (404 if it isn't the caller's)."""
+    chat = AIChatService.get_chat(request.user.id, chat_id)
+    if chat is None:
+        return JsonResponse({'success': False, 'message': 'Chat not found'}, status=404)
+    return JsonResponse({'success': True, 'chat': chat})
+
+
+@csrf_exempt
+@require_POST
+@admin_required
+def ai_chat_delete(request, chat_id):
+    """Soft-delete a chat."""
+    if not AIChatService.delete_chat(request.user.id, chat_id):
+        return JsonResponse({'success': False, 'message': 'Chat not found'}, status=404)
+    return JsonResponse({'success': True})
+
+
+@csrf_exempt
+@require_POST
+@admin_required
+def ai_chat_rename(request, chat_id):
+    """Rename a chat (body: {"title": "..."})."""
+    data, error = parse_json_body(request)
+    if error:
+        return json_response(error)
+    title = ((data or {}).get('title') or '').strip()
+    if not title:
+        return JsonResponse({'success': False, 'message': 'Title is required'}, status=422)
+    if not AIChatService.rename_chat(request.user.id, chat_id, title):
+        return JsonResponse({'success': False, 'message': 'Chat not found'}, status=404)
+    return JsonResponse({'success': True})
 
 

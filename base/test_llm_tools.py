@@ -43,7 +43,7 @@ def test_call_ai_tools_falls_back_when_not_claude(settings, monkeypatch):
     settings.AI_PROVIDER = 'gemini'
     seen = {}
 
-    def fake_call_ai(prompt, system=None, max_tokens=2048, retries=2):
+    def fake_call_ai(prompt, system=None, max_tokens=2048, retries=2, history=None):
         seen['prompt'] = prompt
         return 'PLAIN', None
 
@@ -91,6 +91,89 @@ def test_call_ai_tools_runs_the_tool_loop(settings, monkeypatch):
         and m['content'][0].get('type') == 'tool_result'
         for m in second
     )
+
+
+def test_history_messages_filters_to_clean_turns():
+    out = llm._history_messages([
+        {'role': 'user', 'content': 'a'},
+        {'role': 'assistant', 'content': 'b'},
+        {'role': 'system', 'content': 'dropped'},   # only user/assistant kept
+        {'role': 'user', 'content': ''},             # empty dropped
+        'garbage',                                   # non-dict dropped
+        {'role': 'user', 'content': 'c'},
+    ])
+    assert out == [
+        {'role': 'user', 'content': 'a'},
+        {'role': 'assistant', 'content': 'b'},
+        {'role': 'user', 'content': 'c'},
+    ]
+
+
+def test_call_openai_builds_messages_and_uses_completion_tokens(settings, monkeypatch):
+    settings.AI_PROVIDER = 'openai'
+    settings.OPENAI_API_KEY = 'k'
+    settings.OPENAI_MODEL = 'gpt-5.4-mini'
+
+    captured = {}
+
+    class _Msg:
+        content = 'OPENAI ANSWER'
+
+    class _Choice:
+        message = _Msg()
+
+    class _Resp:
+        choices = [_Choice()]
+
+    class _Completions:
+        def create(self, **kw):
+            captured.update(kw)
+            return _Resp()
+
+    class _Client:
+        def __init__(self, **kw):
+            self.chat = types.SimpleNamespace(completions=_Completions())
+
+    monkeypatch.setattr(llm, 'openai', types.SimpleNamespace(OpenAI=lambda **kw: _Client(**kw)))
+
+    text, err = llm.call_ai(
+        'best cashier?', system='SYS',
+        history=[{'role': 'user', 'content': 'q1'}, {'role': 'assistant', 'content': 'a1'}])
+
+    assert err is None and text == 'OPENAI ANSWER'
+    msgs = captured['messages']
+    assert msgs[0] == {'role': 'system', 'content': 'SYS'}
+    assert msgs[1] == {'role': 'user', 'content': 'q1'}
+    assert msgs[2] == {'role': 'assistant', 'content': 'a1'}
+    assert msgs[3] == {'role': 'user', 'content': 'best cashier?'}
+    # GPT-5-class models reject the legacy max_tokens.
+    assert 'max_completion_tokens' in captured and 'max_tokens' not in captured
+    assert captured['model'] == 'gpt-5.4-mini'
+
+
+def test_call_openai_empty_response_is_an_error(settings, monkeypatch):
+    # A GPT-5 reasoning model can return empty content (finish_reason='length');
+    # that must surface as an error, not a blank success.
+    settings.AI_PROVIDER = 'openai'
+    settings.OPENAI_API_KEY = 'k'
+
+    class _Msg:
+        content = None
+
+    class _Choice:
+        message = _Msg()
+
+    class _Resp:
+        choices = [_Choice()]
+
+    class _Client:
+        def __init__(self, **kw):
+            self.chat = types.SimpleNamespace(
+                completions=types.SimpleNamespace(create=lambda **k: _Resp()))
+
+    monkeypatch.setattr(llm, 'openai', types.SimpleNamespace(OpenAI=lambda **kw: _Client(**kw)))
+    text, err = llm.call_ai('hi')
+    assert text is None and err == 'openai_empty_response'
 
 
 def test_call_ai_tools_surfaces_tool_errors_without_crashing(settings, monkeypatch):

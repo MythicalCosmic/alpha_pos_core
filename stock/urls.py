@@ -123,4 +123,9 @@ urlpatterns = [
     path('ai/query/', ai_views.ai_query, name='ai-query'),
     path('ai/suggestions/', ai_views.ai_suggestions, name='ai-suggestions'),
     path('ai/quick-actions/', ai_views.ai_quick_actions, name='ai-quick-actions'),
+    # Chat history
+    path('ai/chats/', ai_views.ai_chats, name='ai-chats'),
+    path('ai/chats/<int:chat_id>/', ai_views.ai_chat_messages, name='ai-chat-messages'),
+    path('ai/chats/<int:chat_id>/delete/', ai_views.ai_chat_delete, name='ai-chat-delete'),
+    path('ai/chats/<int:chat_id>/rename/', ai_views.ai_chat_rename, name='ai-chat-rename'),
 ]

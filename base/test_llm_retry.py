@@ -15,6 +15,8 @@ def test_is_transient_classification():
     assert not llm._is_transient("401 invalid api key")
     assert not llm._is_transient("400 invalid model name")
     assert not llm._is_transient("")
+    # 429 insufficient_quota is a billing issue, not a transient overload — fail fast.
+    assert not llm._is_transient("Error code: 429 - insufficient_quota: You exceeded your current quota")
 
 
 @pytest.mark.django_db
@@ -23,7 +25,7 @@ def test_call_ai_retries_transient_then_succeeds(settings, monkeypatch):
     monkeypatch.setattr(llm.time, 'sleep', lambda *_: None)
     n = {'c': 0}
 
-    def fake(prompt, system, max_tokens):
+    def fake(prompt, system, max_tokens, history=None):
         n['c'] += 1
         return ("OK", None) if n['c'] >= 2 else (None, "503 UNAVAILABLE high demand")
 
@@ -37,7 +39,7 @@ def test_call_ai_does_not_retry_auth_error(settings, monkeypatch):
     settings.AI_PROVIDER = 'gemini'
     n = {'c': 0}
 
-    def fake(prompt, system, max_tokens):
+    def fake(prompt, system, max_tokens, history=None):
         n['c'] += 1
         return None, "401 API key not valid"
 

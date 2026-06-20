@@ -28,11 +28,22 @@ def test_gemini_key_missing(settings):
 
 def test_dispatch_routes_to_selected_provider(settings, monkeypatch):
     # Confirm call_ai routes by AI_PROVIDER without making a network call.
-    monkeypatch.setattr(llm, '_call_gemini', lambda p, s, m: ('GEM', None))
-    monkeypatch.setattr(llm, '_call_claude', lambda p, s, m: ('CLAUDE', None))
+    monkeypatch.setattr(llm, '_call_gemini', lambda p, s, m, h=None: ('GEM', None))
+    monkeypatch.setattr(llm, '_call_claude', lambda p, s, m, h=None: ('CLAUDE', None))
+    monkeypatch.setattr(llm, '_call_openai', lambda p, s, m, h=None: ('OPENAI', None))
 
     settings.AI_PROVIDER = 'gemini'
     assert llm.call_ai('hi')[0] == 'GEM'
 
     settings.AI_PROVIDER = 'claude'
     assert llm.call_ai('hi')[0] == 'CLAUDE'
+
+    settings.AI_PROVIDER = 'openai'
+    assert llm.call_ai('hi')[0] == 'OPENAI'
+
+
+def test_openai_key_missing(settings):
+    settings.AI_PROVIDER = 'openai'
+    settings.OPENAI_API_KEY = ''
+    text, err = llm.call_ai('hi')
+    assert text is None and err == 'llm_key_missing'

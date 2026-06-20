@@ -1130,7 +1130,8 @@ class AIStockAssistant:
         return True, None
 
     @classmethod
-    def process_query(cls, query: str, context: Dict = None, user_id: int = None, location_id: int = None) -> Dict[str, Any]:
+    def process_query(cls, query: str, context: Dict = None, user_id: int = None,
+                      location_id: int = None, history=None) -> Dict[str, Any]:
         if not isinstance(query, str) or not query.strip():
             return {
                 "success": False,
@@ -1173,6 +1174,7 @@ every number on tool results. Follow all language and formatting rules."""
                     tools=AIToolbox.TOOLS,
                     tool_executor=lambda n, a: AIToolbox.execute(n, a, location_id),
                     max_tokens=4096,
+                    history=history,
                 )
             else:
                 # Snapshot path (Gemini, or the Claude SDK isn't installed): one big
@@ -1204,7 +1206,7 @@ CURRENT DATABASE STATE:
 
 Respond to the user's query based on this data. Follow all language and formatting rules from your instructions."""
 
-                text, err = call_ai(prompt, system=SYSTEM_PROMPT, max_tokens=2048)
+                text, err = call_ai(prompt, system=SYSTEM_PROMPT, max_tokens=2048, history=history)
             if err == 'llm_key_missing':
                 return {
                     "success": False,
