@@ -22,6 +22,7 @@ Both backends return (text, error) where error is None on success, or one of
 'llm_sdk_missing' / 'llm_key_missing' / a raw error string. The callers handle
 those codes identically regardless of provider, so switching is a config change.
 """
+import json
 import logging
 import time
 
@@ -141,29 +142,41 @@ def _history_messages(history):
 
 
 def can_use_tools() -> bool:
-    """True when the agentic (tool-use) path is available: the Claude provider is
-    selected and the anthropic SDK is importable. Tool use lets the assistant
-    drill into any order/shift/date/cashier/product on demand instead of being
-    limited to a fixed pre-computed snapshot — only Claude implements it here."""
-    return get_provider() == 'claude' and anthropic is not None
+    """True when the agentic (tool-use) path is available — the provider is Claude
+    or OpenAI and its SDK is importable. Tool use lets the assistant drill into any
+    order / shift / date / cashier / product on demand (and compare arbitrary date
+    ranges) instead of being limited to a fixed pre-computed snapshot."""
+    provider = get_provider()
+    if provider == 'openai':
+        return openai is not None
+    if provider == 'claude':
+        return anthropic is not None
+    return False
 
 
 def call_ai_tools(prompt, system=None, tools=None, tool_executor=None,
                   max_tokens=4096, max_iterations=10, retries=2, history=None):
-    """Run Claude in a tool-use loop so it can read the live database in full
-    detail. `tools` is a list of Anthropic tool schemas; `tool_executor(name,
-    input_dict)` executes one tool call and returns its result as a string
-    (typically JSON). The loop feeds tool results back until the model answers
-    with text or the iteration budget is spent.
+    """Run the model (Claude or OpenAI) in a tool-use loop so it can read the live
+    database in full detail — drill into any order/shift/date/cashier/product and
+    compare arbitrary date ranges. `tools` is a list of Anthropic-style tool schemas
+    ({name, description, input_schema}); `tool_executor(name, input_dict)` executes
+    one tool call and returns its result as a string (typically JSON). The loop
+    feeds tool results back until the model answers with text or the iteration
+    budget is spent.
 
-    Only the Claude provider runs tools. If the provider is not Claude, the SDK
-    is missing, or no tools/executor were supplied, this falls back to a single
+    Claude and OpenAI run tools. If the provider is something else, the SDK is
+    missing, or no tools/executor were supplied, this falls back to a single
     `call_ai()` so the caller never has to branch. Returns (text, error) with the
     same error codes as `call_ai` ('llm_key_missing' / 'llm_sdk_missing' / raw)."""
     if (not can_use_tools() or not tools or tool_executor is None):
         return call_ai(prompt, system=system, max_tokens=max_tokens,
                        retries=retries, history=history)
 
+    if get_provider() == 'openai':
+        return _openai_tool_loop(prompt, system, tools, tool_executor,
+                                 max_tokens, max_iterations, retries, history)
+
+    # ── Claude tool-use loop ──
     api_key = getattr(settings, 'ANTHROPIC_API_KEY', '') or ''
     if not api_key:
         return None, 'llm_key_missing'
@@ -355,4 +368,110 @@ def _call_openai(prompt, system, max_tokens, history=None):
         return text, None
     except Exception as e:  # noqa: BLE001 — surface a code, log the detail
         logger.exception('openai call failed')
+        return None, str(e)
+
+
+def _openai_tool_loop(prompt, system, tools, tool_executor, max_tokens,
+                      max_iterations, retries, history):
+    """OpenAI function-calling loop — the OpenAI twin of the Claude tool loop. The
+    model calls read-only data tools to answer in full detail (compare dates, drill
+    into any order/shift/cashier/product). Returns (text, error)."""
+    api_key = getattr(settings, 'OPENAI_API_KEY', '') or ''
+    if not api_key:
+        return None, 'llm_key_missing'
+    model = getattr(settings, 'OPENAI_MODEL', '') or DEFAULT_OPENAI_MODEL
+    try:
+        client = openai.OpenAI(api_key=api_key, timeout=_timeout_seconds())
+    except Exception as e:  # noqa: BLE001
+        logger.exception('openai client init failed')
+        return None, str(e)
+
+    # Anthropic-style tool schema -> OpenAI function schema (input_schema is already
+    # a JSON Schema, which is exactly what OpenAI's `parameters` expects).
+    oai_tools = [{
+        'type': 'function',
+        'function': {
+            'name': t['name'],
+            'description': t.get('description', ''),
+            'parameters': t.get('input_schema') or {'type': 'object', 'properties': {}},
+        },
+    } for t in tools]
+
+    messages = []
+    if system:
+        messages.append({'role': 'system', 'content': system})
+    messages.extend(_history_messages(history))
+    messages.append({'role': 'user', 'content': prompt})
+    ceiling = max(int(max_tokens or 2048), OPENAI_MIN_COMPLETION_TOKENS)
+
+    def _create(include_tools):
+        kwargs = {'model': model, 'messages': messages, 'max_completion_tokens': ceiling}
+        if include_tools:
+            kwargs['tools'] = oai_tools
+        delay, last_err = 1.0, None
+        for attempt in range(retries + 1):
+            try:
+                return client.chat.completions.create(**kwargs), None
+            except Exception as e:  # noqa: BLE001
+                last_err = str(e)
+                if attempt < retries and _is_transient(last_err):
+                    logger.warning('openai transient overload (retry %d/%d): %s',
+                                   attempt + 1, retries, last_err[:120])
+                    time.sleep(delay)
+                    delay = min(delay * 2, 8)
+                    continue
+                return None, last_err
+        return None, last_err
+
+    def _final_text(resp):
+        msg = resp.choices[0].message if resp.choices else None
+        text = (msg.content or '') if msg else ''
+        if not text.strip():
+            return None, 'openai_empty_response'
+        return text, None
+
+    try:
+        for _ in range(max_iterations):
+            resp, err = _create(include_tools=True)
+            if err:
+                return None, err
+            msg = resp.choices[0].message if resp.choices else None
+            tool_calls = getattr(msg, 'tool_calls', None) if msg else None
+            if not tool_calls:
+                return _final_text(resp)
+            # Echo the assistant tool-call turn, then run every requested tool and
+            # append one tool-result message per call.
+            messages.append({
+                'role': 'assistant',
+                'content': msg.content or '',
+                'tool_calls': [{
+                    'id': tc.id, 'type': 'function',
+                    'function': {'name': tc.function.name,
+                                 'arguments': tc.function.arguments or '{}'},
+                } for tc in tool_calls],
+            })
+            for tc in tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments or '{}')
+                except (ValueError, TypeError):
+                    args = {}
+                if not isinstance(args, dict):
+                    args = {}
+                try:
+                    out = tool_executor(tc.function.name, args)
+                except Exception as e:  # noqa: BLE001
+                    logger.exception('AI tool %s failed', tc.function.name)
+                    out = f'Tool error: {e}'
+                messages.append({
+                    'role': 'tool', 'tool_call_id': tc.id,
+                    'content': out if isinstance(out, str) else str(out),
+                })
+
+        # Iteration budget spent: ask once more without tools so the model answers.
+        resp, err = _create(include_tools=False)
+        if err:
+            return None, err
+        return _final_text(resp)
+    except Exception as e:  # noqa: BLE001
+        logger.exception('openai tool loop failed')
         return None, str(e)

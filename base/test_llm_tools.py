@@ -176,6 +176,76 @@ def test_call_openai_empty_response_is_an_error(settings, monkeypatch):
     assert text is None and err == 'openai_empty_response'
 
 
+def test_can_use_tools_for_openai(settings):
+    settings.AI_PROVIDER = 'openai'
+    assert llm.can_use_tools() is True   # openai SDK is installed in the venv
+
+
+def test_openai_tool_loop_runs_function_calls(settings, monkeypatch):
+    settings.AI_PROVIDER = 'openai'
+    settings.OPENAI_API_KEY = 'k'
+
+    class _Func:
+        def __init__(self, name, args):
+            self.name = name
+            self.arguments = args
+
+    class _TC:
+        def __init__(self, id, name, args):
+            self.id = id
+            self.function = _Func(name, args)
+
+    class _Msg:
+        def __init__(self, content=None, tool_calls=None):
+            self.content = content
+            self.tool_calls = tool_calls
+
+    class _Resp:
+        def __init__(self, msg):
+            self.choices = [types.SimpleNamespace(message=msg)]
+
+    responses = [
+        _Resp(_Msg(tool_calls=[_TC('call_1', 'list_orders', '{"date": "2026-06-19"}')])),
+        _Resp(_Msg(content='FINAL ANSWER')),
+    ]
+    calls = []
+
+    class _Completions:
+        def create(self, **kw):
+            calls.append(kw)
+            return responses.pop(0)
+
+    class _Client:
+        def __init__(self, **kw):
+            self.chat = types.SimpleNamespace(completions=_Completions())
+
+    monkeypatch.setattr(llm, 'openai', types.SimpleNamespace(OpenAI=lambda **kw: _Client(**kw)))
+
+    ran = {}
+
+    def executor(name, args):
+        ran['name'] = name
+        ran['args'] = args
+        return '{"orders": 3}'
+
+    text, err = llm.call_ai_tools(
+        'how many orders on 2026-06-19?',
+        system='SYS',
+        tools=[{'name': 'list_orders', 'description': 'list orders',
+                'input_schema': {'type': 'object', 'properties': {'date': {'type': 'string'}}}}],
+        tool_executor=executor,
+    )
+    assert err is None and text == 'FINAL ANSWER'
+    assert ran['name'] == 'list_orders' and ran['args'] == {'date': '2026-06-19'}
+    # First create() sent the tools as OpenAI functions and uses max_completion_tokens.
+    assert calls[0]['tools'][0]['type'] == 'function'
+    assert calls[0]['tools'][0]['function']['name'] == 'list_orders'
+    assert 'max_completion_tokens' in calls[0] and 'max_tokens' not in calls[0]
+    # Second create() carried the tool result back as a role:'tool' message.
+    assert any(m.get('role') == 'tool' and m.get('content') == '{"orders": 3}'
+               for m in calls[1]['messages'])
+
+
 def test_call_ai_tools_surfaces_tool_errors_without_crashing(settings, monkeypatch):
     settings.AI_PROVIDER = 'claude'
     settings.ANTHROPIC_API_KEY = 'k'
