@@ -1,10 +1,26 @@
 from django import forms
-from django.contrib import admin
+from django.contrib import admin, messages
 from django.db import models
 from .models import (
     NotificationSettings, NotificationTemplate, NotificationLog,
-    OrderNotificationDispatch,
+    OrderNotificationDispatch, NotificationChat,
 )
+
+_TEST_TEXT = ("\U0001F514 <b>Test bildirishnoma</b>\n"
+             "Alpha POS Telegram bildirishnomalari ishlayapti. ✅")
+
+
+def _send_test(modeladmin, request, chat_ids):
+    from notifications.services.telegram_service import TelegramService
+    chat_ids = [str(c) for c in chat_ids]
+    if not chat_ids:
+        modeladmin.message_user(request, 'No chats selected.', level=messages.WARNING)
+        return
+    ok, err = TelegramService.send_message(_TEST_TEXT, chat_ids=chat_ids)
+    if ok:
+        modeladmin.message_user(request, f'Test sent to {len(chat_ids)} chat(s).')
+    else:
+        modeladmin.message_user(request, f'Test failed: {err}', level=messages.ERROR)
 
 
 class NotificationSettingsForm(forms.ModelForm):
@@ -29,14 +45,39 @@ class NotificationSettingsForm(forms.ModelForm):
 
 @admin.register(NotificationSettings)
 class NotificationSettingsAdmin(admin.ModelAdmin):
+    """Global Telegram settings: bot token, brand, master on/off. The recipient
+    chats + per-category routing live under 'Notification chats' (this row's
+    chat_ids/chat_routing are derived from there and shown read-only)."""
     form = NotificationSettingsForm
     list_display = ('id', 'brand_name', 'is_enabled', 'timeout', 'bot_token_masked')
+    readonly_fields = ('chat_ids', 'chat_routing', 'created_at', 'updated_at')
+    actions = ['send_test_to_all']
 
     @admin.display(description='Bot token')
     def bot_token_masked(self, obj):
         if not obj.bot_token:
             return '—'
         return f'****{obj.bot_token[-4:]}' if len(obj.bot_token) > 4 else '****'
+
+    @admin.action(description='Send a TEST notification to ALL enabled chats')
+    def send_test_to_all(self, request, queryset):
+        _send_test(self, request, NotificationSettings.load().chat_ids or [])
+
+
+@admin.register(NotificationChat)
+class NotificationChatAdmin(admin.ModelAdmin):
+    """Add a Telegram chat id + label, and tick which message categories it
+    receives — inline, no JSON. Use 'Send test' to verify delivery."""
+    list_display = ('chat_id', 'label', 'is_enabled', 'recv_orders', 'recv_shifts',
+                    'recv_contracts', 'recv_documents', 'recv_system')
+    list_editable = ('label', 'is_enabled', 'recv_orders', 'recv_shifts',
+                     'recv_contracts', 'recv_documents', 'recv_system')
+    search_fields = ('chat_id', 'label')
+    actions = ['send_test']
+
+    @admin.action(description='Send a TEST notification to the selected chat(s)')
+    def send_test(self, request, queryset):
+        _send_test(self, request, list(queryset.values_list('chat_id', flat=True)))
 
 
 @admin.register(NotificationTemplate)

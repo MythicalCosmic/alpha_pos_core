@@ -100,6 +100,23 @@ def test_order_new_held_until_items_present(server_edition, monkeypatch):
 
 
 @pytest.mark.django_db
+def test_notification_chat_syncs_settings_and_routing():
+    """Editing NotificationChat rows rebuilds the derived chat_ids + chat_routing
+    that the send path reads — so the admin is the single editable surface."""
+    from notifications.models import NotificationChat
+    NotificationChat.objects.create(chat_id='111', label='Owner', recv_shifts=False)
+    NotificationChat.objects.create(chat_id='222', is_enabled=False)  # disabled
+
+    s = NotificationSettings.load()
+    assert s.chat_ids == ['111']                         # only enabled chats
+    assert s.recipients_for('order_paid') == ['111']     # orders on
+    assert s.recipients_for('daily') == []               # 111 muted shift/daily
+
+    NotificationChat.objects.filter(chat_id='111').delete()
+    assert NotificationSettings.load().chat_ids == []     # delete rebuilds too
+
+
+@pytest.mark.django_db
 def test_worker_stores_new_message_ids_then_replies(server_edition, monkeypatch):
     NotificationSettings.objects.update_or_create(
         pk=1, defaults={'bot_token': 'x', 'chat_ids': ['111'], 'is_enabled': True})

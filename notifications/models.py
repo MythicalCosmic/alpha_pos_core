@@ -98,6 +98,46 @@ class NotificationSettings(models.Model):
         return f"Notification Settings ({self.brand_name})"
 
 
+class NotificationChat(models.Model):
+    """A Telegram chat that receives staff notifications, with a per-category
+    on/off so an admin can pick exactly what each chat gets — straight from the
+    Django admin (no hand-edited JSON). On save/delete a signal rebuilds the
+    derived NotificationSettings.chat_ids + chat_routing that the send path reads,
+    so this is the single editable surface. Branch-local (not synced)."""
+
+    # Maps a routing bucket (ROUTABLE_TYPES) -> the field that toggles it.
+    BUCKET_FIELD = {
+        'order_paid': 'recv_orders',
+        'daily': 'recv_shifts',
+        'contract': 'recv_contracts',
+        'document': 'recv_documents',
+        'system': 'recv_system',
+    }
+
+    chat_id = models.CharField(max_length=64, unique=True, db_index=True)
+    label = models.CharField(max_length=100, blank=True, default='',
+                             help_text='e.g. "Owner", "Kitchen group"')
+    is_enabled = models.BooleanField(default=True)
+    recv_orders = models.BooleanField('Buyurtmalar / Orders', default=True)
+    recv_shifts = models.BooleanField('Smena & kunlik / Shift & daily', default=True)
+    recv_contracts = models.BooleanField('Shartnomalar / Contracts', default=True)
+    recv_documents = models.BooleanField('Hujjatlar / Documents', default=True)
+    recv_system = models.BooleanField('Tizim / System', default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['chat_id']
+        verbose_name = 'notification chat'
+
+    def __str__(self):
+        return f'{self.label or self.chat_id} ({self.chat_id})'
+
+    def events(self):
+        return {bucket: getattr(self, field)
+                for bucket, field in self.BUCKET_FIELD.items()}
+
+
 class NotificationTemplate(models.Model):
     notification_type = models.CharField(max_length=50, unique=True)
     name = models.CharField(max_length=100)

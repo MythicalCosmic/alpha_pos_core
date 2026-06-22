@@ -104,7 +104,7 @@ class OrderNotification:
             return
         _, time_str = format_datetime()
         SenderService.send('order.new', {
-            'display_id': order.display_id,
+            'display_id': order.id,  # NOT order.display_id — the till counter isn't synced (always 1 on the server)
             'cashier_name': _cashier_name(order),
             'order_type': ORDER_TYPE_LABELS.get(order.order_type, order.order_type),
             'total_amount': format_money(order.total_amount),
@@ -129,7 +129,7 @@ class OrderNotification:
 
         _, time_str = format_datetime()
         SenderService.send('order.ready', {
-            'display_id': order.display_id,
+            'display_id': order.id,  # NOT order.display_id — the till counter isn't synced (always 1 on the server)
             'prep_time': prep_time,
             'total_amount': format_money(order.total_amount),
             'items_list': _items_list(order),
@@ -147,7 +147,7 @@ class OrderNotification:
             return
         _, time_str = format_datetime()
         SenderService.send('order.cancelled', {
-            'display_id': order.display_id,
+            'display_id': order.id,  # NOT order.display_id — the till counter isn't synced (always 1 on the server)
             'total_amount': format_money(order.total_amount),
             'time': time_str,
         }, order_id=order.id, thread_role='reply')
@@ -163,7 +163,7 @@ class OrderNotification:
             return
         _, time_str = format_datetime()
         SenderService.send('order.paid', {
-            'display_id': order.display_id,
+            'display_id': order.id,  # NOT order.display_id — the till counter isn't synced (always 1 on the server)
             'total_amount': format_money(order.total_amount),
             'time': time_str,
         }, order_id=order.id, thread_role='reply')
