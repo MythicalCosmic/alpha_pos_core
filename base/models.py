@@ -1045,6 +1045,13 @@ class Order(SyncMixin, models.Model):
     updated_at = models.DateTimeField(auto_now=True)
     ready_at = models.DateTimeField(null=True, blank=True)
     paid_at = models.DateTimeField(null=True, blank=True)
+    # Waiter "send to cashier" signal: stamped when a waiter asks the cashier to
+    # collect payment for their (unpaid) order. Advisory only — the cashier
+    # screen highlights orders with this set and is_paid=False; it is implicitly
+    # superseded once the order is paid. Waiter and cashier share the same till,
+    # so this is a local UI workflow signal and is NOT synced (popped below,
+    # like display_id) — the cloud has no use for it.
+    payment_requested_at = models.DateTimeField(null=True, blank=True)
 
     objects = SyncManager()
 
@@ -1068,6 +1075,8 @@ class Order(SyncMixin, models.Model):
         # same as display_id it must stay local or two branches' kitchen numbers
         # would collide on pull.
         data.pop('chef_queue_number', None)
+        # Local waiter→cashier UI signal (see field comment) — never synced.
+        data.pop('payment_requested_at', None)
         data['user_uuid'] = str(self.user.uuid) if self.user else None
         data['cashier_uuid'] = str(self.cashier.uuid) if self.cashier else None
         data['delivery_person_uuid'] = str(self.delivery_person.uuid) if self.delivery_person else None

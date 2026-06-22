@@ -635,3 +635,13 @@ CORS_ALLOW_ALL = os.environ.get('CORS_ALLOW_ALL', 'False').strip().lower() in ('
 if OPEN_LAN or CORS_ALLOW_ALL:
     CORS_ALLOW_ALL_ORIGINS = True
     CORS_ALLOW_CREDENTIALS = False
+
+# Allow the custom request headers our write endpoints read on top of the
+# django-cors-headers defaults. `Idempotency-Key` is consumed by the @idempotent
+# decorator (orders.create / orders.pay / orders.cancel) — a cross-origin
+# browser client (e.g. the waiter app in web mode) sends it, and the CORS
+# preflight rejects any header not on this list (allow-all-origins does NOT
+# imply allow-all-headers). Native apps don't preflight, but listing it keeps
+# every client working.
+from corsheaders.defaults import default_headers  # noqa: E402
+CORS_ALLOW_HEADERS = (*default_headers, 'idempotency-key')
