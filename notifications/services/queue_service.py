@@ -16,7 +16,7 @@ MAX_PENDING = 500
 class QueueService:
 
     @classmethod
-    def add(cls, message, notification_type, chat_ids=None):
+    def add(cls, message, notification_type, chat_ids=None, order_id=None, thread_role=None):
         queue = cls._get()
         queue.append({
             'message': message,
@@ -24,6 +24,9 @@ class QueueService:
             # Specific chats still pending delivery. None == all configured
             # chats. Storing this lets process() retry only the failed chats.
             'chat_ids': chat_ids,
+            # Order-notification threading metadata (best-effort on retry).
+            'order_id': order_id,
+            'thread_role': thread_role,
         })
         if len(queue) > MAX_PENDING:
             dropped = len(queue) - MAX_PENDING
@@ -62,7 +65,15 @@ class QueueService:
             targets = item.get('chat_ids')
             if targets is None:
                 targets = config.chat_ids
-            still_failed, _ = TelegramService.send_to_chats(item['message'], targets)
+            reply_to = None
+            if item.get('thread_role') == 'reply' and item.get('order_id'):
+                from notifications.services.worker import _new_message_ids
+                reply_to = _new_message_ids(item['order_id'])
+            still_failed, _, sent_ids = TelegramService.send_to_chats(
+                item['message'], targets, reply_to=reply_to)
+            if item.get('thread_role') == 'new' and item.get('order_id') and sent_ids:
+                from notifications.services.worker import _store_message_ids
+                _store_message_ids(item['order_id'], sent_ids)
             if not still_failed:
                 sent += 1
             else:

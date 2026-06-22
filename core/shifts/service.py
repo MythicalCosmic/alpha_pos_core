@@ -279,20 +279,35 @@ class ShiftService:
         # Per-type settlement rows: freeze expected (system) per tender, plus the
         # cashier's blind count + difference. The drawer figures are derived from
         # OrderPayment (cash net of cashbox expenses).
-        from cashbox.services.drawer import expected_payment_totals
-        from cashbox.models import ShiftPaymentTotal
-        counted = counted or {}
-        for method, exp in expected_payment_totals(shift).items():
-            raw = counted.get(method)
-            try:
-                cnt = Decimal(str(raw)) if raw is not None else Decimal('0')
-            except (InvalidOperation, TypeError, ValueError):
-                cnt = Decimal('0')
-            ShiftPaymentTotal.objects.update_or_create(
-                shift=shift, method=method,
-                defaults={'expected_amount': exp, 'counted_amount': cnt,
-                          'difference': cnt - exp},
-            )
+        #
+        # CRITICAL: this is best-effort and MUST NOT be able to fail the close.
+        # The shift is already persisted ENDED above; these rows are derived and
+        # recomputable. We isolate the whole block in a SAVEPOINT (nested atomic)
+        # so a settlement error — a missing cashbox table on a half-migrated DB, a
+        # duplicate row (MultipleObjectsReturned), an unexpected tender — rolls
+        # back ONLY the settlement writes, never the ENDED status. Without this,
+        # any exception here propagated out of the outer @transaction.atomic and
+        # reverted the close, so the till could never be closed at all (the bug).
+        try:
+            with transaction.atomic():
+                from cashbox.services.drawer import expected_payment_totals
+                from cashbox.models import ShiftPaymentTotal
+                counted = counted or {}
+                for method, exp in expected_payment_totals(shift).items():
+                    raw = counted.get(method)
+                    try:
+                        cnt = Decimal(str(raw)) if raw is not None else Decimal('0')
+                    except (InvalidOperation, TypeError, ValueError):
+                        cnt = Decimal('0')
+                    ShiftPaymentTotal.objects.update_or_create(
+                        shift=shift, method=method,
+                        defaults={'expected_amount': exp, 'counted_amount': cnt,
+                                  'difference': cnt - exp},
+                    )
+        except Exception:
+            logger.exception(
+                'shift settlement write failed (shift=%s); closing the shift anyway',
+                shift.id)
 
         shift = ShiftRepository.get_with_relations(shift.id)
         return ServiceResponse.success(data=ShiftService._serialize_shift(shift))

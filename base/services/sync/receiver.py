@@ -153,15 +153,25 @@ class CloudReceiver:
             result['skipped'] = len(records)
             return result
 
+        model_label = model_class.__name__
+        affected_order_ids = set()
         for record_data in records:
             try:
-                _, action = cls._create_or_update(model_class, record_data, branch_id)
+                instance, action = cls._create_or_update(model_class, record_data, branch_id)
                 if action == 'created':
                     result['created'] += 1
                 elif action == 'updated':
                     result['updated'] += 1
                 else:
                     result['skipped'] += 1
+                # Collect the orders touched by this batch so staff notifications
+                # fire AFTER the order + its items are all applied (items arrive
+                # in a separate batch after the order — see _notify_received_orders).
+                if instance is not None and action in ('created', 'updated'):
+                    if model_label == 'Order':
+                        affected_order_ids.add(instance.id)
+                    elif model_label == 'OrderItem' and instance.order_id:
+                        affected_order_ids.add(instance.order_id)
             except Exception as e:
                 rec_uuid = record_data.get("uuid")
                 error_msg = f'{rec_uuid or "?"}: {str(e)}'
@@ -170,7 +180,28 @@ class CloudReceiver:
                     result['failed_uuids'].append(rec_uuid)
                 logger.error(f'Receive error: {error_msg}')
 
+        if affected_order_ids:
+            cls._notify_received_orders(affected_order_ids)
+
         return result
+
+    @staticmethod
+    def _notify_received_orders(order_ids):
+        """Server-only: fire the staff order notifications for orders touched by a
+        just-applied sync batch. Runs after the batch loop (records are committed),
+        so by the time an order's item batch lands the order + all its items are
+        present and order.new renders the full item list. Idempotent + best-effort."""
+        from django.conf import settings
+        if getattr(settings, 'EDITION', '') != 'server':
+            return
+        try:
+            from base.models import Order
+            from notifications.handlers.order import OrderNotification
+            orders = Order.objects.filter(id__in=order_ids).select_related('cashier')
+            for order in orders:
+                OrderNotification.dispatch(order)
+        except Exception:
+            logger.warning('post-receive order notify failed', exc_info=True)
 
     @classmethod
     def _create_or_update(cls, model_class, data, branch_id):

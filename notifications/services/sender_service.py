@@ -21,8 +21,11 @@ def _escape_context(context):
 
 class SenderService:
     @classmethod
-    def send(cls, notification_type, context):
-        """Main send API. Resolves template, checks enabled, sends async."""
+    def send(cls, notification_type, context, order_id=None, thread_role=None):
+        """Main send API. Resolves template, checks enabled, sends async.
+
+        order_id + thread_role enable order-notification reply threading (see
+        notifications.services.worker.enqueue)."""
         from notifications.services.config_service import ConfigService
         if not ConfigService.is_enabled(notification_type):
             return
@@ -51,7 +54,7 @@ class SenderService:
             )
             return
 
-        cls._send_async(text, notification_type)
+        cls._send_async(text, notification_type, order_id=order_id, thread_role=thread_role)
 
     @classmethod
     def send_raw(cls, text):
@@ -59,9 +62,9 @@ class SenderService:
         cls._send_async(text, 'test')
 
     @classmethod
-    def _send_async(cls, text, notification_type):
+    def _send_async(cls, text, notification_type, order_id=None, thread_role=None):
         # Hand off to the single background worker which serializes sends and
         # enforces a per-chat minimum interval. Avoids spawning a thread per
         # message under burst load.
         from notifications.services.worker import enqueue
-        enqueue(text, notification_type)
+        enqueue(text, notification_type, order_id=order_id, thread_role=thread_role)

@@ -20,9 +20,12 @@ def format_datetime(dt=None):
 
 
 def format_money(amount):
-    if isinstance(amount, Decimal):
-        amount = float(amount)
-    return f'{amount:,.0f}'
+    # Tolerant of Decimal / float / int / numeric-string / None so a template
+    # render never blows up on an unexpected type.
+    try:
+        return f'{float(amount):,.0f}'
+    except (TypeError, ValueError):
+        return '0'
 
 
 def format_duration_minutes(minutes):

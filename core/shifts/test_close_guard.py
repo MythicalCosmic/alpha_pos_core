@@ -73,3 +73,25 @@ def test_paid_open_order_does_not_block_close():
     _order(u, 'OPEN', True)        # money already in -> not blocking
     res, st = ShiftService.end_shift(s.id, u.id, '')
     assert st == 200, res
+
+
+@pytest.mark.django_db
+def test_close_survives_settlement_failure(monkeypatch):
+    """A settlement-write error (e.g. a missing cashbox table on a half-migrated
+    DB) must NOT roll back the close — the shift is already ENDED before that
+    best-effort block. This is the 'shift won't close at all' bug: the unguarded
+    settlement block used to 500 and revert the ENDED write inside the atomic."""
+    import cashbox.services.drawer as drawer
+
+    def boom(_shift):
+        raise RuntimeError('no such table: cashbox_shiftpaymenttotal')
+
+    monkeypatch.setattr(drawer, 'expected_payment_totals', boom)
+    u = _cashier('g5@x.com')
+    s = _shift(u)
+    _order(u, 'READY', True)
+    res, st = ShiftService.end_shift(s.id, u.id, '')
+    assert st == 200, res
+    assert res['data']['status'] == 'ENDED'
+    s.refresh_from_db()
+    assert s.status == 'ENDED'

@@ -6,58 +6,78 @@ TEMPLATES = [
     {
         'notification_type': 'order.new',
         'name': 'Yangi buyurtma',
+        'description': (
+            "Yangi buyurtma kelganda yuboriladi. Mavjud o'zgaruvchilar: "
+            '{display_id} {cashier_name} {order_type} {total_amount} {items_list} {time} {brand}'
+        ),
         'template_text': (
-            '<b>{brand}</b>\n'
-            'Yangi buyurtma\n'
+            '🆕 <b>YANGI BUYURTMA</b>\n'
+            '━━━━━━━━━━━━━━\n'
+            '🧾 Buyurtma: <b>#{display_id}</b>\n'
+            '👤 Kassir: {cashier_name}\n'
+            '📍 Turi: {order_type}\n'
+            "💰 Jami: <b>{total_amount} so'm</b>\n"
             '\n'
-            'Buyurtma: #{display_id}\n'
-            'Kassir: {cashier_name}\n'
-            'Turi: {order_type}\n'
-            "Jami: {total_amount} so'm\n"
-            '\n'
+            '🛒 <b>Tarkibi:</b>\n'
             '{items_list}\n'
             '\n'
-            'Vaqt: {time}'
+            '🕒 Qabul qilindi: {time}\n'
+            '<i>{brand}</i>'
         ),
     },
     {
         'notification_type': 'order.ready',
         'name': 'Buyurtma tayyor',
+        'description': (
+            "Buyurtma tayyor bo'lganda yangi buyurtma xabariga JAVOB sifatida yuboriladi. "
+            "O'zgaruvchilar: {display_id} {prep_time} {total_amount} {items_list} {time} {brand}"
+        ),
         'template_text': (
-            '<b>{brand}</b>\n'
-            'Buyurtma tayyor\n'
+            '✅ <b>BUYURTMA TAYYOR</b>\n'
+            '━━━━━━━━━━━━━━\n'
+            '🧾 Buyurtma: <b>#{display_id}</b>\n'
+            '⏱ Tayyorlanish vaqti: <b>{prep_time}</b>\n'
+            "💰 Jami: {total_amount} so'm\n"
             '\n'
-            'Buyurtma: #{display_id}\n'
-            'Tayyorlash vaqti: {prep_time}\n'
-            "Jami: {total_amount} so'm\n"
+            '🛒 <b>Tarkibi:</b>\n'
+            '{items_list}\n'
             '\n'
-            'Vaqt: {time}'
+            "🕒 Tayyor bo'ldi: {time}\n"
+            '<i>{brand}</i>'
         ),
     },
     {
         'notification_type': 'order.cancelled',
         'name': 'Buyurtma bekor qilindi',
+        'description': (
+            'Buyurtma bekor qilinganda yuboriladi. '
+            "O'zgaruvchilar: {display_id} {total_amount} {time} {brand}"
+        ),
         'template_text': (
-            '<b>{brand}</b>\n'
-            'Buyurtma bekor qilindi\n'
+            '❌ <b>BUYURTMA BEKOR QILINDI</b>\n'
+            '━━━━━━━━━━━━━━\n'
+            '🧾 Buyurtma: <b>#{display_id}</b>\n'
+            "💰 Summa: {total_amount} so'm\n"
             '\n'
-            'Buyurtma: #{display_id}\n'
-            "Jami: {total_amount} so'm\n"
-            '\n'
-            'Vaqt: {time}'
+            '🕒 {time}\n'
+            '<i>{brand}</i>'
         ),
     },
     {
         'notification_type': 'order.paid',
         'name': "Buyurtma to'landi",
+        'description': (
+            "Buyurtma to'langanda yuboriladi. "
+            "O'zgaruvchilar: {display_id} {total_amount} {time} {brand}"
+        ),
         'template_text': (
-            '<b>{brand}</b>\n'
-            "Buyurtma to'landi\n"
+            "💳 <b>BUYURTMA TO'LANDI</b>\n"
+            '━━━━━━━━━━━━━━\n'
+            '🧾 Buyurtma: <b>#{display_id}</b>\n'
+            "💰 Jami: <b>{total_amount} so'm</b>\n"
             '\n'
-            'Buyurtma: #{display_id}\n'
-            "Jami: {total_amount} so'm\n"
-            '\n'
-            'Vaqt: {time}'
+            '🕒 {time}\n'
+            '<i>{brand}</i>'
         ),
     },
     {
@@ -399,6 +419,7 @@ class Command(BaseCommand):
                 defaults={
                     'name': tpl['name'],
                     'template_text': tpl['template_text'],
+                    'description': tpl.get('description', ''),
                 },
             )
             if was_created:

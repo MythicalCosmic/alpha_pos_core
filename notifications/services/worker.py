@@ -31,10 +31,20 @@ _worker_lock = threading.Lock()
 _last_send_per_chat: dict[str, float] = {}
 
 
-def enqueue(text, notification_type):
-    """Fire-and-forget enqueue. The worker is lazily started on first call."""
+def enqueue(text, notification_type, order_id=None, thread_role=None):
+    """Fire-and-forget enqueue. The worker is lazily started on first call.
+
+    order_id + thread_role drive order-notification reply threading:
+      thread_role='new'   -> after sending, store the per-chat message ids on the
+                             order's OrderNotificationDispatch row.
+      thread_role='reply' -> before sending, load those stored ids and send THIS
+                             message as a reply threaded under the order.new message.
+    """
     _ensure_worker()
-    _queue.put({'text': text, 'notification_type': notification_type})
+    _queue.put({
+        'text': text, 'notification_type': notification_type,
+        'order_id': order_id, 'thread_role': thread_role,
+    })
 
 
 def _ensure_worker():
@@ -83,6 +93,8 @@ def _dispatch(item, min_interval):
     settings = NotificationSettings.load()
     text = item['text']
     notification_type = item['notification_type']
+    order_id = item.get('order_id')
+    thread_role = item.get('thread_role')
 
     # Per-chat routing: only the chats subscribed to this message's category
     # receive it (managed in the desktop panel). Manual test sends ('test') and
@@ -107,10 +119,20 @@ def _dispatch(item, min_interval):
     if delta < min_interval:
         time.sleep(min_interval - delta)
 
+    # Reply threading: load the order.new message ids so this 'reply' message
+    # is sent threaded under the original order.new message in each chat.
+    reply_to = None
+    if thread_role == 'reply' and order_id:
+        reply_to = _new_message_ids(order_id)
+
     try:
-        failed, error = TelegramService.send_to_chats(text, chat_ids)
+        failed, error, sent_ids = TelegramService.send_to_chats(
+            text, chat_ids, reply_to=reply_to)
         ok = not failed
         _last_send_per_chat[chat_key] = time.monotonic()
+        # Persist the order.new message ids per chat for later reply threading.
+        if thread_role == 'new' and order_id and sent_ids:
+            _store_message_ids(order_id, sent_ids)
         NotificationLog.objects.create(
             notification_type=notification_type,
             recipient=','.join(str(c) for c in chat_ids),
@@ -121,7 +143,8 @@ def _dispatch(item, min_interval):
         if failed:
             # Re-queue ONLY the chats that failed so the retry doesn't duplicate
             # the message to chats that already received it.
-            QueueService.add(text, notification_type, chat_ids=failed)
+            QueueService.add(text, notification_type, chat_ids=failed,
+                             order_id=order_id, thread_role=thread_role)
     except Exception as e:
         NotificationLog.objects.create(
             notification_type=notification_type,
@@ -130,4 +153,30 @@ def _dispatch(item, min_interval):
             status='FAILED',
             error_message=str(e),
         )
-        QueueService.add(text, notification_type)
+        QueueService.add(text, notification_type,
+                         order_id=order_id, thread_role=thread_role)
+
+
+def _new_message_ids(order_id):
+    """The {chat_id: message_id} of the order.new message, or None."""
+    try:
+        from notifications.models import OrderNotificationDispatch
+        disp = OrderNotificationDispatch.objects.filter(order_id=order_id).first()
+        if disp and disp.new_message_ids:
+            return {str(k): v for k, v in disp.new_message_ids.items()}
+    except Exception:
+        logger.debug('failed to load new_message_ids for order %s', order_id, exc_info=True)
+    return None
+
+
+def _store_message_ids(order_id, sent_ids):
+    """Merge the just-sent order.new message ids onto the dispatch row."""
+    try:
+        from notifications.models import OrderNotificationDispatch
+        disp, _ = OrderNotificationDispatch.objects.get_or_create(order_id=order_id)
+        merged = dict(disp.new_message_ids or {})
+        merged.update({str(k): v for k, v in sent_ids.items()})
+        disp.new_message_ids = merged
+        disp.save(update_fields=['new_message_ids', 'updated_at'])
+    except Exception:
+        logger.debug('failed to store message ids for order %s', order_id, exc_info=True)

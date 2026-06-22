@@ -366,3 +366,29 @@ class NotificationLog(models.Model):
 
     def __str__(self):
         return f"{self.notification_type} -> {self.recipient} ({self.status})"
+
+
+class OrderNotificationDispatch(models.Model):
+    """Per-order staff-notification state (server-side, NOT synced).
+
+    Drives idempotent firing of the staff order notifications as orders sync up
+    from the tills (the server is the single notification source). `new_message_ids`
+    stores the Telegram message id of the `order.new` message in each chat so the
+    later `order.ready` message can be sent as a REPLY threaded under it.
+    One row per base.Order id.
+    """
+    order_id = models.IntegerField(unique=True, db_index=True)
+    new_sent = models.BooleanField(default=False)
+    ready_sent = models.BooleanField(default=False)
+    paid_sent = models.BooleanField(default=False)
+    cancelled_sent = models.BooleanField(default=False)
+    # {"<chat_id>": <telegram_message_id>} of the order.new message per chat.
+    new_message_ids = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"OrderNotificationDispatch<order={self.order_id}>"

@@ -1,6 +1,10 @@
 from django import forms
 from django.contrib import admin
-from .models import NotificationSettings, NotificationTemplate, NotificationLog
+from django.db import models
+from .models import (
+    NotificationSettings, NotificationTemplate, NotificationLog,
+    OrderNotificationDispatch,
+)
 
 
 class NotificationSettingsForm(forms.ModelForm):
@@ -37,8 +41,34 @@ class NotificationSettingsAdmin(admin.ModelAdmin):
 
 @admin.register(NotificationTemplate)
 class NotificationTemplateAdmin(admin.ModelAdmin):
-    list_display = ('id', 'notification_type', 'name', 'is_enabled', 'language')
+    """Edit the Telegram message wording here. `description` lists the available
+    {placeholders}; `notification_type` is the code key and is locked on edit."""
+    list_display = ('notification_type', 'name', 'is_enabled', 'language', 'updated_at')
     list_filter = ('is_enabled', 'language')
+    list_editable = ('is_enabled',)
+    search_fields = ('notification_type', 'name', 'template_text')
+    fields = ('notification_type', 'name', 'is_enabled', 'language',
+              'description', 'template_text', 'created_at', 'updated_at')
+    formfield_overrides = {
+        models.TextField: {'widget': forms.Textarea(
+            attrs={'rows': 16, 'cols': 72, 'style': 'font-family:monospace'})},
+    }
+
+    def get_readonly_fields(self, request, obj=None):
+        base = ('created_at', 'updated_at')
+        # Lock the code key when editing an existing template (renaming it would
+        # break the lookup in the send path); it's editable only when adding.
+        return base + ('notification_type',) if obj else base
+
+
+@admin.register(OrderNotificationDispatch)
+class OrderNotificationDispatchAdmin(admin.ModelAdmin):
+    list_display = ('order_id', 'new_sent', 'ready_sent', 'paid_sent',
+                    'cancelled_sent', 'updated_at')
+    search_fields = ('order_id',)
+    list_filter = ('new_sent', 'ready_sent')
+    readonly_fields = ('order_id', 'new_sent', 'ready_sent', 'paid_sent',
+                       'cancelled_sent', 'new_message_ids', 'created_at', 'updated_at')
 
 
 @admin.register(NotificationLog)
