@@ -309,8 +309,20 @@ class ShiftService:
                 'shift settlement write failed (shift=%s); closing the shift anyway',
                 shift.id)
 
-        shift = ShiftRepository.get_with_relations(shift.id)
-        return ServiceResponse.success(data=ShiftService._serialize_shift(shift))
+        # The shift is ENDED and persisted above. Serializing the response must
+        # NOT be able to revert that: an exception in get_with_relations /
+        # _serialize_shift here propagates out of the outer @transaction.atomic
+        # and rolls back the ENDED write — so the till could never close on a
+        # serialization hiccup. Catch it and return a minimal payload; the shift
+        # is closed regardless (the caller re-reads it via /shifts/current).
+        try:
+            fresh = ShiftRepository.get_with_relations(shift.id)
+            return ServiceResponse.success(data=ShiftService._serialize_shift(fresh))
+        except Exception:
+            logger.exception(
+                'shift serialize after close failed (shift=%s); shift is ENDED, '
+                'returning minimal payload', shift.id)
+            return ServiceResponse.success(data={'id': shift.id, 'status': 'ENDED'})
 
     @staticmethod
     @transaction.atomic

@@ -148,6 +148,12 @@ if os.environ.get('DB_ENGINE'):
             'PASSWORD': os.environ.get('DB_PASSWORD', ''),
             'HOST': os.environ.get('DB_HOST', 'db'),
             'PORT': os.environ.get('DB_PORT', '5432'),
+            # Bound the connect wait so a momentarily-busy embedded Postgres
+            # (just-launched / mid-checkpoint / brief stall) fails fast with a
+            # clear error instead of hanging a request indefinitely, and recycle
+            # any dead/stale handle before reuse rather than erroring on it.
+            'OPTIONS': {'connect_timeout': int(os.environ.get('DB_CONNECT_TIMEOUT', '10'))},
+            'CONN_HEALTH_CHECKS': True,
         }
     }
 else:
