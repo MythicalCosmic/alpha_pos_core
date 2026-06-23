@@ -262,6 +262,11 @@ FILE_UPLOAD_MAX_MEMORY_SIZE = int(
 DATA_UPLOAD_MAX_NUMBER_FIELDS = 1000
 
 BRANCH_ID = os.environ.get('BRANCH_ID', 'main')
+# Per-install till identity (minted by the desktop at first run). Lets the cloud
+# distinguish multiple tills even when they share one branch token — drives the
+# POS presence registry (base/services/presence.py) that smartfood auto-dispatch
+# reads. Empty on the cloud / unset installs.
+DEVICE_ID = os.environ.get('DEVICE_ID', '')
 # Whether login refuses a user whose branch_id differs from this instance's
 # BRANCH_ID. OFF by default: users synced from the cloud (branch_id=cloud) would
 # otherwise be locked out of a desktop branch. Operators running true isolated
