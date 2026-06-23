@@ -13,11 +13,20 @@ _insecure_url_warned = False
 
 
 def _auth_headers():
-    return {
+    headers = {
         'Authorization': f'Branch {get_cloud_token()}',
         'X-Branch-ID': get_branch_id(),
         'Content-Type': 'application/json',
     }
+    # Heartbeat presence: every sync request doubles as this till's "I'm online,
+    # cashier X is active" ping (the cloud records it; auto-dispatch reads it).
+    # Best-effort — never let a presence lookup block a sync.
+    try:
+        from base.services.presence import device_presence_headers
+        headers.update(device_presence_headers())
+    except Exception:
+        pass
+    return headers
 
 
 def _guard_url(url):

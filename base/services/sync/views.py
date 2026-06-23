@@ -144,6 +144,16 @@ def receive(request):
     if not model_name or not records:
         return JsonResponse({'error': 'Missing model or records'}, status=400)
 
+    # Heartbeat presence: this authenticated push proves the till (branch_id +
+    # device) is online now; record its active cashier so smartfood auto-dispatch
+    # can target a CONNECTED POS. Best-effort, no-op without the device header.
+    from base.services.presence import mark_device_live
+    mark_device_live(
+        request.META.get('HTTP_X_DEVICE_ID', ''),
+        branch_id,
+        request.META.get('HTTP_X_ACTIVE_CASHIER', ''),
+    )
+
     from base.services.sync.receiver import CloudReceiver
     result = CloudReceiver.receive_batch(model_name, branch_id, records)
 
@@ -278,6 +288,16 @@ def changes(request):
                 status=403,
             )
         requesting_branch = bound_branch
+
+    # Heartbeat presence on the pull path too, so an idle till (nothing to push)
+    # still refreshes its liveness every sync cycle. Best-effort.
+    from base.services.presence import mark_device_live
+    mark_device_live(
+        request.META.get('HTTP_X_DEVICE_ID', ''),
+        requesting_branch,
+        request.META.get('HTTP_X_ACTIVE_CASHIER', ''),
+    )
+
     since_param = request.GET.get('since')
     since_dt = parse_datetime(since_param) if since_param else None
     try:

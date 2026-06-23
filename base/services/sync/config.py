@@ -216,6 +216,12 @@ def get_branch_id():
     return getattr(settings, 'BRANCH_ID', '')
 
 
+def get_device_id():
+    """Per-install till identity (minted at desktop install). Distinguishes
+    multiple tills that may share one branch token. Empty on the cloud."""
+    return getattr(settings, 'DEVICE_ID', '')
+
+
 def get_deployment_mode():
     return getattr(settings, 'DEPLOYMENT_MODE', 'local')
 
