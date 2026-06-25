@@ -41,15 +41,18 @@ def ai_query(request):
             errors={'query': 'Query is required'},
         ))
 
-    # Persisted, multi-turn: pass chat_id to continue a conversation (history is
-    # replayed to the model), or omit it to start a new chat. The response carries
-    # back chat_id so the client can keep the thread going.
+    # Persisted, multi-turn: pass chat_id (alias: conversation_id) to continue a
+    # conversation (history is replayed to the model), or omit it to start a new
+    # chat. The response carries back BOTH chat_id and conversation_id so either
+    # client naming works.
     result = AIChatService.send(
         user_id=request.user.id,
         query=query,
-        chat_id=data.get('chat_id'),
+        chat_id=data.get('chat_id') or data.get('conversation_id'),
         location_id=data.get('location_id'),
     )
+    if isinstance(result, dict) and result.get('chat_id') is not None:
+        result.setdefault('conversation_id', result['chat_id'])
     # Map service-layer error codes to real HTTP status codes so clients can
     # switch on response.status instead of having to parse the body. Without
     # this every failure (rate limit, invalid query, quota exhausted) comes
