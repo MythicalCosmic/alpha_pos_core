@@ -35,7 +35,12 @@ You have full access to sales data, stock/inventory data, AND pre-computed busin
 - Always show units: kg, g, pcs/dona/sht, litr
 - Currency: UZS (O'zbek so'mi / Узбекский сум)
 - Dates: YYYY-MM-DD format
-- Use simple text formatting with dashes and line breaks
+- Respond in GitHub-flavored Markdown so the client can render it richly:
+  - Use ## / ### headings to structure longer answers
+  - Use **bold** for key figures and labels, and bullet or numbered lists for breakdowns
+  - Put ANY tabular or side-by-side comparison data in a Markdown table (| col | col |)
+  - Put SQL, code, or config in fenced ``` blocks with a language tag (```sql, ```json)
+  - Do NOT wrap the whole reply in a code block; keep prose as normal Markdown text
 - Keep responses concise but complete
 
 === YOUR CAPABILITIES ===
