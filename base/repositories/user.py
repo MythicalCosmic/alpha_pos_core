@@ -33,11 +33,13 @@ class UserRepository(BaseSyncRepository):
 
     @classmethod
     def get_pos_staff(cls):
-        # Everyone shown on the monoblock login picker: cashiers + managers.
-        # Managers sit at the same login tier but carry elevated in-app access.
+        # Everyone shown on the monoblock login picker: cashiers + managers +
+        # kitchen (CHEF) staff. Managers sit at the same login tier but carry
+        # elevated in-app access; CHEF logs in here and the FE routes them to /kds.
         return cls.model.objects.filter(
             is_deleted=False,
-            role__in=(User.RoleChoices.CASHIER, User.RoleChoices.MANAGER),
+            role__in=(User.RoleChoices.CASHIER, User.RoleChoices.MANAGER,
+                      User.RoleChoices.CHEF),
             status=User.UserStatus.ACTIVE,
         )
 
