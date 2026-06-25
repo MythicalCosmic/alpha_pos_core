@@ -1492,9 +1492,20 @@ class TreasuryTransaction(SyncMixin, models.Model):
         return f"{self.type} {self.delta} ({self.account_id})"
 
 
+def _default_business_day_start():
+    """Operating-day cutover default (03:00). A callable keeps the migration
+    serialization stable and avoids a module-level datetime import."""
+    from datetime import time
+    return time(3, 0)
+
+
 class AppSettings(models.Model):
     hr_enabled = models.BooleanField(default=False)
     waiter_enabled = models.BooleanField(default=False)
+    # Operating-day cutover: stats/dashboards treat [business_day_start, next
+    # business_day_start) as ONE business day, so a 01:00 sale counts toward the
+    # night before. Per-restaurant; default 03:00. See base.services.business_day.
+    business_day_start = models.TimeField(default=_default_business_day_start)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
