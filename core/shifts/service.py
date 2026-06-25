@@ -419,12 +419,14 @@ class ShiftService:
         return {"success": True, "message": "Success", "data": data}, 200
 
     @staticmethod
-    def end_active_for_user(user_id, notes=''):
-        """End the caller's own active shift. 404 if they have none open."""
+    def end_active_for_user(user_id, notes='', counted=None, actor=None):
+        """End the caller's own active shift. 404 if they have none open. Threads
+        the cashier's blind per-tender count (`counted`) through to end_shift so
+        the ShiftPaymentTotal reconciliation rows are created on close."""
         shift = ShiftRepository.get_active_for_user(user_id)
         if not shift:
             return ServiceResponse.not_found("No active shift to end")
-        return ShiftService.end_shift(shift.id, user_id, notes)
+        return ShiftService.end_shift(shift.id, user_id, notes, actor=actor, counted=counted)
 
     @staticmethod
     def get_active_shifts():

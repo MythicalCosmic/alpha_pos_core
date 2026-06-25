@@ -95,3 +95,20 @@ def test_close_survives_settlement_failure(monkeypatch):
     assert res['data']['status'] == 'ENDED'
     s.refresh_from_db()
     assert s.status == 'ENDED'
+
+
+@pytest.mark.django_db
+def test_end_active_for_user_threads_counted_into_settlement():
+    """The cashier's blind per-tender count posted to /shifts/end reaches
+    end_shift, so the ShiftPaymentTotal reconciliation rows carry it."""
+    from decimal import Decimal
+    from cashbox.models import ShiftPaymentTotal
+    u = _cashier('counted@x.com')
+    s = _shift(u)
+    res, st = ShiftService.end_active_for_user(
+        u.id, notes='close', counted={'CASH': '100', 'UZCARD': '50'}, actor=u)
+    assert st == 200, res
+    assert res['data']['status'] == 'ENDED'
+    rows = {r.method: r for r in ShiftPaymentTotal.objects.filter(shift_id=s.id)}
+    assert rows['CASH'].counted_amount == Decimal('100')
+    assert rows['UZCARD'].counted_amount == Decimal('50')
