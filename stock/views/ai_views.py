@@ -1,7 +1,7 @@
 from django.conf import settings
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
-from django.views.decorators.http import require_GET, require_POST
+from django.views.decorators.http import require_GET, require_POST, require_http_methods
 from base.helpers.request import parse_json_body
 from base.helpers.response import json_response, ServiceResponse
 from base.security.rate_limit import rate_limit
@@ -149,10 +149,21 @@ def ai_quick_actions(request):
 # the saved chats. All admin-gated like the rest of the AI surface.
 
 @csrf_exempt
-@require_GET
+@require_http_methods(["GET", "POST"])
 @admin_required
 def ai_chats(request):
-    """List the signed-in operator's saved chats (most-recent first)."""
+    """GET: list the signed-in operator's saved chats (most-recent first).
+    POST: create a new empty chat and return it, so the client can set
+    conversation_id before the first /ai/query/ turn (body optional: {"title"})."""
+    if request.method == 'POST':
+        data, err = parse_json_body(request)
+        if err:
+            data = {}
+        title = ((data or {}).get('title') or '').strip()
+        chat = AIChatService.create_chat(request.user.id, title=title)
+        # `id` at the top level AND the full `chat` object, so the FE can read
+        # either `res.id` or `res.chat.id`.
+        return JsonResponse({'success': True, 'id': chat['id'], 'chat': chat}, status=201)
     return JsonResponse({'success': True, 'chats': AIChatService.list_chats(request.user.id)})
 
 

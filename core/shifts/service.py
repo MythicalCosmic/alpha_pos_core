@@ -88,7 +88,8 @@ class ShiftTemplateService:
 
 class ShiftService:
     @staticmethod
-    def list(page=1, per_page=20, user_id=None, status=None, date_from=None, date_to=None):
+    def list(page=1, per_page=20, user_id=None, status=None, date_from=None,
+             date_to=None, live_only=False):
         # _serialize_shift reads reconciliation(+reconciled_by) per row. select_related
         # on a reverse one-to-one does NOT cache ABSENCE (Django re-queries per shift
         # that has no reconciliation -> O(rows)), so prefetch it instead: one extra
@@ -106,6 +107,9 @@ class ShiftService:
             qs = qs.filter(start_time__gte=date_from)
         if date_to:
             qs = qs.filter(start_time__lte=date_to)
+        if live_only:
+            # A genuinely running shift: ACTIVE with no end_time (matches is_live_stats).
+            qs = qs.filter(status='ACTIVE', end_time__isnull=True)
 
         page_obj, paginator = ShiftRepository.paginate(qs, page, per_page)
         shifts = list(page_obj)
@@ -430,8 +434,15 @@ class ShiftService:
 
     @staticmethod
     def get_active_shifts():
-        shifts = ShiftRepository.filter_by_status('ACTIVE').select_related('user', 'shift_template')
-        data = [ShiftService._serialize_shift(s) for s in shifts]
+        shifts = list(ShiftRepository.filter_by_status('ACTIVE')
+                      .select_related('user', 'shift_template')
+                      .prefetch_related('reconciliation', 'reconciliation__reconciled_by'))
+        # Same batched extras as list() so active rows carry the full field set
+        # (payment_mix, items_sold, prep, peak hour, expenses, cancelled, net...).
+        now = timezone.now()
+        extras_map = ShiftService._batch_list_extras(shifts, now=now)
+        data = [ShiftService._serialize_shift(s, extras=extras_map.get(s.id), now=now)
+                for s in shifts]
         return ServiceResponse.success(data=data)
 
     @staticmethod
@@ -737,6 +748,18 @@ class ShiftService:
             total_revenue = shift.total_revenue
             cash_collected = shift.cash_collected
 
+        def _dec(v):
+            try:
+                return Decimal(str(v if v is not None else 0))
+            except (InvalidOperation, TypeError):
+                return Decimal('0')
+
+        def _q2(d):
+            # Money as a 2dp string, backend-independent. (SQLite drops the scale
+            # on Sum() so a live total comes back as '150'; Postgres keeps '150.00'.
+            # Quantizing makes the API output identical on both.)
+            return str(_dec(d).quantize(Decimal('0.01')))
+
         duration_minutes = None
         if shift.start_time and effective_end:
             duration_minutes = int((effective_end - shift.start_time).total_seconds() / 60)
@@ -777,8 +800,8 @@ class ShiftService:
             'end_time': shift.end_time.isoformat() if shift.end_time else None,
             'status': shift.status,
             'total_orders': total_orders,
-            'total_revenue': str(total_revenue),
-            'cash_collected': str(cash_collected),
+            'total_revenue': _q2(total_revenue),
+            'cash_collected': _q2(cash_collected),
             # True ⇒ figures are live (shift still running), not finalized.
             'is_live_stats': is_live,
             'duration_minutes': duration_minutes,
@@ -798,6 +821,42 @@ class ShiftService:
             except (InvalidOperation, TypeError):
                 net = Decimal(str(total_revenue))
             result['net_revenue'] = str(net.quantize(Decimal('0.01')))
+
+        # ── Admin Shifts page (item 11): a flat, FE-named field set on EVERY shift
+        #    row (list / active / detail). Decimals are strings; reconciliation-
+        #    derived fields (variance/reported/reported_by) are null until the shift
+        #    is reconciled. Kept ALONGSIDE the originals for back-compat.
+        _ex = extras or {}
+        _tr = _dec(total_revenue)
+        _cash = _dec(cash_collected)
+        _exp = _dec(_ex.get('expenses_total'))
+        _canc = _dec(_ex.get('cancelled_orders_value'))
+        ph = _ex.get('peak_hour')
+        peak_label = None
+        if isinstance(ph, dict) and ph.get('hour') is not None:
+            _h = int(ph['hour'])
+            peak_label = f"{_h:02d}:00-{(_h + 1) % 24:02d}:00"
+        rec = reconciliation  # serialized dict above, or None until reconciled
+        # avg ticket over PAID orders (payment_mix counts), not total_orders —
+        # total_orders includes cancelled, which would understate the ticket.
+        _paid_n = sum(int((v or {}).get('count', 0))
+                      for v in (_ex.get('payment_mix') or {}).values())
+        result.update({
+            'gross_revenue': _q2(_tr),
+            'net_revenue': result.get('net_revenue') or _q2(_tr - _exp - _canc),
+            'card_collected': _q2(_tr - _cash),
+            'expenses_total': result.get('expenses_total', _q2(_exp)),
+            'cancelled_count': int(_ex.get('cancelled_orders_count') or 0),
+            'cancelled_amount': _q2(_canc),
+            'expected_cash': (rec['expected_cash'] if rec else _q2(_cash)),
+            'variance': (rec['difference'] if rec else None),
+            'reported': (rec['actual_cash'] if rec else None),
+            'reported_by': (rec['reconciled_by'] if rec else None),
+            'avg_ticket': _q2(_tr / _paid_n) if _paid_n else '0.00',
+            'items_sold': int(_ex.get('items_sold') or 0),
+            'avg_prep_time': _ex.get('avg_prep_seconds'),
+            'peak_hour': peak_label,
+        })
         # The shift DETAIL page additionally gets the HEAVY breakdowns kept off the
         # list (per-product/category stats + the per-tender cashier-vs-manager
         # settlement comparison) so paging shifts doesn't run those per row.

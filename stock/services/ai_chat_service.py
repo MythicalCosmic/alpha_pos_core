@@ -106,20 +106,43 @@ class AIChatService:
         return result
 
     @classmethod
+    def create_chat(cls, user_id, title=''):
+        """Create a new empty chat up front so the client can set conversation_id
+        BEFORE the first /ai/query/ turn. (The FE's flow is create -> query with that
+        id -> fetch.) Empty chats are hidden from list_chats until they hold a
+        message, so an abandoned, never-asked chat never shows as a blank sidebar row."""
+        chat = AIChat.objects.create(
+            user_id=user_id, title=(title or '').strip()[:140] or 'New chat')
+        return {
+            'id': chat.id,
+            'title': chat.title,
+            'created_at': chat.created_at.isoformat() if chat.created_at else None,
+            'updated_at': chat.updated_at.isoformat() if chat.updated_at else None,
+            'preview': '',
+            'message_count': 0,
+            'messages': [],
+        }
+
+    @classmethod
     def list_chats(cls, user_id, limit=50):
+        from django.db.models import Count, Q
         chats = (AIChat.objects.filter(user_id=user_id, is_deleted=False)
+                 # Hide empty chats (created but never asked) so they don't show as
+                 # blank "New chat" rows in the sidebar.
+                 .annotate(_n=Count('messages', filter=Q(messages__is_deleted=False)))
+                 .filter(_n__gt=0)
                  .order_by('-updated_at')[:max(1, min(int(limit or 50), 200))])
         out = []
         for c in chats:
-            live = c.messages.filter(is_deleted=False)
-            last = live.order_by('-created_at', '-id').first()
+            last = (c.messages.filter(is_deleted=False)
+                    .order_by('-created_at', '-id').first())
             out.append({
                 'id': c.id,
                 'title': c.title or f'Chat #{c.id}',
                 'created_at': c.created_at.isoformat() if c.created_at else None,
                 'updated_at': c.updated_at.isoformat() if c.updated_at else None,
                 'preview': (last.content[:120] if last else ''),
-                'message_count': live.count(),
+                'message_count': c._n,
             })
         return out
 
