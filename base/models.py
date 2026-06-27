@@ -998,6 +998,13 @@ class Order(SyncMixin, models.Model):
     # ever increases, so the chef never sees the number "reset" mid-service.
     # Per-branch (allocated from ChefQueueCounter), nullable for legacy rows.
     chef_queue_number = models.IntegerField(null=True, blank=True)
+    # Stable per-BUSINESS-DAY sequence (item 4): the human order reference on the
+    # admin Orders page. Unlike display_id it never wraps (so two orders the same
+    # day never share a number), and unlike chef_queue_number it resets to 1 each
+    # business day. Per-branch, allocated at creation, synced as a value (the
+    # counter itself never propagates). Nullable: legacy rows + tills not yet on a
+    # build that assigns it — the FE falls back to display_id when null.
+    order_number = models.PositiveIntegerField(null=True, blank=True, db_index=True)
 
     order_type = models.CharField(
         max_length=10,

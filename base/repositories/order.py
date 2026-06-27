@@ -5,7 +5,7 @@ from django.db.models.functions import Coalesce, TruncDate, TruncMonth, TruncYea
 from django.core.paginator import Paginator
 from decimal import Decimal
 from base.repositories.base import BaseSyncRepository
-from base.models import Order, DisplayIdCounter, ChefQueueCounter
+from base.models import Order, DisplayIdCounter, ChefQueueCounter, SequenceCounter
 
 
 # Wrap kitchen-handoff numbers at this point so the line never has to read
@@ -130,6 +130,28 @@ class OrderRepository(BaseSyncRepository):
         with transaction.atomic():
             row, _ = ChefQueueCounter.objects.select_for_update().get_or_create(
                 scope=scope, defaults={'value': 0},
+            )
+            row.value = row.value + 1
+            row.save(update_fields=['value', 'updated_at'])
+            return row.value
+
+    @classmethod
+    def next_order_number(cls, scope=None):
+        """Atomically allocate the next per-BUSINESS-DAY order number (item 4).
+
+        Monotonic within a (branch, business day): never wraps — so two orders the
+        same day never share a number — and resets to 1 each business day (the scope
+        carries the business date). Stored on the order and synced as a VALUE; the
+        counter is per-branch bookkeeping and never propagates to siblings/cloud.
+        Caller must be inside a transaction (order services wrap create in
+        @transaction.atomic). scope defaults to BRANCH_ID.
+        """
+        from base.services.business_day import business_date
+        branch = scope or getattr(settings, 'BRANCH_ID', 'default') or 'default'
+        counter_scope = f'ordernum:{branch}:{business_date().isoformat()}'
+        with transaction.atomic():
+            row, _ = SequenceCounter.objects.select_for_update().get_or_create(
+                scope=counter_scope, defaults={'value': 0},
             )
             row.value = row.value + 1
             row.save(update_fields=['value', 'updated_at'])

@@ -140,6 +140,7 @@ def create_qr_order(table, items, customer_note=None):
         description=(customer_note or '')[:500] or None,
         display_id=OrderRepository.next_display_id(),
         chef_queue_number=OrderRepository.next_chef_queue_number(),
+        order_number=OrderRepository.next_order_number(),
     )
     for product, qty, price in items:
         OrderItem.objects.create(

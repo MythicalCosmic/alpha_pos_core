@@ -178,6 +178,7 @@ def checkout(customer, phone_required=True):
         total_amount=total,
         display_id=OrderRepository.next_display_id(),
         chef_queue_number=OrderRepository.next_chef_queue_number(),
+        order_number=OrderRepository.next_order_number(),
     )
     for item in items:
         OrderItem.objects.create(
