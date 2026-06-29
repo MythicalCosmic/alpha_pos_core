@@ -16,6 +16,8 @@ from stock.models.transfers import StockTransfer, StockTransferItem
 from stock.models.counts import VarianceReasonCode, StockCount, StockCountItem
 from stock.models.settings import StockSettings, StockAlertConfig
 from stock.models.ai_chat import AIChat, AIMessage
+from stock.models.ai_briefing import AIBriefing
+from stock.models.ai_anomaly import Anomaly, AnomalySettings
 
 __all__ = [
     'StockLocation',
@@ -52,5 +54,9 @@ __all__ = [
     'StockSettings',
     'StockAlertConfig',
     'AIChat',
+    'AIMessage',
+    'AIBriefing',
+    'Anomaly',
+    'AnomalySettings',
     'AIMessage',
 ]
