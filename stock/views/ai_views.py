@@ -50,6 +50,9 @@ def ai_query(request):
         query=query,
         chat_id=data.get('chat_id') or data.get('conversation_id'),
         location_id=data.get('location_id'),
+        # Page context (route/range/filters the user is viewing) -> 'CURRENT VIEW:'
+        # preamble so the model resolves "this/now/these" against the open tab.
+        context=data.get('context'),
     )
     if isinstance(result, dict) and result.get('chat_id') is not None:
         result.setdefault('conversation_id', result['chat_id'])

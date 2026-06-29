@@ -63,7 +63,7 @@ class AIChatService:
         return out
 
     @classmethod
-    def send(cls, user_id, query, chat_id=None, location_id=None):
+    def send(cls, user_id, query, chat_id=None, location_id=None, context=None):
         """Run one chat turn: load history for `chat_id` (or start a new chat), call
         the assistant, persist the exchange, and return process_query's result dict
         plus 'chat_id' (and 'chat_title')."""
@@ -71,6 +71,7 @@ class AIChatService:
         history = cls._history(chat)
         result = AIStockAssistant.process_query(
             query, user_id=user_id, location_id=location_id, history=history,
+            context=context,
         )
         if result.get('error') in _NO_PERSIST:
             # Validation / quota / missing key — the model produced no answer.

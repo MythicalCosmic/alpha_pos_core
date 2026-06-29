@@ -43,6 +43,46 @@ You have full access to sales data, stock/inventory data, AND pre-computed busin
   - Do NOT wrap the whole reply in a code block; keep prose as normal Markdown text
 - Keep responses concise but complete
 
+=== CHARTS (inline visualizations) ===
+When a numeric breakdown would help the user SEE a trend / comparison / share
+(period-over-period revenue, category share, payment-method mix, top products by
+units or revenue, hour-of-day volume, etc.), emit a fenced code block tagged
+`chart` whose body is a single valid JSON object. The client renders it as a
+native chart. Supported shapes:
+
+LINE / time-series (one or more series):
+```chart
+{"type":"line","title":"Revenue by day","subtitle":"from /dashboard/sales",
+ "categories":["2026-06-01","2026-06-02"],
+ "series":[{"label":"Revenue","data":[12000000,13500000]},
+           {"label":"Last month","data":[10500000,11800000]}]}
+```
+BAR (single series):
+```chart
+{"type":"bar","title":"Daily orders","data":[{"label":"Mon","value":124},{"label":"Tue","value":142}]}
+```
+DONUT (share of total):
+```chart
+{"type":"donut","title":"Payment mix · today","data":[{"label":"CASH","value":8500000},{"label":"UZCARD","value":6200000}]}
+```
+HBAR (ranked horizontal bars, good for top-N):
+```chart
+{"type":"hbar","title":"Top products by revenue","data":[{"label":"Spicy Fries","value":14200000},{"label":"Garden Burger","value":12900000}]}
+```
+
+CHART RULES (follow exactly):
+- Emit VALID JSON only — no trailing commas, no comments, no expressions.
+- Money values as raw integer so'm (no thousands separators, no "UZS" in the number).
+- Use a chart ONLY when the user asked (explicitly or implicitly) for a breakdown /
+  trend / comparison — never for a single one-off number. When in doubt, do NOT chart;
+  a wrong or misleading chart is worse than none.
+- Pair every chart with ONE short prose sentence (e.g. "Sales peaked Saturday at 22.7M").
+  The chart is supportive, not the whole reply.
+- At most 2 charts per reply.
+- For "line": categories length MUST equal every series' data length, or it is dropped.
+- Set "subtitle" to the source endpoint when known (e.g. "from /dashboard/sales").
+- Optional per-point or per-series "color" (hex or rgb()); omit to use the default palette.
+
 === YOUR CAPABILITIES ===
 
 SALES & BUSINESS:
@@ -1134,6 +1174,31 @@ class AIStockAssistant:
             return True, None
         return True, None
 
+    @staticmethod
+    def _context_preamble(context) -> str:
+        """Render the FE-sent page context {route, range_from, range_to, filters,
+        visible_data_keys} into a 'CURRENT VIEW:' prompt preamble so the model
+        resolves pronouns (this/now/these) against what the user is looking at.
+        Returns '' when there is no usable context."""
+        if not isinstance(context, dict) or not context:
+            return ''
+        lines = ['CURRENT VIEW:']
+        if context.get('route'):
+            lines.append(f"- route: {context['route']}")
+        rf, rt = context.get('range_from'), context.get('range_to')
+        if rf or rt:
+            lines.append(f"- range: {rf or '?'} to {rt or '?'}")
+        if context.get('filters'):
+            lines.append(f"- filters: {json.dumps(context['filters'], ensure_ascii=False, default=str)}")
+        vis = context.get('visible_data_keys') or context.get('visible_data')
+        if vis:
+            vis = ', '.join(str(v) for v in vis) if isinstance(vis, (list, tuple)) else str(vis)
+            lines.append(f"- visible data: {vis}")
+        if len(lines) == 1:        # only the header — nothing useful was provided
+            return ''
+        lines.append('Treat any pronoun like "this", "now", "these" as referring to the CURRENT VIEW.')
+        return '\n'.join(lines) + '\n\n'
+
     @classmethod
     def process_query(cls, query: str, context: Dict = None, user_id: int = None,
                       location_id: int = None, history=None) -> Dict[str, Any]:
@@ -1159,13 +1224,16 @@ class AIStockAssistant:
         try:
             from base.services.llm import call_ai, call_ai_tools, can_use_tools
 
+            # Page-context preamble (the tab/range/filters the user is looking at),
+            # so "this/now/these" resolve to the CURRENT VIEW. Empty when no context.
+            preamble = cls._context_preamble(context)
             if can_use_tools():
                 # Claude path: hand the model read-only tools so it can drill into
                 # any order/shift/date/cashier/product itself — true "see everything"
                 # detail that never fits in a single pre-computed snapshot.
                 from stock.services.ai_tools_service import AIToolbox
                 overview = AIToolbox.execute('get_overview', {}, location_id)
-                prompt = f"""USER QUERY: {query}
+                prompt = f"""{preamble}USER QUERY: {query}
 
 QUICK OVERVIEW (call tools for anything more specific):
 {overview}
@@ -1204,7 +1272,7 @@ every number on tool results. Follow all language and formatting rules."""
                         "sales_velocity": cls._get_sales_velocity(),
                     }
 
-                prompt = f"""USER QUERY: {query}
+                prompt = f"""{preamble}USER QUERY: {query}
 
 CURRENT DATABASE STATE:
 {json.dumps(combined_data, indent=2, default=str, ensure_ascii=False)}
