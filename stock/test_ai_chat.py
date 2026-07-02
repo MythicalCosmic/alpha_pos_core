@@ -16,7 +16,7 @@ def _patch_pq(monkeypatch, fn):
 def test_send_creates_chat_and_saves_both_messages(monkeypatch):
     seen = {}
 
-    def fake(query, user_id=None, location_id=None, history=None):
+    def fake(query, user_id=None, location_id=None, history=None, **kwargs):
         seen['history'] = history
         return {'success': True, 'response': 'ANSWER', 'suggestions': []}
 
@@ -33,13 +33,13 @@ def test_send_creates_chat_and_saves_both_messages(monkeypatch):
 
 @pytest.mark.django_db
 def test_send_continues_chat_with_history(monkeypatch):
-    _patch_pq(monkeypatch, lambda query, user_id=None, location_id=None, history=None:
+    _patch_pq(monkeypatch, lambda query, user_id=None, location_id=None, history=None, **kwargs:
               {'success': True, 'response': 'first answer'})
     cid = AIChatService.send(user_id=7, query='q1')['chat_id']
 
     seen = {}
 
-    def second(query, user_id=None, location_id=None, history=None):
+    def second(query, user_id=None, location_id=None, history=None, **kwargs):
         seen['history'] = history
         return {'success': True, 'response': 'second answer'}
 
@@ -55,7 +55,7 @@ def test_send_continues_chat_with_history(monkeypatch):
 
 @pytest.mark.django_db
 def test_rate_limited_does_not_persist(monkeypatch):
-    _patch_pq(monkeypatch, lambda query, user_id=None, location_id=None, history=None:
+    _patch_pq(monkeypatch, lambda query, user_id=None, location_id=None, history=None, **kwargs:
               {'success': False, 'error': 'rate_limited', 'response': 'quota'})
     r = AIChatService.send(user_id=7, query='hi')
     assert r['error'] == 'rate_limited'
@@ -65,12 +65,12 @@ def test_rate_limited_does_not_persist(monkeypatch):
 @pytest.mark.django_db
 def test_error_turn_in_existing_chat_excluded_from_history(monkeypatch):
     # A successful first turn establishes the chat.
-    _patch_pq(monkeypatch, lambda query, user_id=None, location_id=None, history=None:
+    _patch_pq(monkeypatch, lambda query, user_id=None, location_id=None, history=None, **kwargs:
               {'success': True, 'response': 'hello'})
     cid = AIChatService.send(user_id=7, query='hi')['chat_id']
 
     # A failed turn IN the existing chat is recorded (is_error=True).
-    _patch_pq(monkeypatch, lambda query, user_id=None, location_id=None, history=None:
+    _patch_pq(monkeypatch, lambda query, user_id=None, location_id=None, history=None, **kwargs:
               {'success': False, 'error': 'internal_error', 'response': 'unavailable'})
     AIChatService.send(user_id=7, query='boom', chat_id=cid)
     assert AIMessage.objects.filter(chat_id=cid, role='assistant', is_error=True).exists()
@@ -80,7 +80,7 @@ def test_error_turn_in_existing_chat_excluded_from_history(monkeypatch):
     # alternating pairs with no orphan user turn (no consecutive same-role bug).
     seen = {}
 
-    def ok(query, user_id=None, location_id=None, history=None):
+    def ok(query, user_id=None, location_id=None, history=None, **kwargs):
         seen['history'] = history
         return {'success': True, 'response': 'ok now'}
 
@@ -94,7 +94,7 @@ def test_error_turn_in_existing_chat_excluded_from_history(monkeypatch):
 
 @pytest.mark.django_db
 def test_failed_first_message_does_not_create_chat(monkeypatch):
-    _patch_pq(monkeypatch, lambda query, user_id=None, location_id=None, history=None:
+    _patch_pq(monkeypatch, lambda query, user_id=None, location_id=None, history=None, **kwargs:
               {'success': False, 'error': 'internal_error', 'response': 'down'})
     r = AIChatService.send(user_id=7, query='hi')
     assert r['error'] == 'internal_error'
@@ -103,7 +103,7 @@ def test_failed_first_message_does_not_create_chat(monkeypatch):
 
 @pytest.mark.django_db
 def test_quota_exceeded_does_not_persist(monkeypatch):
-    _patch_pq(monkeypatch, lambda query, user_id=None, location_id=None, history=None:
+    _patch_pq(monkeypatch, lambda query, user_id=None, location_id=None, history=None, **kwargs:
               {'success': False, 'error': 'quota_exceeded', 'response': 'rate limited'})
     AIChatService.send(user_id=7, query='hi')
     assert AIChat.objects.count() == 0 and AIMessage.objects.count() == 0
@@ -113,7 +113,7 @@ def test_quota_exceeded_does_not_persist(monkeypatch):
 def test_blank_success_answer_not_stored(monkeypatch):
     # A success result with an empty answer (e.g. a truncated model reply) must
     # not leave a blank assistant bubble / junk chat.
-    _patch_pq(monkeypatch, lambda query, user_id=None, location_id=None, history=None:
+    _patch_pq(monkeypatch, lambda query, user_id=None, location_id=None, history=None, **kwargs:
               {'success': True, 'response': '   '})
     AIChatService.send(user_id=7, query='hi')
     assert AIChat.objects.count() == 0 and AIMessage.objects.count() == 0
@@ -121,7 +121,7 @@ def test_blank_success_answer_not_stored(monkeypatch):
 
 @pytest.mark.django_db
 def test_chats_are_scoped_per_user(monkeypatch):
-    _patch_pq(monkeypatch, lambda query, user_id=None, location_id=None, history=None:
+    _patch_pq(monkeypatch, lambda query, user_id=None, location_id=None, history=None, **kwargs:
               {'success': True, 'response': 'a'})
     a = AIChatService.send(user_id=7, query='mine')['chat_id']
     AIChatService.send(user_id=8, query='theirs')
@@ -136,7 +136,7 @@ def test_chats_are_scoped_per_user(monkeypatch):
 
 @pytest.mark.django_db
 def test_bad_chat_id_starts_new_chat(monkeypatch):
-    _patch_pq(monkeypatch, lambda query, user_id=None, location_id=None, history=None:
+    _patch_pq(monkeypatch, lambda query, user_id=None, location_id=None, history=None, **kwargs:
               {'success': True, 'response': 'x'})
     r = AIChatService.send(user_id=7, query='hi', chat_id='not-a-number')
     assert r['chat_id'] and AIChat.objects.filter(id=r['chat_id']).exists()

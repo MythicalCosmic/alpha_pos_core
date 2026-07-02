@@ -503,6 +503,10 @@ class User(SyncMixin, models.Model):
 
     last_login_at = models.DateTimeField(null=True, blank=True)
     last_login_api = models.CharField(max_length=20, null=True, blank=True)
+    # Account creation time (auto-stamped on INSERT, like every other model).
+    # Added late via migration 0035; the pre-existing rows were backfilled to the
+    # migration run time (no historical creation timestamp was ever recorded).
+    created_at = models.DateTimeField(auto_now_add=True)
     # Required by SyncMixin._should_replace tiebreaker: when two branches
     # land at the same sync_version, the row with the newer updated_at
     # wins. Without this field, equal-version syncs fell through to a

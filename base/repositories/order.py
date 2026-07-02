@@ -225,6 +225,7 @@ class OrderRepository(BaseSyncRepository):
 
         return qs.aggregate(
             total=Count('id'),
+            open=Count('id', filter=Q(status='OPEN')),
             preparing=Count('id', filter=Q(status='PREPARING')),
             ready=Count('id', filter=Q(status='READY')),
             completed=Count('id', filter=Q(status='COMPLETED')),

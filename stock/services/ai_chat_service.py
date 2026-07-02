@@ -62,6 +62,33 @@ class AIChatService:
             out.append({'role': 'assistant', 'content': a_content})
         return out
 
+    @staticmethod
+    def _normalize(s):
+        return ' '.join((s or '').lower().split())
+
+    @classmethod
+    def _repeat_count(cls, chat, query):
+        """How many of the most-recent CONSECUTIVE prior USER turns in this chat are
+        the same (normalized) question as `query`. 0 = fresh; 1 = asked once before
+        (so this is the 2nd identical ask). Reads raw AIMessage rows (NOT _history)
+        so a question the model keeps FAILING still counts toward the annoyed tone.
+        The current message isn't persisted yet, so only prior turns are compared."""
+        if chat is None:
+            return 0
+        norm = cls._normalize(query)
+        if not norm:
+            return 0
+        prior = (chat.messages.filter(is_deleted=False, role=AIMessage.Role.USER)
+                 .order_by('-created_at', '-id')
+                 .values_list('content', flat=True)[:5])
+        n = 0
+        for c in prior:
+            if cls._normalize(c) == norm:
+                n += 1
+            else:
+                break
+        return n
+
     @classmethod
     def send(cls, user_id, query, chat_id=None, location_id=None, context=None):
         """Run one chat turn: load history for `chat_id` (or start a new chat), call
@@ -69,9 +96,10 @@ class AIChatService:
         plus 'chat_id' (and 'chat_title')."""
         chat = cls._load_chat(user_id, chat_id)
         history = cls._history(chat)
+        repeat_count = cls._repeat_count(chat, query)
         result = AIStockAssistant.process_query(
             query, user_id=user_id, location_id=location_id, history=history,
-            context=context,
+            context=context, repeat_count=repeat_count,
         )
         if result.get('error') in _NO_PERSIST:
             # Validation / quota / missing key — the model produced no answer.

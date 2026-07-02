@@ -195,9 +195,9 @@ def call_ai_tools(prompt, system=None, tools=None, tool_executor=None,
         # demand') with backoff — same policy as call_ai's single-shot path.
         kwargs = {'model': model, 'max_tokens': max_tokens, 'messages': messages}
         if system:
-            kwargs['system'] = system
+            kwargs['system'] = _cache_system(system)
         if include_tools:
-            kwargs['tools'] = tools
+            kwargs['tools'] = _cache_tools(tools)
         delay = 1.0
         last_err = None
         for attempt in range(retries + 1):
@@ -259,6 +259,81 @@ def call_ai_tools(prompt, system=None, tools=None, tool_executor=None,
         return None, str(e)
 
 
+# ── AI determinism + prompt caching helpers ─────────────────────────────────
+# Learned once per process: whether the OpenAI endpoint/model accepts our
+# determinism/cache kwargs. None = not yet probed; False = rejected once, so we
+# stop sending them (avoids a failed+retry round-trip on every request).
+_OPENAI_EXTRAS = ('seed', 'prompt_cache_key', 'temperature')
+_openai_extras_ok = None
+
+
+def _openai_sampling_kwargs(model):
+    """Determinism + cache-routing kwargs for the OpenAI chat API. `seed` gives
+    best-effort reproducibility (same question -> same answer); `prompt_cache_key`
+    improves prefix-cache hit routing (caching itself is automatic once the static
+    system prefix is large, which it is). Reasoning models (gpt-5 / o-series) reject
+    a non-default temperature, so temperature is only sent for classic models.
+    Anything the SDK/model rejects is stripped by _openai_create."""
+    kw = {
+        'seed': int(getattr(settings, 'OPENAI_SEED', 7)),
+        'prompt_cache_key': 'alpha-pos-ai-assistant',
+    }
+    if not str(model or '').startswith(('gpt-5', 'o1', 'o3', 'o4')):
+        kw['temperature'] = float(getattr(settings, 'AI_TEMPERATURE', 0) or 0)
+    return kw
+
+
+def _openai_create(client, kwargs):
+    """client.chat.completions.create(**kwargs), tolerant of an SDK/model that
+    rejects the determinism/cache kwargs: an old SDK raises TypeError, a stricter
+    model returns 400 'unsupported_parameter/value'. On that specific failure we
+    strip the extras, remember it for the rest of the process, and retry once so
+    the call still succeeds. Every other error propagates unchanged."""
+    global _openai_extras_ok
+    if _openai_extras_ok is False:
+        kwargs = {k: v for k, v in kwargs.items() if k not in _OPENAI_EXTRAS}
+        return client.chat.completions.create(**kwargs)
+    try:
+        resp = client.chat.completions.create(**kwargs)
+        if _openai_extras_ok is None and any(k in kwargs for k in _OPENAI_EXTRAS):
+            _openai_extras_ok = True
+        return resp
+    except Exception as e:  # noqa: BLE001
+        msg = str(e).lower()
+        looks_like_param = (
+            isinstance(e, TypeError)
+            or 'unsupported' in msg or 'unexpected keyword' in msg
+            or any(k in msg for k in _OPENAI_EXTRAS)
+        )
+        if looks_like_param and any(k in kwargs for k in _OPENAI_EXTRAS):
+            _openai_extras_ok = False
+            logger.warning('openai: determinism/cache kwargs rejected (%s); '
+                           'dropping them for this process', str(e)[:120])
+            base = {k: v for k, v in kwargs.items() if k not in _OPENAI_EXTRAS}
+            return client.chat.completions.create(**base)
+        raise
+
+
+def _cache_system(system):
+    """Wrap the static system prompt in an Anthropic cache_control block so the
+    large prefix is cached (ephemeral). Plain string in -> list-of-one-block out;
+    falsy stays falsy."""
+    if not system:
+        return system
+    return [{'type': 'text', 'text': system,
+             'cache_control': {'type': 'ephemeral'}}]
+
+
+def _cache_tools(tools):
+    """Mark the LAST tool with cache_control so the whole tools array caches with
+    the system prefix. Returns a shallow copy (never mutates the caller's list)."""
+    if not tools:
+        return tools
+    cached = [dict(t) for t in tools]
+    cached[-1] = {**cached[-1], 'cache_control': {'type': 'ephemeral'}}
+    return cached
+
+
 def _call_claude(prompt, system, max_tokens, history=None):
     if anthropic is None:
         return None, 'llm_sdk_missing'
@@ -274,7 +349,7 @@ def _call_claude(prompt, system, max_tokens, history=None):
             'messages': _history_messages(history) + [{'role': 'user', 'content': prompt}],
         }
         if system:
-            kwargs['system'] = system
+            kwargs['system'] = _cache_system(system)
         resp = client.messages.create(**kwargs)
         # content is a list of blocks; concatenate the text blocks. No sampling
         # params are sent so this stays valid across the Opus 4.x line too.
@@ -319,7 +394,10 @@ def _call_gemini(prompt, system, max_tokens, history=None):
         # (bad key / bad request) stops immediately — a fallback won't help.
         candidates = [model] + [m for m in GEMINI_FALLBACK_MODELS if m != model]
         last_err = None
-        cfg = types.GenerateContentConfig(max_output_tokens=max_tokens)
+        cfg = types.GenerateContentConfig(
+            max_output_tokens=max_tokens,
+            temperature=float(getattr(settings, 'AI_TEMPERATURE', 0) or 0),
+        )
         for m in candidates:
             try:
                 resp = client.models.generate_content(model=m, contents=contents, config=cfg)
@@ -355,9 +433,10 @@ def _call_openai(prompt, system, max_tokens, history=None):
         # answer against `max_completion_tokens`; keep a generous floor so an
         # answer is never truncated (or eaten entirely by reasoning).
         ceiling = max(int(max_tokens or 2048), OPENAI_MIN_COMPLETION_TOKENS)
-        resp = client.chat.completions.create(
-            model=model, messages=messages, max_completion_tokens=ceiling,
-        )
+        resp = _openai_create(client, {
+            'model': model, 'messages': messages, 'max_completion_tokens': ceiling,
+            **_openai_sampling_kwargs(model),
+        })
         text = resp.choices[0].message.content if resp.choices else None
         if not (text or '').strip():
             # A GPT-5 reasoning model can spend the whole max_completion_tokens
@@ -405,13 +484,14 @@ def _openai_tool_loop(prompt, system, tools, tool_executor, max_tokens,
     ceiling = max(int(max_tokens or 2048), OPENAI_MIN_COMPLETION_TOKENS)
 
     def _create(include_tools):
-        kwargs = {'model': model, 'messages': messages, 'max_completion_tokens': ceiling}
+        kwargs = {'model': model, 'messages': messages, 'max_completion_tokens': ceiling,
+                  **_openai_sampling_kwargs(model)}
         if include_tools:
             kwargs['tools'] = oai_tools
         delay, last_err = 1.0, None
         for attempt in range(retries + 1):
             try:
-                return client.chat.completions.create(**kwargs), None
+                return _openai_create(client, kwargs), None
             except Exception as e:  # noqa: BLE001
                 last_err = str(e)
                 if attempt < retries and _is_transient(last_err):

@@ -287,6 +287,13 @@ GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash')
 # OpenAI. GPT-5-class models use max_completion_tokens (handled in base.services.llm).
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
 OPENAI_MODEL = os.environ.get('OPENAI_MODEL', 'gpt-5.4-mini')
+# AI determinism knobs. A fixed seed makes the assistant reproducible (same
+# question -> same answer) where the provider supports it; AI_TEMPERATURE feeds
+# the non-reasoning OpenAI/Gemini paths (reasoning models ignore/reject it and
+# fall back gracefully). Prompt caching is automatic on OpenAI (stable system
+# prefix) and via cache_control on Anthropic — no key required.
+OPENAI_SEED = int(os.environ.get('OPENAI_SEED', '7'))
+AI_TEMPERATURE = float(os.environ.get('AI_TEMPERATURE', '0'))
 
 # Secret token Telegram includes as X-Telegram-Bot-Api-Secret-Token on every
 # webhook call, set when registering the webhook URL via setWebhook. Without
