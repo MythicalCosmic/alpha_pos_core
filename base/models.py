@@ -340,6 +340,12 @@ class SyncMixin(models.Model):
         incoming_updated = data.pop('updated_at', None)
         if isinstance(incoming_updated, str):
             incoming_updated = parse_datetime(incoming_updated)
+        # created_at is auto_now_add — save() would stamp the receiver's clock on
+        # INSERT (an offline backlog would then all read "created today"). Preserve
+        # the origin value; restored via .update() on the create branch below.
+        incoming_created = data.pop('created_at', None)
+        if isinstance(incoming_created, str):
+            incoming_created = parse_datetime(incoming_created)
 
         try:
             # Row-lock the existing row for the get()->compare->save sequence so
@@ -425,6 +431,9 @@ class SyncMixin(models.Model):
             if incoming_updated and hasattr(instance, 'updated_at'):
                 cls.objects.filter(pk=instance.pk).update(updated_at=incoming_updated)
                 instance.updated_at = incoming_updated
+            if incoming_created and hasattr(instance, 'created_at'):
+                cls.objects.filter(pk=instance.pk).update(created_at=incoming_created)
+                instance.created_at = incoming_created
             return instance, 'created'
 
     @classmethod
@@ -1117,6 +1126,11 @@ class Order(SyncMixin, models.Model):
         incoming_updated = data.pop('updated_at', None)
         if isinstance(incoming_updated, str):
             incoming_updated = parse_datetime(incoming_updated)
+        # created_at is auto_now_add: preserve the origin time so an offline
+        # backlog sync doesn't stamp every order with the receive date.
+        incoming_created = data.pop('created_at', None)
+        if isinstance(incoming_created, str):
+            incoming_created = parse_datetime(incoming_created)
 
         user = None
         cashier = None
@@ -1217,6 +1231,9 @@ class Order(SyncMixin, models.Model):
             if incoming_updated:
                 cls.objects.filter(pk=instance.pk).update(updated_at=incoming_updated)
                 instance.updated_at = incoming_updated
+            if incoming_created:
+                cls.objects.filter(pk=instance.pk).update(created_at=incoming_created)
+                instance.created_at = incoming_created
             return instance, 'created'
 
     def __str__(self):

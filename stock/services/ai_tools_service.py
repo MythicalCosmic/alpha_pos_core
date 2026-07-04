@@ -16,7 +16,7 @@ from datetime import date, timedelta
 import json
 import logging
 
-from django.db.models import Sum, Count, F, Q, Avg
+from django.db.models import Sum, Count, F, Q, Avg, Min, Max
 from django.db.models.functions import TruncDate, TruncHour
 from django.utils import timezone
 
@@ -72,6 +72,65 @@ def _parse_date(s):
         return date.fromisoformat(str(s)[:10])
     except (ValueError, TypeError):
         return None
+
+
+# ── generic read-only query tool (query_db) ─────────────────────────────────
+# Business models the AI may query freely. AUTH / licensing / session / crypto
+# models are deliberately ABSENT, and sensitive fields are stripped from every
+# result — even reached through a relation (cashier__password).
+_QUERYABLE_MODELS = {
+    'order': Order, 'orderitem': OrderItem, 'product': Product, 'category': Category,
+    'customer': Customer, 'user': User, 'cashier': User, 'staff': User,
+    'shift': Shift, 'cashreconciliation': CashReconciliation,
+    'cashregister': CashRegister, 'inkassa': Inkassa,
+    'stocklevel': StockLevel, 'stockbatch': StockBatch, 'stocklocation': StockLocation,
+}
+_SENSITIVE_MARKERS = ('password', 'passwd', 'secret', 'token', 'fernet',
+                      'payload', 'hash', 'otp', 'apikey', 'api_key', 'private')
+_AGG_FUNCS = {'sum': Sum, 'avg': Avg, 'min': Min, 'max': Max}
+
+
+def _seg_sensitive(seg):
+    low = str(seg).lower()
+    return any(m in low for m in _SENSITIVE_MARKERS)
+
+
+def _path_sensitive(path):
+    """True if ANY segment of a field path (a__b__c, optional '-' prefix) names a
+    sensitive field — blocks e.g. 'cashier__password', not just top-level fields."""
+    return any(_seg_sensitive(seg) for seg in str(path).lstrip('-').split('__'))
+
+
+def _deep_float(obj):
+    """Decimal -> float throughout a nested dict/list so aggregates serialize as
+    clean numbers (json default=str would otherwise stringify them)."""
+    from decimal import Decimal
+    if isinstance(obj, list):
+        return [_deep_float(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _deep_float(v) for k, v in obj.items()}
+    return float(obj) if isinstance(obj, Decimal) else obj
+
+
+def _build_aggs(aggregate):
+    """Parse {alias: 'func:field' | 'count'} into Django aggregation expressions.
+    Returns (aggs, None) or (None, error). Blocks sensitive fields."""
+    if not isinstance(aggregate, dict) or not aggregate:
+        return None, 'aggregate must be a non-empty object like {"revenue":"sum:total_amount","n":"count"}'
+    out = {}
+    for alias, spec in list(aggregate.items())[:12]:
+        s = str(spec).strip().lower()
+        if s == 'count':
+            out[str(alias)] = Count('id')
+            continue
+        fn, _, field = s.partition(':')
+        f, field = _AGG_FUNCS.get(fn.strip()), field.strip()
+        if not f or not field:
+            return None, "aggregate '%s' must be 'count' or 'func:field' (func: sum/avg/min/max)" % spec
+        if _path_sensitive(field):
+            return None, "field '%s' is not accessible" % field
+        out[str(alias)] = f(field)
+    return out, None
 
 
 def _customer_brief(c):
@@ -441,6 +500,39 @@ class AIToolbox:
                 "required": ["kind"],
             },
         },
+        {
+            "name": "query_db",
+            "description": (
+                "GENERIC read-only query over the live database — your way to reach ANY data "
+                "point the specific tools above do not already expose. Pick a model, filter it "
+                "with Django-style field lookups, and either return matching rows (choose the "
+                "fields) OR aggregate (count / sum:field / avg:field / min:field / max:field, "
+                "optionally grouped). Queryable models: order, orderitem, product, category, "
+                "customer, user, shift, cashreconciliation, cashregister, inkassa, stocklevel, "
+                "stockbatch, stocklocation. Field lookups use '__': "
+                '{"status":"COMPLETED","created_at__date":"2026-07-04","total_amount__gte":50000}. '
+                'Aggregate example: aggregate {"revenue":"sum:total_amount","orders":"count"} '
+                'group_by ["cashier"]. Row example: fields ["id","total_amount","status",'
+                '"cashier__first_name"]. Prefer a specific tool when it already computes the exact '
+                "metric (those are pre-validated); use query_db for anything they can't. Read-only; "
+                "soft-deleted rows and sensitive fields (passwords/tokens/keys) are always excluded."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "model": {"type": "string", "description": "order, orderitem, product, category, customer, user, shift, cashreconciliation, cashregister, inkassa, stocklevel, stockbatch, stocklocation"},
+                    "filters": {"type": "object", "description": 'Django field lookups, e.g. {"status":"COMPLETED","created_at__gte":"2026-07-01"}'},
+                    "exclude": {"type": "object", "description": "Same shape as filters, rows to exclude"},
+                    "aggregate": {"type": "object", "description": '{alias:"func:field" | "count"}, func: sum/avg/min/max. e.g. {"revenue":"sum:total_amount","n":"count"}'},
+                    "group_by": {"type": "array", "items": {"type": "string"}, "description": 'Group aggregates by these field paths, e.g. ["cashier","status"]'},
+                    "fields": {"type": "array", "items": {"type": "string"}, "description": 'Row mode: fields to return, e.g. ["id","total_amount","cashier__first_name"]. Omit for all non-sensitive fields.'},
+                    "order_by": {"type": "array", "items": {"type": "string"}, "description": 'e.g. ["-total_amount"]'},
+                    "limit": {"type": "integer", "description": f"Row-mode max (default 50, max {MAX_LIST})"},
+                    "offset": {"type": "integer", "description": "Skip N rows for paging"},
+                },
+                "required": ["model"],
+            },
+        },
     ]
 
     # ── dispatcher ──
@@ -461,6 +553,7 @@ class AIToolbox:
             "list_stock": cls._t_list_stock,
             "sales_report": cls._t_sales_report,
             "business_analytics": cls._t_analytics,
+            "query_db": cls._t_query_db,
         }.get(name)
         if handler is None:
             return json.dumps({"error": f"unknown tool: {name}"})
@@ -471,6 +564,90 @@ class AIToolbox:
             return json.dumps({"error": str(e)})
 
     # ── handlers ──
+    @classmethod
+    def _t_query_db(cls, args):
+        """Generic read-only query: pick a whitelisted model, filter it, and return
+        rows or aggregations. Sensitive fields and soft-deleted rows are excluded;
+        a bad model/field/lookup returns an {error} the model can read and correct."""
+        name = str(args.get('model') or '').strip().lower()
+        model = _QUERYABLE_MODELS.get(name)
+        if model is None:
+            return {"error": "unknown model '%s'. queryable: %s"
+                    % (name, ', '.join(sorted(set(_QUERYABLE_MODELS))))}
+
+        qs = model.objects.all()
+        # Exclude soft-deleted rows unless explicitly asked.
+        if any(f.name == 'is_deleted' for f in model._meta.concrete_fields) \
+                and args.get('include_deleted') is not True:
+            qs = qs.filter(is_deleted=False)
+
+        filters = args.get('filters') or {}
+        excludes = args.get('exclude') or {}
+        if not isinstance(filters, dict) or not isinstance(excludes, dict):
+            return {"error": "'filters' and 'exclude' must be objects of field lookups"}
+        for key in list(filters) + list(excludes):
+            if _path_sensitive(key):
+                return {"error": "field '%s' is not accessible" % key}
+        try:
+            if filters:
+                qs = qs.filter(**filters)
+            if excludes:
+                qs = qs.exclude(**excludes)
+        except Exception as e:  # noqa: BLE001 — bad lookup: let the model correct it
+            return {"error": 'bad filter (%s). Use Django lookups like '
+                             '{"status":"COMPLETED","created_at__gte":"2026-07-01"}.' % e}
+
+        aggregate = args.get('aggregate') or {}
+        group_by = args.get('group_by') or []
+        if isinstance(group_by, str):
+            group_by = [group_by]
+
+        # ── aggregate / group-by mode ──
+        if aggregate or group_by:
+            for g in group_by:
+                if _path_sensitive(g):
+                    return {"error": "field '%s' is not accessible" % g}
+            aggs, err = _build_aggs(aggregate or {'n': 'count'})
+            if err:
+                return {"error": err}
+            try:
+                if group_by:
+                    rows = list(qs.values(*group_by[:6]).annotate(**aggs)
+                                .order_by(*group_by[:6])[:MAX_LIST])
+                    return {"model": name, "group_by": group_by[:6],
+                            "groups": len(rows), "result": _deep_float(rows)}
+                return {"model": name, "matched": qs.count(),
+                        "result": _deep_float(qs.aggregate(**aggs))}
+            except Exception as e:  # noqa: BLE001
+                return {"error": "bad aggregate/group_by (%s)" % e}
+
+        # ── row mode ──
+        fields = args.get('fields') or []
+        if fields:
+            for fld in fields:
+                if _path_sensitive(fld):
+                    return {"error": "field '%s' is not accessible" % fld}
+        else:
+            fields = [f.name for f in model._meta.concrete_fields
+                      if not _seg_sensitive(f.name)]
+        order_by = args.get('order_by') or []
+        if isinstance(order_by, str):
+            order_by = [order_by]
+        for ob in order_by:
+            if _path_sensitive(ob):
+                return {"error": "field '%s' is not accessible" % ob}
+        limit = _clamp(args.get('limit'), 50, 1, MAX_LIST)
+        offset = _clamp(args.get('offset'), 0, 0, _OFFSET_MAX)
+        total = qs.count()
+        try:
+            if order_by:
+                qs = qs.order_by(*order_by[:5])
+            rows = list(qs.values(*fields)[offset:offset + limit])
+        except Exception as e:  # noqa: BLE001
+            return {"error": "bad fields/order_by (%s)" % e}
+        return {"model": name, "total_matching": total, "returned": len(rows),
+                "rows": _deep_float(rows)}
+
     @classmethod
     def _t_datetime(cls, args):
         local = timezone.localtime()  # in TIME_ZONE (Asia/Tashkent) for wall-clock answers

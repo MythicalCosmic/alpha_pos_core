@@ -203,7 +203,19 @@ open and closed shifts, every cashier, every product, all stock, and any date ra
   sales_report for revenue over any date range; business_analytics for ABC/XYZ/menu/etc.
 - ALWAYS call tools to get real numbers — never guess or invent data. Call as many tools as
   you need (you may call several at once). Page with offset or narrow with filters if a list
-  is capped. Base every figure in your answer on tool results. Follow all language/format rules."""
+  is capped. Base every figure in your answer on tool results. Follow all language/format rules.
+- You ALSO have `query_db`: a GENERIC read-only query over the live database. Use it to reach ANY
+  data point the fixed tools do not already expose — filter any business model (order, orderitem,
+  product, category, customer, user, shift, cashreconciliation, cashregister, inkassa, stocklevel,
+  stockbatch, stocklocation) with Django field lookups and return rows OR run aggregations
+  (count / sum / avg / min / max, optionally grouped by any field). For READING, NOTHING in the
+  business database is off-limits to you — every order, line item, payment, shift, cashier,
+  product, category, customer, stock and cash record, and any field on them, at any level of
+  detail. MOVE FREELY: if a question needs a number no fixed tool computes, build it yourself with
+  query_db rather than giving up or approximating. Prefer a specific tool when it already computes
+  the exact metric (those are pre-validated); for everything else compute it directly from the data
+  with query_db, then VERIFY the result against the ACCURACY rules (recompute, cross-check the
+  totals) before you state it. Never answer "I can't get that" when query_db could fetch it."""
 
 
 class AIStockAssistant:

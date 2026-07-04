@@ -106,6 +106,26 @@ def _preserve_updated_at(model_class, instance, incoming_updated):
     instance.updated_at = incoming_updated
 
 
+def _preserve_created_at(model_class, instance, raw_created):
+    # created_at is auto_now_add on every SyncMixin model, so save() stamps the
+    # RECEIVER's clock on INSERT. When an offline till syncs a backlog (e.g. a whole
+    # day worked while the cloud was down), every row would otherwise land with
+    # TODAY's created_at — dumping yesterday's sales into today and corrupting all
+    # time-series analytics (revenue-by-day, "today", business-day windows).
+    # .update() bypasses auto_now_add so the origin created_at from the pushing
+    # branch survives. No-op on UPDATE (auto_now_add only fires on INSERT), but
+    # harmless there and it also corrects a row whose created_at was mis-stamped
+    # by an earlier (buggy) receive.
+    from django.utils.dateparse import parse_datetime
+    if not raw_created or not hasattr(instance, 'created_at'):
+        return
+    val = parse_datetime(raw_created) if isinstance(raw_created, str) else raw_created
+    if val is None:
+        return
+    model_class.objects.filter(pk=instance.pk).update(created_at=val)
+    instance.created_at = val
+
+
 class CloudReceiver:
 
     @classmethod
@@ -334,6 +354,7 @@ class CloudReceiver:
                     instance.branch_id = incoming_branch
                 instance.save(_syncing=True)
                 _preserve_updated_at(model_class, instance, incoming_updated)
+                _preserve_created_at(model_class, instance, cleaned.get('created_at'))
                 return instance, 'updated'
 
             except model_class.DoesNotExist:
@@ -367,6 +388,7 @@ class CloudReceiver:
                         instance.branch_id = incoming_branch
                     instance.save(_syncing=True)
                     _preserve_updated_at(model_class, instance, incoming_updated)
+                    _preserve_created_at(model_class, instance, cleaned.get('created_at'))
                     return instance, 'updated'
 
                 instance = model_class(
@@ -385,4 +407,5 @@ class CloudReceiver:
 
                 instance.save(_syncing=True)
                 _preserve_updated_at(model_class, instance, incoming_updated)
+                _preserve_created_at(model_class, instance, cleaned.get('created_at'))
                 return instance, 'created'
