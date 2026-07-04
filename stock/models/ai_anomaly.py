@@ -25,6 +25,11 @@ class Anomaly(models.Model):
     message = models.TextField(blank=True, default='')
     deep_link = models.CharField(max_length=255, blank=True, default='')
     ai_explanation = models.TextField(blank=True, default='')
+    # Localized {uz,ru,en} copies. The plain message/ai_explanation TextFields stay
+    # as the English fallback (Telegram delivery + pre-i18n rows). default=dict is a
+    # callable (Django forbids a mutable {} literal default).
+    message_i18n = models.JSONField(blank=True, default=dict)
+    explanation_i18n = models.JSONField(blank=True, default=dict)
     acked_by = models.IntegerField(null=True, blank=True)
     acked_at = models.DateTimeField(null=True, blank=True)
 

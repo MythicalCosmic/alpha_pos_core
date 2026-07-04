@@ -20,8 +20,13 @@ VALID_HOURS = 16  # the briefing stays "fresh" through the operating day
 _BRIEFING_SYSTEM = (
     "You are the operator's morning analyst. You output ONLY a valid JSON array — no "
     "prose, no markdown fences. Each element is an object with EXACTLY these keys: "
-    "icon, title, body, deep_link, ai_seed_prompt. Money is integer so'm. Keep title "
-    "<= 7 words and body <= 25 words."
+    "icon, title, body, deep_link, ai_seed_prompt. `title` and `body` are each an "
+    "OBJECT with EXACTLY three string keys: \"uz\" (Uzbek, Latin script), \"ru\" "
+    "(Russian), \"en\" (English) — the SAME message written in each language, never "
+    "left blank. Money is integer so'm (keep the digits identical across languages; "
+    "only translate the words). Keep each title <= 7 words and each body <= 25 words "
+    "in every language. icon, deep_link and ai_seed_prompt stay plain strings "
+    "(ai_seed_prompt in English)."
 )
 
 
@@ -91,11 +96,12 @@ class AIBriefingService:
                     "menu-engineering action. icon is one of "
                     "[revenue, trend, stock, staff, menu]. deep_link is an app route like "
                     "\"/dashboard?range=7d\" or \"/stock?filter=low\". ai_seed_prompt is a "
-                    "question that opens an AI thread to dig deeper. Return ONLY the JSON "
-                    "array.\n\nSNAPSHOT:\n"
+                    "question that opens an AI thread to dig deeper. Each bullet's `title` "
+                    "and `body` MUST be an object {\"uz\":..., \"ru\":..., \"en\":...} with "
+                    "all three languages filled. Return ONLY the JSON array.\n\nSNAPSHOT:\n"
                     + json.dumps(snap, default=str, ensure_ascii=False)[:12000]
                 )
-                text, err = call_ai(prompt, system=_BRIEFING_SYSTEM, max_tokens=1500)
+                text, err = call_ai(prompt, system=_BRIEFING_SYSTEM, max_tokens=2200)
                 if not err and text:
                     bullets = cls._parse_bullets(text)
                     if bullets:
@@ -105,8 +111,24 @@ class AIBriefingService:
         return cls._fallback(snap)
 
     @staticmethod
-    def _parse_bullets(text):
-        """Pull a JSON array of bullets out of the model output, defensively."""
+    def _langify(val, limit):
+        """Coerce a title/body value into {'uz','ru','en'}. Accepts a dict (already
+        trilingual — backfill any missing language from English) or a plain string
+        (treated as all three)."""
+        if isinstance(val, dict):
+            en = str(val.get('en') or '').strip()[:limit]
+            uz = str(val.get('uz') or '').strip()[:limit]
+            ru = str(val.get('ru') or '').strip()[:limit]
+            en = en or uz or ru
+            return {'uz': uz or en, 'ru': ru or en, 'en': en}
+        s = str(val or '').strip()[:limit]
+        return {'uz': s, 'ru': s, 'en': s}
+
+    @classmethod
+    def _parse_bullets(cls, text):
+        """Pull a JSON array of bullets out of the model output, defensively. title
+        and body may be a string or a {uz,ru,en} object; both normalize to a flat
+        English title/body (backward compat) PLUS title_i18n/body_i18n {uz,ru,en}."""
         s = (text or '').strip()
         if s.startswith('```'):
             s = s.strip('`')
@@ -122,19 +144,32 @@ class AIBriefingService:
         for it in data if isinstance(data, list) else []:
             if not isinstance(it, dict):
                 continue
+            title = cls._langify(it.get('title'), 120)
+            body = cls._langify(it.get('body'), 400)
             out.append({
                 'icon': str(it.get('icon') or 'trend')[:24],
-                'title': str(it.get('title') or '').strip()[:120],
-                'body': str(it.get('body') or '').strip()[:400],
+                'title': title['en'],            # flat English — backward compat
+                'body': body['en'],              # flat English — backward compat
+                'title_i18n': title,             # {uz,ru,en}
+                'body_i18n': body,               # {uz,ru,en}
                 'deep_link': str(it.get('deep_link') or '')[:255],
                 'ai_seed_prompt': str(it.get('ai_seed_prompt') or '')[:400],
             })
         return [b for b in out if b['title'] or b['body']]
 
-    @staticmethod
-    def _fallback(snap):
+    @classmethod
+    def _mk(cls, icon, title, body, deep_link, ai_seed_prompt):
+        """Build a fallback bullet with flat English + {uz,ru,en} for title/body."""
+        t = cls._langify(title, 120)
+        b = cls._langify(body, 400)
+        return {'icon': icon, 'title': t['en'], 'body': b['en'],
+                'title_i18n': t, 'body_i18n': b,
+                'deep_link': deep_link, 'ai_seed_prompt': ai_seed_prompt}
+
+    @classmethod
+    def _fallback(cls, snap):
         """Templated, data-driven bullets when the LLM can't compose — always
-        renders something useful."""
+        renders something useful, in uz/ru/en."""
         bullets = []
         inv = snap.get('inventory_health') or {}
         summary = inv.get('summary') or {}
@@ -147,47 +182,62 @@ class AIBriefingService:
         msummary = menu.get('summary') or {}
 
         if today.get('total_revenue_uzs') is not None:
-            bullets.append({
-                'icon': 'revenue',
-                'title': "Today's revenue so far",
-                'body': f"{int(today.get('total_revenue_uzs') or 0):,} so'm across "
-                        f"{today.get('count', 0)} orders.",
-                'deep_link': '/dashboard?range=today',
-                'ai_seed_prompt': 'How does today compare to the same weekday average?',
-            })
+            rev = int(today.get('total_revenue_uzs') or 0)
+            cnt = today.get('count', 0)
+            bullets.append(cls._mk(
+                icon='revenue',
+                title={'en': "Today's revenue so far", 'ru': 'Выручка за сегодня',
+                       'uz': 'Bugungi tushum'},
+                body={'en': f"{rev:,} so'm across {cnt} orders.",
+                      'ru': f"{rev:,} so'm, заказов: {cnt}.",
+                      'uz': f"{rev:,} so'm, {cnt} ta buyurtma."},
+                deep_link='/dashboard?range=today',
+                ai_seed_prompt='How does today compare to the same weekday average?'))
         if top:
-            t = top[0]
-            bullets.append({
-                'icon': 'trend',
-                'title': f"Top seller: {t.get('name', '—')}",
-                'body': f"{int(t.get('revenue_uzs') or 0):,} so'm so far.",
-                'deep_link': '/dashboard/products',
-                'ai_seed_prompt': f"Why is {t.get('name', 'this product')} selling well?",
-            })
+            name = top[0].get('name', '—')
+            rev = int(top[0].get('revenue_uzs') or 0)
+            bullets.append(cls._mk(
+                icon='trend',
+                title={'en': f"Top seller: {name}", 'ru': f"Лидер продаж: {name}",
+                       'uz': f"Eng ko'p sotilgan: {name}"},
+                body={'en': f"{rev:,} so'm so far.", 'ru': f"{rev:,} so'm на данный момент.",
+                      'uz': f"Hozircha {rev:,} so'm."},
+                deep_link='/dashboard/products',
+                ai_seed_prompt=f"Why is {name} selling well?"))
         if dead:
-            d = dead[0]
-            bullets.append({
-                'icon': 'stock',
-                'title': 'Dead / slow stock',
-                'body': f"{d.get('name', 'An item')} hasn't moved in "
-                        f"{d.get('days_since_last_movement', '?')} days.",
-                'deep_link': '/stock?filter=dead',
-                'ai_seed_prompt': 'Which items should I discount or discontinue?',
-            })
+            name = dead[0].get('name', 'An item')
+            days = dead[0].get('days_since_last_movement', '?')
+            bullets.append(cls._mk(
+                icon='stock',
+                title={'en': 'Dead / slow stock', 'ru': 'Залежавшийся товар',
+                       'uz': 'Sotilmayotgan mahsulot'},
+                body={'en': f"{name} hasn't moved in {days} days.",
+                      'ru': f"{name} не продаётся уже {days} дн.",
+                      'uz': f"{name} {days} kundan beri sotilmagan."},
+                deep_link='/stock?filter=dead',
+                ai_seed_prompt='Which items should I discount or discontinue?'))
         elif low:
-            bullets.append({
-                'icon': 'stock', 'title': 'Inventory needs attention',
-                'body': f"{low} item(s) flagged in inventory health.",
-                'deep_link': '/stock', 'ai_seed_prompt': 'What stock is running low?',
-            })
+            bullets.append(cls._mk(
+                icon='stock',
+                title={'en': 'Inventory needs attention', 'ru': 'Требуется проверка склада',
+                       'uz': "Ombor e'tibor talab qiladi"},
+                body={'en': f"{low} item(s) flagged in inventory health.",
+                      'ru': f"{low} позиц. отмечены в проверке склада.",
+                      'uz': f"{low} ta mahsulot ombor tekshiruvida belgilangan."},
+                deep_link='/stock',
+                ai_seed_prompt='What stock is running low?'))
         if msummary.get('dogs'):
-            bullets.append({
-                'icon': 'menu',
-                'title': 'Menu action: review the "Dogs"',
-                'body': f"{msummary['dogs']} low-popularity, low-margin item(s) to rethink.",
-                'deep_link': '/dashboard/products',
-                'ai_seed_prompt': 'Show me the menu-engineering Dogs and what to do.',
-            })
+            n = msummary['dogs']
+            bullets.append(cls._mk(
+                icon='menu',
+                title={'en': 'Menu action: review the "Dogs"',
+                       'ru': 'Меню: пересмотреть «Аутсайдеров»',
+                       'uz': 'Menyu: "Autsayderlar"ni ko\'rib chiqing'},
+                body={'en': f"{n} low-popularity, low-margin item(s) to rethink.",
+                      'ru': f"{n} непопул., низкомарж. позиц. на пересмотр.",
+                      'uz': f"{n} ta kam ommabop, kam foydali mahsulotni qayta ko'rib chiqing."},
+                deep_link='/dashboard/products',
+                ai_seed_prompt='Show me the menu-engineering Dogs and what to do.'))
         return bullets[:5]
 
 

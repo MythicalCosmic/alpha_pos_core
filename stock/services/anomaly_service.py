@@ -22,6 +22,34 @@ logger = logging.getLogger(__name__)
 
 _SEV = Anomaly.Severity
 
+# Weekday names per language — RevenueDip uses these instead of English strftime('%A').
+_WD = {
+    'en': ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'],
+    'ru': ['понедельникам', 'вторникам', 'средам', 'четвергам', 'пятницам', 'субботам', 'воскресеньям'],
+    'uz': ['dushanba', 'seshanba', 'chorshanba', 'payshanba', 'juma', 'shanba', 'yakshanba'],
+}
+
+
+def _parse_i18n(text):
+    """Extract a {uz,ru,en} object from LLM output, defensively (missing langs
+    backfilled from en; returns {} if nothing usable)."""
+    import json
+    s = (text or '').strip().strip('`')
+    start, end = s.find('{'), s.rfind('}')
+    if start == -1 or end == -1 or end <= start:
+        return {}
+    try:
+        d = json.loads(s[start:end + 1])
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(d, dict):
+        return {}
+    en = str(d.get('en') or '').strip()[:400]
+    uz = str(d.get('uz') or '').strip()[:400]
+    ru = str(d.get('ru') or '').strip()[:400]
+    en = en or uz or ru
+    return {'uz': uz or en, 'ru': ru or en, 'en': en} if en else {}
+
 
 def _key(detector, target_kind, target_id, window_key):
     raw = f"{detector}|{target_kind}:{target_id}|{window_key}"
@@ -66,7 +94,9 @@ class LowStockCrossed(Detector):
             sev = _SEV.CRITICAL if qty <= 0 else (_SEV.HIGH if rp and qty <= rp / 2 else _SEV.MEDIUM)
             out.append(_candidate(
                 self.name, sev, 'stock_item', it.id, wk,
-                f"{it.name} is low: {qty} left (reorder at {rp}).",
+                {'en': f"{it.name} is low: {qty} left (reorder at {rp}).",
+                 'ru': f"{it.name} заканчивается: осталось {qty} (точка заказа {rp}).",
+                 'uz': f"{it.name} tugayapti: {qty} qoldi (buyurtma nuqtasi {rp})."},
                 '/stock?filter=low'))
         return out
 
@@ -98,10 +128,15 @@ class RevenueDip(Detector):
             return []
         pct = int((1 - (rev / avg)) * 100) if avg else 0
         sev = _SEV.HIGH if rev < avg * Decimal('0.5') else _SEV.MEDIUM
+        wd = d.weekday()
         return [_candidate(
             self.name, sev, 'date', d.isoformat(), d.isoformat(),
-            f"{d.isoformat()} revenue {int(rev):,} so'm — {pct}% below the "
-            f"{d.strftime('%A')} average ({int(avg):,}).",
+            {'en': f"{d.isoformat()} revenue {int(rev):,} so'm — {pct}% below the "
+                   f"{_WD['en'][wd]} average ({int(avg):,}).",
+             'ru': f"Выручка за {d.isoformat()} — {int(rev):,} so'm, на {pct}% ниже "
+                   f"среднего по {_WD['ru'][wd]} ({int(avg):,}).",
+             'uz': f"{d.isoformat()} tushumi {int(rev):,} so'm — {_WD['uz'][wd]} kunlari "
+                   f"o'rtachasidan {pct}% past ({int(avg):,})."},
             '/dashboard?range=7d')]
 
 
@@ -125,10 +160,12 @@ class CashierVoidBurst(Detector):
             if cancels >= 5 or (cancels >= 3 and total >= 5 and rate >= 0.3):
                 name = f"{r['cashier__first_name'] or ''} {r['cashier__last_name'] or ''}".strip()
                 sev = _SEV.HIGH if cancels >= 6 else _SEV.MEDIUM
+                pct = int(rate * 100)
                 out.append(_candidate(
                     self.name, sev, 'cashier', r['cashier_id'], wk,
-                    f"{name or 'Cashier'} voided {cancels} of {total} orders today "
-                    f"({int(rate * 100)}%).",
+                    {'en': f"{name or 'Cashier'} voided {cancels} of {total} orders today ({pct}%).",
+                     'ru': f"{name or 'Кассир'} отменил(а) {cancels} из {total} заказов сегодня ({pct}%).",
+                     'uz': f"{name or 'Kassir'} bugun {total} buyurtmadan {cancels} tasini bekor qildi ({pct}%)."},
                     f"/orders?cashier_id={r['cashier_id']}&status=CANCELED"))
         return out
 
@@ -155,8 +192,9 @@ class UnusualDiscount(Detector):
                 sev = _SEV.HIGH if eff >= 70 else _SEV.MEDIUM
                 out.append(_candidate(
                     self.name, sev, 'order', r['id'], r['id'],
-                    f"Order #{r['display_id']} discounted {int(eff)}% "
-                    f"({int(damt):,} so'm off {int(sub):,}).",
+                    {'en': f"Order #{r['display_id']} discounted {int(eff)}% ({int(damt):,} so'm off {int(sub):,}).",
+                     'ru': f"Заказ #{r['display_id']} со скидкой {int(eff)}% ({int(damt):,} so'm из {int(sub):,}).",
+                     'uz': f"#{r['display_id']} buyurtmaga {int(eff)}% chegirma ({int(sub):,} dan {int(damt):,} so'm)."},
                     f"/orders/{r['id']}"))
         return out
 
@@ -181,12 +219,16 @@ class AnomalyScanner:
                 key = _key(c['detector'], c['target_kind'], c['target_id'], c['window_key'])
                 if Anomaly.objects.filter(idempotency_key=key).exists():
                     continue
+                msg = c['message']            # {uz,ru,en} dict
+                expl = cls._explain(c)        # {uz,ru,en} dict, {} if unavailable
                 try:
                     a = Anomaly.objects.create(
                         detector=c['detector'], severity=c['severity'],
                         target_kind=c['target_kind'], target_id=c['target_id'],
-                        idempotency_key=key, message=c['message'], deep_link=c['deep_link'],
-                        ai_explanation=cls._explain(c))
+                        idempotency_key=key, deep_link=c['deep_link'],
+                        message=msg['en'], message_i18n=msg,
+                        ai_explanation=(expl.get('en', '') if expl else ''),
+                        explanation_i18n=expl or {})
                 except Exception:
                     # Unique race: another scan created it first — skip.
                     logger.debug('anomaly %s already exists (race)', key)
@@ -197,19 +239,23 @@ class AnomalyScanner:
 
     @staticmethod
     def _explain(c):
-        """One-line AI explanation, best-effort (empty if the LLM is unavailable)."""
+        """AI explanation in {uz,ru,en}, best-effort ({} if the LLM is unavailable)."""
         try:
             from base.services.llm import call_ai, key_missing
             if key_missing():
-                return ''
+                return {}
+            m = c.get('message')
+            seed = m.get('en', '') if isinstance(m, dict) else str(m or '')
             text, err = call_ai(
-                f"In ONE short sentence, explain why this matters to a restaurant "
-                f"owner and the first thing to check:\n{c['message']}",
-                system="You output one plain sentence, no markdown.", max_tokens=120)
-            return (text or '').strip()[:400] if not err else ''
+                "In ONE short sentence each, explain why this matters to a restaurant "
+                "owner and the first thing to check. Return ONLY a JSON object with keys "
+                "uz, ru, en (Uzbek, Russian, English), no markdown.\n" + seed,
+                system='You output ONLY a valid JSON object {"uz":..,"ru":..,"en":..}. '
+                       'No markdown, no prose.', max_tokens=400)
+            return {} if (err or not text) else _parse_i18n(text)
         except Exception:
             logger.exception('anomaly explain failed')
-            return ''
+            return {}
 
     @staticmethod
     def _deliver(anomaly):
@@ -239,8 +285,12 @@ class AnomalyService:
         anomalies = [{
             'id': a.id, 'detector': a.detector, 'severity': a.severity,
             'fired_at': a.fired_at.isoformat() if a.fired_at else None,
-            'message': a.message, 'deep_link': a.deep_link,
-            'ai_explanation': a.ai_explanation,
+            # {uz,ru,en}; old rows (no i18n) fall back to the English string.
+            'message': a.message_i18n or {'uz': a.message, 'ru': a.message, 'en': a.message},
+            'deep_link': a.deep_link,
+            'ai_explanation': a.explanation_i18n or (
+                {'uz': a.ai_explanation, 'ru': a.ai_explanation, 'en': a.ai_explanation}
+                if a.ai_explanation else {}),
             'target_kind': a.target_kind, 'target_id': a.target_id,
             'acked': a.acked_at is not None,
         } for a in rows]
