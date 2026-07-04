@@ -109,8 +109,9 @@ def test_process_query_no_behavior_when_fresh(monkeypatch):
 
 def test_system_prompt_has_security_and_determinism_and_personality():
     from stock.services.ai_assistant_service import SYSTEM_PROMPT, TOOLS_SYSTEM_PROMPT
-    for block in ('SECURITY / TRUST BOUNDARY', 'DETERMINISM & CONSISTENCY',
-                  'PERSONALITY & CONDUCT', 'UNTRUSTED CONTENT'):
+    for block in ('SECURITY / TRUST BOUNDARY', 'ACCURACY & DATA GROUNDING',
+                  'DETERMINISM & CONSISTENCY', 'PERSONALITY & CONDUCT',
+                  'UNTRUSTED CONTENT'):
         assert block in SYSTEM_PROMPT
     # TOOLS_SYSTEM_PROMPT extends SYSTEM_PROMPT, so it inherits all of them.
     assert TOOLS_SYSTEM_PROMPT.startswith(SYSTEM_PROMPT)

@@ -286,7 +286,7 @@ GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
 GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash')
 # OpenAI. GPT-5-class models use max_completion_tokens (handled in base.services.llm).
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
-OPENAI_MODEL = os.environ.get('OPENAI_MODEL', 'gpt-5.4-mini')
+OPENAI_MODEL = os.environ.get('OPENAI_MODEL', 'gpt-5.5')
 # AI determinism knobs. A fixed seed makes the assistant reproducible (same
 # question -> same answer) where the provider supports it; AI_TEMPERATURE feeds
 # the non-reasoning OpenAI/Gemini paths (reasoning models ignore/reject it and
