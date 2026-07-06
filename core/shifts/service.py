@@ -352,7 +352,26 @@ class ShiftService:
         if existing:
             return ServiceResponse.error("Reconciliation already exists for this shift")
 
-        expected_cash = shift.cash_collected
+        # Expected DRAWER cash must be NET of cash paid OUT of the drawer (cashbox
+        # expenses), matching the per-tender ShiftPaymentTotal the cashier counted
+        # against at close. shift.cash_collected is GROSS (Sum of CASH order totals,
+        # no expense subtraction — see end_shift), so using it made the manager's
+        # physical count read a FALSE shortage equal to the shift's cash paid-outs
+        # (a cashier who took 6.1M cash and paid 1.58M of it out as expenses has
+        # 4.52M in the drawer, not 6.1M). Prefer the frozen CASH settlement row;
+        # fall back to the live net drawer figure, then to gross as a last resort.
+        from cashbox.models import ShiftPaymentTotal
+        _spt_cash = ShiftPaymentTotal.objects.filter(
+            shift=shift, method='CASH', is_deleted=False).first()
+        if _spt_cash is not None:
+            expected_cash = _spt_cash.expected_amount
+        else:
+            try:
+                from cashbox.services.drawer import expected_payment_totals
+                expected_cash = expected_payment_totals(shift).get(
+                    'CASH', shift.cash_collected)
+            except Exception:  # noqa: BLE001 — never block reconcile on a recompute
+                expected_cash = shift.cash_collected
         actual = Decimal(str(actual_cash))
         difference = actual - expected_cash
 
@@ -368,7 +387,7 @@ class ShiftService:
         # Post the manager-confirmed money to the branch SAFE (cash) / BANK
         # (cards) and freeze the per-type confirmed figures. confirmed defaults
         # to the cashier's counted amount per method (the "copy" UX).
-        from cashbox.models import ShiftPaymentTotal
+        # (ShiftPaymentTotal already imported above for the expected-cash figure.)
         confirmed = confirmed or {}
         confirmed_cash = Decimal('0')
         confirmed_card = Decimal('0')
