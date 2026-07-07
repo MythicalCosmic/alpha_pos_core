@@ -74,6 +74,31 @@ def _parse_date(s):
         return None
 
 
+# Reporting/revenue basis, SHARED with dashboard_service + ai_assistant_service so
+# the AI always agrees with the admin panel: a sale counts when PLACED (created_at)
+# inside the BUSINESS-DAY window (03:00 cutover, not calendar midnight) and only if
+# PAID and not CANCELLED. (Cash-drawer settlement uses paid_at — a separate concern.)
+_REV = Q(is_paid=True) & ~Q(status='CANCELED')
+
+
+def _bd_today_window():
+    """(lo, now) — the current business day 'so far'."""
+    from base.services.business_day import today_window
+    return today_window()
+
+
+def _bd_range_window(d_from, d_to):
+    """Aware [d_from@cutover, (d_to+1)@cutover) business-day window (inclusive)."""
+    from base.services.business_day import range_window
+    return range_window(d_from, d_to)
+
+
+def _bd_today():
+    """The current business date (a 01:00 sale still belongs to the night before)."""
+    from base.services.business_day import business_date
+    return business_date()
+
+
 # ── generic read-only query tool (query_db) ─────────────────────────────────
 # Business models the AI may query freely. AUTH / licensing / session / crypto
 # models are deliberately ABSENT, and sensitive fields are stripped from every
@@ -222,7 +247,7 @@ def _shift_dict(s, with_orders=False):
     oqs = _shift_orders_qs(s)
     agg = oqs.aggregate(
         cnt=Count("id"),
-        revenue=Sum("total_amount", filter=Q(is_paid=True)),
+        revenue=Sum("total_amount", filter=_REV),
         gross=Sum("total_amount"),
     )
     # Reverse one-to-one: accessing a missing .reconciliation raises DoesNotExist
@@ -324,11 +349,12 @@ def _cashier_dict(u, with_today=True):
         "open_shift_id": open_shift.id if open_shift else None,
     }
     if with_today:
-        # "Today" is a wall-clock concept: filter on the local calendar date
-        # (TIME_ZONE is Asia/Tashkent, UTC+5) so 00:00-05:00 local orders count.
+        # "Today" = the current BUSINESS day (03:00 cutover), matching the admin
+        # dashboard, not a plain calendar date. Revenue = paid, non-cancelled.
+        _lo, _hi = _bd_today_window()
         agg = Order.objects.filter(
-            is_deleted=False, cashier=u, created_at__date=timezone.localdate()
-        ).aggregate(cnt=Count("id"), rev=Sum("total_amount", filter=Q(is_paid=True)))
+            is_deleted=False, cashier=u, created_at__gte=_lo, created_at__lt=_hi,
+        ).aggregate(cnt=Count("id"), rev=Sum("total_amount", filter=_REV))
         data["today_orders"] = agg["cnt"] or 0
         data["today_revenue_uzs"] = _f(agg["rev"])
     return data
@@ -607,6 +633,25 @@ class AIToolbox:
             for g in group_by:
                 if _path_sensitive(g):
                     return {"error": "field '%s' is not accessible" % g}
+            # Guard against JOIN fan-out. Summing/averaging a BASE-model field while the
+            # query traverses a to-many relation (e.g. filtering items__product__name or
+            # grouping by items__product__category) multiplies each row by its line count,
+            # inflating the total — and .distinct() cannot fix a fan-out Sum. Refuse it and
+            # steer the model to aggregate on the item side or use the sales_report tool.
+            _to_many = {f.name for f in model._meta.get_fields()
+                        if getattr(f, 'one_to_many', False) or getattr(f, 'many_to_many', False)}
+            _joins_to_many = any(str(p).split('__', 1)[0] in _to_many
+                                 for p in (list(filters) + list(excludes) + list(group_by)))
+            if _to_many and _joins_to_many:
+                for _spec in (aggregate or {}).values():
+                    _fn, _, _fld = str(_spec).strip().lower().partition(':')
+                    if _fn in ('sum', 'avg') and _fld and _fld.split('__', 1)[0] not in _to_many:
+                        return {"error":
+                                "join fan-out: aggregating an order-level field '%s' while "
+                                "filtering/grouping across a to-many relation (%s) counts each "
+                                "row once per line item and inflates the total. Aggregate on "
+                                "the item side (query model 'orderitem', sum 'quantity*price') "
+                                "or use the sales_report tool." % (_fld, ', '.join(sorted(_to_many)))}
             aggs, err = _build_aggs(aggregate or {'n': 'count'})
             if err:
                 return {"error": err}
@@ -654,6 +699,12 @@ class AIToolbox:
         return {
             "now": _iso(local),
             "today": timezone.localdate().isoformat(),
+            # Sales/analytics use the BUSINESS day (cutover ~03:00): a sale before 03:00
+            # belongs to the previous business_date. Use business_date to anchor
+            # "today's sales" so it matches the admin dashboard.
+            "business_date": _bd_today().isoformat(),
+            "business_day_note": "Reports bound on the business day (03:00 cutover); "
+                                 "use business_date for 'today' revenue questions.",
             "weekday": local.strftime("%A"),
             "timezone": str(timezone.get_current_timezone()),
         }
@@ -661,11 +712,14 @@ class AIToolbox:
     @classmethod
     def _t_overview(cls, args):
         now = timezone.now()
-        today_local = timezone.localdate()  # wall-clock day (Asia/Tashkent, UTC+5)
-        today = Order.objects.filter(is_deleted=False, created_at__date=today_local)
+        today_local = timezone.localdate()  # calendar date — used for stock expiry below
+        # Sales "today" = the current BUSINESS day (03:00 cutover) so it matches the
+        # admin dashboard, not a plain calendar day. Revenue = paid, non-cancelled.
+        _lo, _hi = _bd_today_window()
+        today = Order.objects.filter(is_deleted=False, created_at__gte=_lo, created_at__lt=_hi)
         t_agg = today.aggregate(
             cnt=Count("id"),
-            revenue=Sum("total_amount", filter=Q(is_paid=True)),
+            revenue=Sum("total_amount", filter=_REV),
             paid=Count("id", filter=Q(is_paid=True)),
             unpaid=Count("id", filter=Q(is_paid=False)),
         )
@@ -673,7 +727,7 @@ class AIToolbox:
                        .select_related("user").order_by("-start_time"))
         open_list = []
         for s in open_shifts[:50]:
-            a = _shift_orders_qs(s).aggregate(c=Count("id"), r=Sum("total_amount", filter=Q(is_paid=True)))
+            a = _shift_orders_qs(s).aggregate(c=Count("id"), r=Sum("total_amount", filter=_REV))
             open_list.append({
                 "cashier": _name(s.user), "cashier_id": s.user_id,
                 "since": _iso(s.start_time), "shift_id": s.id,
@@ -728,14 +782,16 @@ class AIToolbox:
         qs = (Order.objects.filter(is_deleted=False)
               .select_related("cashier", "customer", "table", "place")
               .prefetch_related("items__product"))
+        # Business-day window (03:00 cutover) so "orders on date X" matches the
+        # dashboard's day for X (a 01:00 sale belongs to the previous business day).
         d = _parse_date(args.get("date"))
-        if d:
-            qs = qs.filter(created_at__date=d)
         df, dt = _parse_date(args.get("date_from")), _parse_date(args.get("date_to"))
+        if d:
+            df = dt = d
         if df:
-            qs = qs.filter(created_at__date__gte=df)
+            qs = qs.filter(created_at__gte=_bd_range_window(df, df)[0])
         if dt:
-            qs = qs.filter(created_at__date__lte=dt)
+            qs = qs.filter(created_at__lt=_bd_range_window(dt, dt)[1])
         if args.get("status"):
             qs = qs.filter(status=str(args["status"]).upper())
         if args.get("order_type"):
@@ -798,14 +854,15 @@ class AIToolbox:
             qs = qs.filter(status=str(args["status"]).upper())
         if args.get("cashier_id"):
             qs = qs.filter(user_id=args["cashier_id"])
+        # Business-day window on shift start (03:00 cutover) to match reporting.
         d = _parse_date(args.get("date"))
-        if d:
-            qs = qs.filter(start_time__date=d)
         df, dt = _parse_date(args.get("date_from")), _parse_date(args.get("date_to"))
+        if d:
+            df = dt = d
         if df:
-            qs = qs.filter(start_time__date__gte=df)
+            qs = qs.filter(start_time__gte=_bd_range_window(df, df)[0])
         if dt:
-            qs = qs.filter(start_time__date__lte=dt)
+            qs = qs.filter(start_time__lt=_bd_range_window(dt, dt)[1])
         total = qs.count()
         limit = _clamp(args.get("limit"), 50, 1, MAX_ORDERS)
         offset = _clamp(args.get("offset"), 0, 0, _OFFSET_MAX)
@@ -844,13 +901,13 @@ class AIToolbox:
         if u is None:
             return {"error": "cashier not found", "args": args}
         data = _cashier_dict(u)
-        cutoff = timezone.now().date() - timedelta(days=30)
+        _lo, _hi = _bd_range_window(_bd_today() - timedelta(days=29), _bd_today())
         perf = Order.objects.filter(
-            is_deleted=False, cashier=u, created_at__date__gte=cutoff
+            is_deleted=False, cashier=u, created_at__gte=_lo, created_at__lt=_hi,
         ).aggregate(
             orders=Count("id"),
-            revenue=Sum("total_amount", filter=Q(is_paid=True)),
-            avg=Avg("total_amount"),
+            revenue=Sum("total_amount", filter=_REV),
+            avg=Avg("total_amount", filter=_REV),
             completed=Count("id", filter=Q(status="COMPLETED")),
             canceled=Count("id", filter=Q(status="CANCELED")),
         )
@@ -926,17 +983,20 @@ class AIToolbox:
         elif dt and not df:
             df = dt
 
-        orders = Order.objects.filter(is_deleted=False, created_at__date__gte=df, created_at__date__lte=dt)
+        # Business-day window (03:00 cutover) so the AI's sales report matches the
+        # admin dashboard for the same dates. Volume on created_at; revenue via _REV.
+        _lo, _hi = _bd_range_window(df, dt)
+        orders = Order.objects.filter(is_deleted=False, created_at__gte=_lo, created_at__lt=_hi)
         items = OrderItem.objects.filter(
-            is_deleted=False, order__is_deleted=False,
-            order__created_at__date__gte=df, order__created_at__date__lte=dt,
-        )
+            is_deleted=False, order__is_deleted=False, order__is_paid=True,
+            order__created_at__gte=_lo, order__created_at__lt=_hi,
+        ).exclude(order__status='CANCELED')
 
         totals = orders.aggregate(
             orders=Count("id"),
-            revenue=Sum("total_amount", filter=Q(is_paid=True)),
+            revenue=Sum("total_amount", filter=_REV),
             gross=Sum("total_amount"),
-            avg=Avg("total_amount"),
+            avg=Avg("total_amount", filter=_REV),
             paid=Count("id", filter=Q(is_paid=True)),
             unpaid=Count("id", filter=Q(is_paid=False)),
             discount=Sum("discount_amount"),
@@ -945,13 +1005,13 @@ class AIToolbox:
             "date": r["day"].isoformat() if r["day"] else None,
             "orders": r["c"], "revenue_uzs": _f(r["rev"]),
         } for r in orders.annotate(day=TruncDate("created_at")).values("day").annotate(
-            c=Count("id"), rev=Sum("total_amount", filter=Q(is_paid=True))).order_by("day")]
+            c=Count("id"), rev=Sum("total_amount", filter=_REV)).order_by("day")]
         by_cashier = [{
             "cashier": f"{r['cashier__first_name']} {r['cashier__last_name']}".strip(),
             "cashier_id": r["cashier__id"], "orders": r["c"], "revenue_uzs": _f(r["rev"]),
         } for r in orders.filter(cashier__isnull=False).values(
             "cashier__id", "cashier__first_name", "cashier__last_name").annotate(
-            c=Count("id"), rev=Sum("total_amount", filter=Q(is_paid=True))).order_by("-rev")]
+            c=Count("id"), rev=Sum("total_amount", filter=_REV)).order_by("-rev")]
         by_category = [{
             "category": r["product__category__name"], "qty": r["q"], "revenue_uzs": _f(r["rev"]),
         } for r in items.values("product__category__name").annotate(
@@ -962,7 +1022,7 @@ class AIToolbox:
             q=Sum("quantity"), rev=Sum(F("quantity") * F("price"))).order_by("-rev")[:25]]
         by_method = {r["payment_method"] or "UNSET": {"orders": r["c"], "revenue_uzs": _f(r["rev"])}
                      for r in orders.values("payment_method").annotate(
-                         c=Count("id"), rev=Sum("total_amount", filter=Q(is_paid=True)))}
+                         c=Count("id"), rev=Sum("total_amount", filter=_REV))}
         by_type = {r["order_type"]: r["c"] for r in orders.values("order_type").annotate(c=Count("id"))}
 
         result = {
@@ -990,7 +1050,7 @@ class AIToolbox:
                 "hour": r["h"].strftime("%H:%M") if r["h"] else None,
                 "orders": r["c"], "revenue_uzs": _f(r["rev"]),
             } for r in orders.annotate(h=TruncHour("created_at")).values("h").annotate(
-                c=Count("id"), rev=Sum("total_amount", filter=Q(is_paid=True))).order_by("h")]
+                c=Count("id"), rev=Sum("total_amount", filter=_REV)).order_by("h")]
         return result
 
     @classmethod
