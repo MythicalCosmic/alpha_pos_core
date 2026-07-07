@@ -227,22 +227,30 @@ class AIStockAssistant:
     def _get_sales_data(cls) -> Dict:
         """Gather all sales, users, cashier, and business data from the main app."""
         now = timezone.now()
-        today = now.date()
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        seven_days_ago = today - timedelta(days=7)
-        thirty_days_ago = today - timedelta(days=30)
+        # Business-day windows (03:00 cutover) so the AI's today/week/month match
+        # the admin dashboard instead of a plain calendar day. Revenue is attributed
+        # by created_at (order placement), paid and non-cancelled — the reporting
+        # canonical shared with dashboard_service and the SYSTEM_PROMPT definition.
+        from base.services.business_day import business_date, range_window, today_window
+        bd = business_date()
+        today_lo, today_hi = today_window()
+        week_lo, week_hi = range_window(bd - timedelta(days=6), bd)
+        month_lo, month_hi = range_window(bd - timedelta(days=29), bd)
+        # Revenue = paid, not cancelled. Applied to every total_amount Sum/Avg below
+        # so unpaid carts and cancelled tickets never inflate the numbers the AI cites.
+        _REV = Q(is_paid=True) & ~Q(status='CANCELED')
 
         # ── Orders summary ──
         all_orders = Order.objects.filter(is_deleted=False)
-        today_orders = all_orders.filter(created_at__gte=today_start)
-        week_orders = all_orders.filter(created_at__date__gte=seven_days_ago)
-        month_orders = all_orders.filter(created_at__date__gte=thirty_days_ago)
+        today_orders = all_orders.filter(created_at__gte=today_lo, created_at__lt=today_hi)
+        week_orders = all_orders.filter(created_at__gte=week_lo, created_at__lt=week_hi)
+        month_orders = all_orders.filter(created_at__gte=month_lo, created_at__lt=month_hi)
 
         def order_stats(qs):
             agg = qs.aggregate(
                 count=Count('id'),
-                total_revenue=Sum('total_amount'),
-                avg_order=Avg('total_amount'),
+                total_revenue=Sum('total_amount', filter=_REV),
+                avg_order=Avg('total_amount', filter=_REV),
                 paid_count=Count('id', filter=Q(is_paid=True)),
                 unpaid_count=Count('id', filter=Q(is_paid=False)),
             )
@@ -261,9 +269,9 @@ class AIStockAssistant:
         # ── Top products (30 days) ──
         top_products = list(
             OrderItem.objects.filter(
-                order__is_deleted=False,
-                order__created_at__date__gte=thirty_days_ago
-            ).values('product__name', 'product__price').annotate(
+                order__is_deleted=False, order__is_paid=True,
+                order__created_at__gte=month_lo, order__created_at__lt=month_hi,
+            ).exclude(order__status='CANCELED').values('product__name', 'product__price').annotate(
                 qty_sold=Sum('quantity'),
                 revenue=Sum(F('quantity') * F('price'))
             ).order_by('-revenue')[:15]
@@ -278,9 +286,9 @@ class AIStockAssistant:
         # ── Top products TODAY ──
         top_products_today = list(
             OrderItem.objects.filter(
-                order__is_deleted=False,
-                order__created_at__gte=today_start
-            ).values('product__name').annotate(
+                order__is_deleted=False, order__is_paid=True,
+                order__created_at__gte=today_lo, order__created_at__lt=today_hi,
+            ).exclude(order__status='CANCELED').values('product__name').annotate(
                 qty_sold=Sum('quantity'),
                 revenue=Sum(F('quantity') * F('price'))
             ).order_by('-revenue')[:10]
@@ -294,9 +302,9 @@ class AIStockAssistant:
         # ── Category revenue (30 days) ──
         category_revenue = list(
             OrderItem.objects.filter(
-                order__is_deleted=False,
-                order__created_at__date__gte=thirty_days_ago
-            ).values('product__category__name').annotate(
+                order__is_deleted=False, order__is_paid=True,
+                order__created_at__gte=month_lo, order__created_at__lt=month_hi,
+            ).exclude(order__status='CANCELED').values('product__category__name').annotate(
                 revenue=Sum(F('quantity') * F('price')),
                 qty_sold=Sum('quantity')
             ).order_by('-revenue')[:10]
@@ -311,13 +319,13 @@ class AIStockAssistant:
         cashier_stats = list(
             all_orders.filter(
                 cashier__isnull=False,
-                created_at__date__gte=thirty_days_ago
+                created_at__gte=month_lo, created_at__lt=month_hi,
             ).values(
                 'cashier__id', 'cashier__first_name', 'cashier__last_name'
             ).annotate(
                 orders_count=Count('id'),
-                total_revenue=Sum('total_amount'),
-                avg_order=Avg('total_amount'),
+                total_revenue=Sum('total_amount', filter=_REV),
+                avg_order=Avg('total_amount', filter=_REV),
                 completed=Count('id', filter=Q(status='COMPLETED')),
                 canceled=Count('id', filter=Q(status='CANCELED')),
             ).order_by('-total_revenue')
@@ -337,7 +345,7 @@ class AIStockAssistant:
                 hour=TruncHour('created_at')
             ).values('hour').annotate(
                 count=Count('id'),
-                revenue=Sum('total_amount')
+                revenue=Sum('total_amount', filter=_REV)
             ).order_by('hour')
         )
         hourly_data = [{
@@ -352,7 +360,7 @@ class AIStockAssistant:
                 day=TruncDate('created_at')
             ).values('day').annotate(
                 count=Count('id'),
-                revenue=Sum('total_amount')
+                revenue=Sum('total_amount', filter=_REV)
             ).order_by('day')
         )
         daily_data = [{

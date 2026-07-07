@@ -54,7 +54,12 @@ class OrderItemRepository(BaseSyncRepository):
 
     @classmethod
     def get_top_products(cls, date_from=None, date_to=None, limit=20):
-        qs = cls.model.objects.filter(is_deleted=False, order__is_deleted=False)
+        # Revenue/sales basis: only PAID, non-cancelled orders — otherwise open
+        # carts and cancelled tickets inflate product/category revenue and the
+        # popularity ranking (these feed the admin top-products/category stats).
+        qs = cls.model.objects.filter(
+            is_deleted=False, order__is_deleted=False, order__is_paid=True,
+        ).exclude(order__status='CANCELED')
         if date_from:
             qs = qs.filter(order__created_at__gte=date_from)
         if date_to:
@@ -98,7 +103,12 @@ class OrderItemRepository(BaseSyncRepository):
 
     @classmethod
     def get_least_sold_products(cls, date_from=None, date_to=None, limit=20):
-        qs = cls.model.objects.filter(is_deleted=False, order__is_deleted=False)
+        # Revenue/sales basis: only PAID, non-cancelled orders — otherwise open
+        # carts and cancelled tickets inflate product/category revenue and the
+        # popularity ranking (these feed the admin top-products/category stats).
+        qs = cls.model.objects.filter(
+            is_deleted=False, order__is_deleted=False, order__is_paid=True,
+        ).exclude(order__status='CANCELED')
         if date_from:
             qs = qs.filter(order__created_at__gte=date_from)
         if date_to:
@@ -117,7 +127,12 @@ class OrderItemRepository(BaseSyncRepository):
 
     @classmethod
     def get_product_category_stats(cls, date_from=None, date_to=None):
-        qs = cls.model.objects.filter(is_deleted=False, order__is_deleted=False)
+        # Revenue/sales basis: only PAID, non-cancelled orders — otherwise open
+        # carts and cancelled tickets inflate product/category revenue and the
+        # popularity ranking (these feed the admin top-products/category stats).
+        qs = cls.model.objects.filter(
+            is_deleted=False, order__is_deleted=False, order__is_paid=True,
+        ).exclude(order__status='CANCELED')
         if date_from:
             qs = qs.filter(order__created_at__gte=date_from)
         if date_to:
