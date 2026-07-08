@@ -399,7 +399,7 @@ class AIToolbox:
                     "date_to": {"type": "string", "description": "Range end YYYY-MM-DD (inclusive)"},
                     "status": {"type": "string", "enum": ["OPEN", "PREPARING", "READY", "COMPLETED", "CANCELED"]},
                     "order_type": {"type": "string", "enum": ["HALL", "DELIVERY", "PICKUP"]},
-                    "payment_method": {"type": "string", "enum": ["CASH", "UZCARD", "HUMO", "PAYME", "MIXED"]},
+                    "payment_method": {"type": "string", "enum": ["CASH", "UZCARD", "HUMO", "CARD", "PAYME", "MIXED"], "description": "STORED roll-up value. Reporting folds UZCARD/HUMO/CARD into one `card` tender; MIXED means the sale was split (its real tenders live in the order's payment lines)."},
                     "is_paid": {"type": "boolean"},
                     "cashier_id": {"type": "integer", "description": "Filter by cashier user id"},
                     "customer_phone": {"type": "string", "description": "Match order or customer phone (partial ok)"},

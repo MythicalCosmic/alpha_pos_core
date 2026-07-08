@@ -84,7 +84,7 @@ BAR (single series):
 ```
 DONUT (share of total):
 ```chart
-{"type":"donut","title":"Payment mix · today","data":[{"label":"CASH","value":8500000},{"label":"UZCARD","value":6200000}]}
+{"type":"donut","title":"Payment mix · today","data":[{"label":"cash","value":8500000},{"label":"card","value":6200000}]}
 ```
 HBAR (ranked horizontal bars, good for top-N):
 ```chart

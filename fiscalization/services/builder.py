@@ -64,14 +64,36 @@ def build_receipt_payload(order, tenant, receipt_type='SALE'):
             'vat': _vat_portion(line_total, vat_percent),
         })
 
-    is_cash = (order.payment_method or 'CASH') == 'CASH'
+    # Tender split. The FISCAL partition is CASH vs ALL-NON-CASH — it is NOT the
+    # reporting partition {cash, card, payme}: Payme is electronic money and must be
+    # declared under received_card, never as physical cash.
+    #
+    # Previously this read `is_cash = payment_method == 'CASH'`, so a MIXED cash+card
+    # sale declared 100% CARD to the OFD. And received_cash must never come from the
+    # raw CASH OrderPayment line — that is the TENDERED amount (it includes the
+    # customer's change), so received_cash + received_card would exceed `total` and
+    # the OFD rejects the receipt. Derive card, then subtract IN TIYIN so the two
+    # fields reconcile exactly to `total` under ROUND_HALF_UP.
+    from base.services.tender import order_tender_split
+    split, _ = order_tender_split(order)
+    if split['unknown']:
+        # e.g. a MIXED order with no payment lines. Guessing would misdeclare to the
+        # tax authority in one direction or the other; let the retry queue hold it.
+        raise ValueError(
+            f'cannot fiscalize order {order.id}: {split["unknown"]} of revenue has no '
+            f'determinable tender (payment_method={order.payment_method!r}, no payment lines)'
+        )
+    received_card = _to_tiyin(split['card'] + split['payme'])
+    received_card = max(0, min(received_card, total))
+    received_cash = total - received_card
+
     return {
         'tin': tenant.get('tin', ''),
         'receipt_type': receipt_type,
         'order_id': order.id,
         'order_number': order.display_id,
-        'received_cash': total if is_cash else 0,
-        'received_card': 0 if is_cash else total,
+        'received_cash': received_cash,
+        'received_card': received_card,
         'total': total,
         'items': items,
     }

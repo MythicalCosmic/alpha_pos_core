@@ -22,7 +22,12 @@ from base.models import SyncMixin, SyncManager
 # a mixed-tender order is split into its component OrderPayment rows, each of
 # which lands under its own method below. Kept loose (CharField, no DB choices)
 # because PaymentMethodConfig is operator-editable.
-PAYMENT_METHODS = ('CASH', 'UZCARD', 'HUMO', 'PAYME')
+#
+# 'CARD' MUST stay in step with Order.PaymentMethod: drawer.expected_payment_totals
+# seeds its dict from this tuple and `totals.get(method, 0)` would otherwise mint a
+# bucket for an unlisted method, which then becomes a real ShiftPaymentTotal row
+# (unique(shift, method)) that nothing else knows about.
+PAYMENT_METHODS = ('CASH', 'UZCARD', 'HUMO', 'CARD', 'PAYME')
 
 
 class ShiftPaymentTotal(SyncMixin, models.Model):

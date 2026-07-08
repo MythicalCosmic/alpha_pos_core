@@ -245,27 +245,28 @@ class ShiftService:
         # reconciliation step (expected_cash vs actual_cash) doesn't report every
         # card-paying cashier as short on cash. Legacy paid orders pre-payment_method
         # use NULL: treat them as CASH so historical shifts don't suddenly read zero.
-        money = Order.objects.filter(
+        paid_orders = Order.objects.filter(
             is_deleted=False,
             cashier_id=shift.user_id,
             is_paid=True,
             paid_at__gte=shift.start_time,
             paid_at__lte=now,
-        ).exclude(status='CANCELED').aggregate(
-            total_revenue=Coalesce(
-                Sum('total_amount'),
-                Decimal('0.00'),
-                output_field=DecimalField(),
-            ),
-            cash_collected=Coalesce(
-                Sum(
-                    'total_amount',
-                    filter=Q(payment_method='CASH') | Q(payment_method__isnull=True),
-                ),
-                Decimal('0.00'),
-                output_field=DecimalField(),
-            ),
-        )
+        ).exclude(status='CANCELED')
+        # cash_collected is DERIVED from the tender split, not from
+        # Sum(total_amount, filter=payment_method='CASH'): that booked a MIXED
+        # order's cash leg as ZERO (the whole sale vanished from cash), and it
+        # ignored the customer's change on split payments. base.services.tender is
+        # the single implementation shared with the drawer and the dashboards.
+        from base.services.tender import breakdown_for_orders
+        _split, _ = breakdown_for_orders(paid_orders)
+        money = {
+            'total_revenue': paid_orders.aggregate(
+                s=Coalesce(Sum('total_amount'), Decimal('0.00'),
+                           output_field=DecimalField()))['s'],
+            # Gross cash taken this shift (before cashbox pay-outs; the drawer's
+            # expected figure nets those separately).
+            'cash_collected': _split['cash'],
+        }
 
         shift = ShiftRepository.update(
             shift,
@@ -525,19 +526,13 @@ class ShiftService:
             ).exclude(status='CANCELED')
 
             paid = sold.filter(is_paid=True)
-            mix = paid.aggregate(
-                CASH=Coalesce(Sum('total_amount', filter=Q(payment_method='CASH') | Q(payment_method__isnull=True)),
-                              Decimal('0.00'), output_field=DecimalField()),
-                UZCARD=Coalesce(Sum('total_amount', filter=Q(payment_method='UZCARD')),
-                                Decimal('0.00'), output_field=DecimalField()),
-                HUMO=Coalesce(Sum('total_amount', filter=Q(payment_method='HUMO')),
-                              Decimal('0.00'), output_field=DecimalField()),
-                PAYME=Coalesce(Sum('total_amount', filter=Q(payment_method='PAYME')),
-                               Decimal('0.00'), output_field=DecimalField()),
-                MIXED=Coalesce(Sum('total_amount', filter=Q(payment_method='MIXED')),
-                               Decimal('0.00'), output_field=DecimalField()),
-            )
-            payment_mix = {k: str(v) for k, v in mix.items()}
+            # Canonical tenders. MIXED is never a bucket: a split sale is attributed
+            # to its real tenders (cash is the bill portion, not the tendered cash).
+            from base.services.tender import breakdown_for_orders
+            _split, _detail = breakdown_for_orders(paid)
+            payment_mix = {k: str(_split[k]) for k in ('cash', 'card', 'payme')}
+            if _split['unknown']:
+                payment_mix['unknown'] = str(_split['unknown'])
 
             prep = sold.filter(ready_at__isnull=False).aggregate(
                 avg=Avg(ExpressionWrapper(_F('ready_at') - _F('created_at'),
@@ -652,19 +647,34 @@ class ShiftService:
 
             # Payment mix + counts: paid, non-cancelled, bucketed by paid_at so the
             # mix reconciles to total_revenue (which is itself paid_at-based).
-            mix_acc = defaultdict(lambda: defaultdict(lambda: [Decimal('0.00'), 0]))
-            money_rows = Order.objects.filter(
+            # Canonical tender split per shift. ONE extra query for the payment
+            # lines (never per-shift): a MIXED order contributes to BOTH cash and
+            # card, so it can no longer vanish into a `MIXED` bucket.
+            from base.models import OrderPayment
+            from base.services.tender import split_from_rows
+            mix_acc = defaultdict(
+                lambda: {'cash': zero, 'card': zero, 'payme': zero, 'unknown': zero})
+            paid_cnt = defaultdict(int)
+            money_rows = list(Order.objects.filter(
                 is_deleted=False, cashier_id__in=cashier_ids, is_paid=True,
                 paid_at__gte=min_start, paid_at__lte=max_end,
             ).exclude(status='CANCELED').values_list(
-                'cashier_id', 'paid_at', 'total_amount', 'payment_method')
-            for cid, paid_at, amt, method in money_rows:
+                'id', 'cashier_id', 'paid_at', 'total_amount', 'payment_method'))
+            _ops = defaultdict(list)
+            if money_rows:
+                for _oid, _m, _a in OrderPayment.objects.filter(
+                        is_deleted=False, order_id__in=[r[0] for r in money_rows],
+                ).values_list('order_id', 'method', 'amount'):
+                    _ops[_oid].append((_m, _a))
+            for oid, cid, paid_at, amt, method in money_rows:
                 sid = bucket(cid, paid_at)
                 if sid is None:
                     continue
-                slot = mix_acc[sid][method or 'CASH']   # NULL/legacy method -> CASH
-                slot[0] += (amt or zero)
-                slot[1] += 1
+                _s, _ = split_from_rows(amt, method, _ops.get(oid, ()), order_id=oid)
+                acc = mix_acc[sid]
+                for _k in ('cash', 'card', 'payme', 'unknown'):
+                    acc[_k] += _s[_k]
+                paid_cnt[sid] += 1
 
             # Cancelled orders (count + lost value) by created_at.
             canc_cnt = defaultdict(int)
@@ -723,8 +733,10 @@ class ShiftService:
                 return str((d or zero).quantize(zero))   # always 2dp, e.g. "100.00"
 
             for sid in out:
-                pm = {m: {'amount': money(v[0]), 'count': v[1]}
-                      for m, v in mix_acc.get(sid, {}).items()}
+                # {tender: amount}. An order can contribute to two tenders, so a
+                # per-tender `count` is meaningless -> `paid_orders` is emitted instead.
+                _mx = mix_acc.get(sid) or {}
+                pm = {k: money(v) for k, v in _mx.items() if k != 'unknown' or v}
                 hc = hour_cnt.get(sid)
                 if hc:
                     # busiest hour; tie -> earliest hour (matches order_by('-c','hour')).
@@ -738,6 +750,7 @@ class ShiftService:
                     'cancelled_orders_count': int(canc_cnt.get(sid, 0)),
                     'cancelled_orders_value': money(canc_val.get(sid)),
                     'payment_mix': pm,
+                    'paid_orders': int(paid_cnt.get(sid, 0)),
                     'items_sold': int(units.get(sid, 0)),
                     'avg_prep_seconds': int(round(prep_sum.get(sid, 0.0) / n)) if n else None,
                     'peak_hour': peak_hour,
@@ -858,12 +871,13 @@ class ShiftService:
         rec = reconciliation  # serialized dict above, or None until reconciled
         # avg ticket over PAID orders (payment_mix counts), not total_orders —
         # total_orders includes cancelled, which would understate the ticket.
-        _paid_n = sum(int((v or {}).get('count', 0))
-                      for v in (_ex.get('payment_mix') or {}).values())
+        _paid_n = int(_ex.get('paid_orders') or 0)
         result.update({
             'gross_revenue': _q2(_tr),
             'net_revenue': result.get('net_revenue') or _q2(_tr - _exp - _canc),
-            'card_collected': _q2(_tr - _cash),
+            # card = Uzcard+Humo+Card (Payme is its own tender, no longer folded in)
+            'card_collected': _q2(_dec((_ex.get('payment_mix') or {}).get('card'))),
+            'payme_collected': _q2(_dec((_ex.get('payment_mix') or {}).get('payme'))),
             'expenses_total': result.get('expenses_total', _q2(_exp)),
             'cancelled_count': int(_ex.get('cancelled_orders_count') or 0),
             'cancelled_amount': _q2(_canc),

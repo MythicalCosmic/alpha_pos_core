@@ -1039,9 +1039,15 @@ class Order(SyncMixin, models.Model):
         CASH = "CASH", "Cash"
         UZCARD = "UZCARD", "Uzcard"
         HUMO = "HUMO", "Humo"
+        # Acquirer-agnostic card. smartfood already writes this literal, and a till
+        # may emit it instead of picking Uzcard/Humo. Reporting folds UZCARD/HUMO/CARD
+        # into one `card` tender (see base.services.tender); the stored value keeps
+        # whatever acquirer detail the operator captured.
+        CARD = "CARD", "Card"
         PAYME = "PAYME", "Payme"
         # Set on the Order when a single sale is split across >1 distinct method.
-        # The per-line breakdown lives in OrderPayment rows.
+        # The per-line breakdown lives in OrderPayment rows. NEVER a reporting bucket
+        # and never a valid INPUT method — see base.services.tender.
         MIXED = "MIXED", "Mixed"
 
     is_paid = models.BooleanField(default=False, db_index=True)
