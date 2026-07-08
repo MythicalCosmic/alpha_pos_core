@@ -164,10 +164,11 @@ class OrderRepository(BaseSyncRepository):
 
     @classmethod
     def build_filtered_queryset(cls, statuses=None, payment_status=None,
-                                 category_ids=None, user_id=None, cashier_id=None,
-                                 order_type=None, date_from=None, date_to=None,
-                                 order_by='-created_at', include_deleted=False,
-                                 customer_id=None):
+                                 category_ids=None, product_ids=None, user_id=None,
+                                 cashier_id=None, order_type=None, date_from=None,
+                                 date_to=None, order_by='-created_at',
+                                 include_deleted=False, customer_id=None,
+                                 tod_from=None, tod_to=None):
         qs = cls.get_with_relations(include_deleted=include_deleted)
 
         # Scope to one client (base.Customer) — powers the returning-client history
@@ -196,6 +197,10 @@ class OrderRepository(BaseSyncRepository):
         if category_ids:
             qs = qs.filter(items__product__category_id__in=category_ids).distinct()
 
+        if product_ids:
+            # Orders that CONTAIN any of these products (mirrors category_ids).
+            qs = qs.filter(items__product_id__in=product_ids).distinct()
+
         if user_id:
             qs = qs.filter(user_id=user_id)
 
@@ -211,10 +216,16 @@ class OrderRepository(BaseSyncRepository):
         if date_to:
             qs = qs.filter(created_at__lte=date_to)
 
+        # Time-of-day filter: keep only rows whose LOCAL wall-clock time is within
+        # [tod_from, tod_to], applied per day (working-hours window). No-op if both None.
+        from base.services.business_day import tod_filter
+        qs = tod_filter(qs, tod_from, tod_to, field='created_at')
+
         return qs.order_by(order_by)
 
     @classmethod
-    def get_stats_aggregate(cls, date_from=None, date_to=None, cashier_id=None):
+    def get_stats_aggregate(cls, date_from=None, date_to=None, cashier_id=None,
+                            product_ids=None, tod_from=None, tod_to=None):
         qs = cls.model.objects.filter(is_deleted=False)
         if date_from:
             qs = qs.filter(created_at__gte=date_from)
@@ -222,6 +233,15 @@ class OrderRepository(BaseSyncRepository):
             qs = qs.filter(created_at__lte=date_to)
         if cashier_id:
             qs = qs.filter(cashier_id=cashier_id)
+        if product_ids:
+            # Orders CONTAINING any of these products — via a SUBQUERY, not a join,
+            # so the Count/Sum aggregates below don't fan out (an order with two
+            # matching products would otherwise be counted twice).
+            from base.models import OrderItem
+            qs = qs.filter(id__in=OrderItem.objects.filter(
+                is_deleted=False, product_id__in=product_ids).values('order_id'))
+        from base.services.business_day import tod_filter
+        qs = tod_filter(qs, tod_from, tod_to, field='created_at')
 
         return qs.aggregate(
             total=Count('id'),
@@ -245,7 +265,9 @@ class OrderRepository(BaseSyncRepository):
         )
 
     @classmethod
-    def get_daily_stats(cls, date_from=None, date_to=None, cashier_id=None):
+    def get_daily_stats(cls, date_from=None, date_to=None, cashier_id=None,
+                        tod_from=None, tod_to=None):
+        from base.services.business_day import business_day_date_expr, tod_filter
         qs = cls.model.objects.filter(is_deleted=False)
         if date_from:
             qs = qs.filter(created_at__gte=date_from)
@@ -253,8 +275,11 @@ class OrderRepository(BaseSyncRepository):
             qs = qs.filter(created_at__lte=date_to)
         if cashier_id:
             qs = qs.filter(cashier_id=cashier_id)
+        qs = tod_filter(qs, tod_from, tod_to, field='created_at')
 
-        return list(qs.annotate(date=TruncDate('created_at')).values('date').annotate(
+        # Bucket by BUSINESS date (03:00 cutover), not calendar midnight, so the
+        # daily series matches the business-day windowing used everywhere else.
+        return list(qs.annotate(date=business_day_date_expr('created_at')).values('date').annotate(
             orders=Count('id'),
             revenue=Coalesce(Sum('total_amount', filter=Q(is_paid=True) & ~Q(status='CANCELED')), Decimal('0.00'), output_field=DecimalField()),
             paid=Count('id', filter=Q(is_paid=True)),
@@ -361,15 +386,21 @@ class OrderRepository(BaseSyncRepository):
         return avg.total_seconds()
 
     @classmethod
-    def get_hourly_distribution(cls, date_from=None, date_to=None):
+    def get_hourly_distribution(cls, date_from=None, date_to=None,
+                                tod_from=None, tod_to=None):
         from django.db.models.functions import ExtractHour
+        from django.utils import timezone as _tz
+        from base.services.business_day import tod_filter
         qs = cls.model.objects.filter(is_deleted=False)
         if date_from:
             qs = qs.filter(created_at__gte=date_from)
         if date_to:
             qs = qs.filter(created_at__lte=date_to)
+        qs = tod_filter(qs, tod_from, tod_to, field='created_at')
 
-        return list(qs.annotate(hour=ExtractHour('created_at')).values('hour').annotate(
+        # Local hour (Asia/Tashkent) — ExtractHour without tzinfo bucketed on UTC,
+        # off by the tz offset from the business-day windowing.
+        return list(qs.annotate(hour=ExtractHour('created_at', tzinfo=_tz.get_current_timezone())).values('hour').annotate(
             count=Count('id'),
             revenue=Coalesce(Sum('total_amount', filter=Q(is_paid=True) & ~Q(status='CANCELED')), Decimal('0.00'), output_field=DecimalField()),
         ).order_by('hour'))

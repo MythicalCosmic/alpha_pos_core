@@ -69,3 +69,62 @@ def today_window(start=None):
     now = timezone.now()
     lo, _ = day_window(business_date(now, start), start)
     return lo, now
+
+
+def parse_hhmm(value):
+    """"HH:MM" / "HH:MM:SS" (or a datetime.time) -> datetime.time, else None."""
+    from datetime import datetime as _dt
+    if isinstance(value, time):
+        return value
+    if not isinstance(value, str):
+        return None
+    for fmt in ('%H:%M', '%H:%M:%S'):
+        try:
+            return _dt.strptime(value.strip(), fmt).time()
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def business_day_date_expr(field='created_at', start=None, tz=None):
+    """A DB expression that truncates <field> to its BUSINESS date (03:00 cutover)
+    for day bucketing (GROUP BY). A 01:00 sale buckets under the previous date —
+    matching the business-day windowing used everywhere, instead of TruncDate at
+    calendar midnight. Asia/Tashkent has no DST so the fixed-offset shift is exact."""
+    from datetime import timedelta
+    from django.db.models import DateTimeField, ExpressionWrapper, F
+    from django.db.models.functions import TruncDate
+    start = start or business_day_start()
+    tz = tz or timezone.get_current_timezone()
+    offset = timedelta(hours=start.hour, minutes=start.minute, seconds=start.second)
+    shifted = ExpressionWrapper(F(field) - offset, output_field=DateTimeField())
+    return TruncDate(shifted, tzinfo=tz)
+
+
+def business_day_hour_order(start=None):
+    """The 24 local hours ordered starting at the business-day cutover, e.g.
+    [3,4,...,23,0,1,2] for a 03:00 start — for labelling an hourly series."""
+    start = start or business_day_start()
+    h0 = start.hour
+    return [(h0 + i) % 24 for i in range(24)]
+
+
+def tod_filter(qs, tod_from, tod_to, field='created_at', tz=None):
+    """Restrict a queryset to rows whose LOCAL (tz) time-of-day is within
+    [tod_from, tod_to] (datetime.time), applied PER DAY — a working-hours window
+    repeated every day, NOT one continuous span. Both None -> unchanged.
+
+    Uses TruncTime with an explicit tzinfo so the comparison is against the local
+    wall-clock time (Asia/Tashkent), and .alias() (not .annotate()) so the helper
+    never leaks a column into a later .values().annotate() GROUP BY. `field` may
+    traverse a relation (e.g. 'order__created_at' for an OrderItem queryset)."""
+    if tod_from is None and tod_to is None:
+        return qs
+    from django.db.models.functions import TruncTime
+    tz = tz or timezone.get_current_timezone()
+    qs = qs.alias(_tod=TruncTime(field, tzinfo=tz))
+    if tod_from is not None:
+        qs = qs.filter(_tod__gte=tod_from)
+    if tod_to is not None:
+        qs = qs.filter(_tod__lte=tod_to)
+    return qs

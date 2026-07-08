@@ -1527,6 +1527,16 @@ def _default_business_day_start():
     return time(3, 0)
 
 
+def _default_business_open():
+    from datetime import time
+    return time(9, 0)
+
+
+def _default_business_close():
+    from datetime import time
+    return time(23, 0)
+
+
 class AppSettings(models.Model):
     hr_enabled = models.BooleanField(default=False)
     waiter_enabled = models.BooleanField(default=False)
@@ -1534,6 +1544,11 @@ class AppSettings(models.Model):
     # business_day_start) as ONE business day, so a 01:00 sale counts toward the
     # night before. Per-restaurant; default 03:00. See base.services.business_day.
     business_day_start = models.TimeField(default=_default_business_day_start)
+    # Working hours the venue actually trades — the FE's "Working hours" preset for
+    # the time-of-day (tod_from/tod_to) dashboard filter. Reporting DEFAULT window,
+    # not an enforcement gate. Per-restaurant; defaults 09:00 open / 23:00 close.
+    business_open = models.TimeField(default=_default_business_open)
+    business_close = models.TimeField(default=_default_business_close)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
