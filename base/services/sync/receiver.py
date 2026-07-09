@@ -38,6 +38,37 @@ def _resolve_foreign_keys(data):
     return resolved, missing
 
 
+def _parse_temporal(field_type, value):
+    """Turn an incoming ISO date/datetime string into a real date/datetime.
+
+    Sync payloads carry temporal fields as ISO strings (the encoder uses
+    ``.isoformat()``). Django's stdlib parsers handle that with no third-party
+    dependency. The old path did ``from dateutil import parser`` unconditionally;
+    when dateutil isn't installed (it isn't in the server image) the caller
+    swallowed the ImportError and stored the *raw string*. Postgres accepts a
+    tidy ISO string but rejects the odd ones, so that row failed to write,
+    retried to the dead-letter cap, and went permanently missing on the cloud —
+    the mechanism behind the "missing shift" reports. Parse deterministically
+    here so every well-formed value ingests; only fall through to dateutil (if
+    present) or the raw value for something the stdlib can't read.
+    """
+    from django.utils.dateparse import parse_datetime, parse_date
+    if field_type == 'DateField':
+        parsed = parse_date(value)
+        if parsed is None:
+            dt = parse_datetime(value)
+            parsed = dt.date() if dt is not None else None
+    else:
+        parsed = parse_datetime(value)
+    if parsed is not None:
+        return parsed
+    try:
+        from dateutil import parser as date_parser
+        return date_parser.parse(value)
+    except Exception:
+        return value
+
+
 def _clean_field_value(field, value):
     if value is None:
         return None
@@ -49,8 +80,7 @@ def _clean_field_value(field, value):
 
     if field_type in ('DateTimeField', 'DateField'):
         if isinstance(value, str) and value:
-            from dateutil import parser as date_parser
-            return date_parser.parse(value)
+            return _parse_temporal(field_type, value)
         return value
 
     if field_type == 'BooleanField':
