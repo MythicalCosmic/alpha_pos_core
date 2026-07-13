@@ -3,7 +3,6 @@ from decimal import Decimal
 from django.core.cache import cache
 from django.db.models import Sum, Count, Avg, Q, F, ExpressionWrapper, DurationField
 from django.db.models.functions import ExtractHour
-from django.db import models
 from notifications.helpers import (
     uzb_now, format_datetime, format_money,
     format_duration_minutes, format_prep_time, UZB_TZ,
@@ -175,9 +174,12 @@ class ShiftNotification:
         if cashier_id:
             item_q &= Q(order__cashier_id=cashier_id)
 
-        top = list(OrderItem.objects.filter(item_q).values('product__name').annotate(
+        from base.services.revenue import net_line_revenue
+        top = list(OrderItem.objects.filter(
+            item_q, is_deleted=False, order__is_deleted=False,
+        ).exclude(order__status='CANCELED').values('product__name').annotate(
             qty=Sum('quantity'),
-            rev=Sum(F('price') * F('quantity'), output_field=models.DecimalField()),
+            rev=Sum(net_line_revenue()),
         ).order_by('-qty')[:5])
 
         duration_min = int((end_time - start_time).total_seconds() / 60)

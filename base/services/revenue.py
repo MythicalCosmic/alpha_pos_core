@@ -10,7 +10,10 @@ proportional allocation by each line's gross value::
 Delivery fees and tips are intentionally not product revenue. A zero/legacy
 subtotal falls back to gross line value rather than dividing by zero.
 """
-from django.db.models import Case, DecimalField, ExpressionWrapper, F, When
+from decimal import Decimal
+
+from django.db.models import Case, DecimalField, ExpressionWrapper, F, Value, When
+from django.db.models.functions import Greatest
 
 
 REVENUE_FIELD = DecimalField(max_digits=24, decimal_places=6)
@@ -26,11 +29,14 @@ def gross_line_revenue():
 def net_line_revenue():
     """Discount-adjusted product revenue for an OrderItem queryset."""
     gross = gross_line_revenue()
-    discounted = ExpressionWrapper(
-        gross
-        * (F('order__subtotal') - F('order__discount_amount'))
-        / F('order__subtotal'),
-        output_field=REVENUE_FIELD,
+    discounted = Greatest(
+        ExpressionWrapper(
+            gross
+            * (F('order__subtotal') - F('order__discount_amount'))
+            / F('order__subtotal'),
+            output_field=REVENUE_FIELD,
+        ),
+        Value(Decimal('0'), output_field=REVENUE_FIELD),
     )
     return Case(
         When(order__subtotal__gt=0, then=discounted),

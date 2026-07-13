@@ -34,3 +34,9 @@ def test_order_discount_is_allocated_proportionally_to_product_lines(
     assert rows[first.id]['net'] == Decimal('54')
     assert rows[second.id]['net'] == Decimal('36')
     assert sum(row['net'] for row in rows.values()) == order.total_amount
+
+    from base.repositories.order_item import OrderItemRepository
+    ranked = OrderItemRepository.get_top_products(limit=10)
+    by_product = {row['product_id']: row for row in ranked}
+    assert by_product[first.id]['total_revenue'] == Decimal('54')
+    assert by_product[second.id]['total_revenue'] == Decimal('36')

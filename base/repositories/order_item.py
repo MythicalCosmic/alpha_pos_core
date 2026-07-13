@@ -5,6 +5,7 @@ from django.utils import timezone
 from decimal import Decimal
 from base.repositories.base import BaseSyncRepository
 from base.models import OrderItem
+from base.services.revenue import net_line_revenue
 
 # How far back "top selling / popular" looks when ranking products.
 POPULAR_WINDOW_DAYS = 30
@@ -70,7 +71,7 @@ class OrderItemRepository(BaseSyncRepository):
         ).annotate(
             total_qty=Sum('quantity'),
             total_revenue=Coalesce(
-                Sum(F('price') * F('quantity'), output_field=DecimalField()),
+                Sum(net_line_revenue()),
                 Decimal('0.00')
             ),
             order_count=Count('order_id', distinct=True),
@@ -119,7 +120,7 @@ class OrderItemRepository(BaseSyncRepository):
         ).annotate(
             total_qty=Sum('quantity'),
             total_revenue=Coalesce(
-                Sum(F('price') * F('quantity'), output_field=DecimalField()),
+                Sum(net_line_revenue()),
                 Decimal('0.00')
             ),
             order_count=Count('order_id', distinct=True),
@@ -143,7 +144,7 @@ class OrderItemRepository(BaseSyncRepository):
         ).annotate(
             total_qty=Sum('quantity'),
             total_revenue=Coalesce(
-                Sum(F('price') * F('quantity'), output_field=DecimalField()),
+                Sum(net_line_revenue()),
                 Decimal('0.00')
             ),
             order_count=Count('order_id', distinct=True),
