@@ -396,7 +396,9 @@ class CloudReceiver:
                 # forever. Converge on the incoming uuid.
                 natural = None
                 if hasattr(model_class, '_find_by_natural_key'):
-                    natural = model_class._find_by_natural_key(cleaned, resolved_fks)
+                    natural = model_class._find_by_natural_key(
+                        cleaned, resolved_fks, incoming_branch=incoming_branch,
+                    )
                 if natural is not None:
                     # Re-fetch under a row lock so two concurrent receives that
                     # both reconcile onto the same natural-key row serialize

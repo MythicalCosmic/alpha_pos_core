@@ -476,19 +476,22 @@ class ShiftService:
             is_deleted=False, cashier_id=shift.user_id,
             created_at__gte=start, created_at__lte=end,
         ).aggregate(total_orders=Count('id'))
-        money = Order.objects.filter(
+        paid_orders = Order.objects.filter(
             is_deleted=False, cashier_id=shift.user_id, is_paid=True,
             paid_at__gte=start, paid_at__lte=end,
-        ).exclude(status='CANCELED').aggregate(
+        ).exclude(status='CANCELED')
+        money = paid_orders.aggregate(
             total_revenue=Coalesce(Sum('total_amount'), Decimal('0.00'), output_field=DecimalField()),
-            cash_collected=Coalesce(
-                Sum('total_amount', filter=Q(payment_method='CASH') | Q(payment_method__isnull=True)),
-                Decimal('0.00'), output_field=DecimalField()),
         )
+        # Use the same canonical tender engine as end_shift and the drawer.
+        # The old live-only shortcut counted a MIXED cash+card sale as zero cash,
+        # so the counter was wrong until the shift closed and totals were frozen.
+        from base.services.tender import breakdown_for_orders
+        split, _ = breakdown_for_orders(paid_orders)
         return (
             orders_taken['total_orders'] or 0,
             money['total_revenue'],
-            money['cash_collected'],
+            split['cash'],
         )
 
     @staticmethod

@@ -172,9 +172,10 @@ class SyncMixin(models.Model):
     #   * SYNC_DENY_FROM_BRANCH — catalog/admin fields the cloud owns (e.g.
     #     Product.price). Refused when the *cloud* ingests a branch push;
     #     accepted by a *branch* pulling from the cloud.
-    # On CREATE a denied field that is required (NOT NULL, no default) is still
-    # written: the row cannot materialize otherwise, and a row we don't yet hold
-    # locally has no value to protect. Protection is meaningful only on UPDATE.
+    # On CREATE, direction matters. A branch pulling a trusted brand-new row must
+    # keep its financial fields (there is no local value to protect). The cloud
+    # receiving an untrusted branch create still strips protected fields that
+    # have defaults; only required/no-default fields pass so the row can exist.
     SYNC_WRITE_DENYLIST = frozenset()
     SYNC_DENY_FROM_BRANCH = frozenset()
 
@@ -188,7 +189,7 @@ class SyncMixin(models.Model):
     SYNC_NATURAL_KEYS = ()
 
     @classmethod
-    def _find_by_natural_key(cls, data, resolved_fks=None):
+    def _find_by_natural_key(cls, data, resolved_fks=None, incoming_branch=None):
         """Find an existing row by SYNC_NATURAL_KEYS so an incoming record with a
         new uuid reconciles onto it instead of INSERTing a duplicate that trips a
         unique constraint. A key can be a plain field (read from `data`) or an FK
@@ -200,6 +201,12 @@ class SyncMixin(models.Model):
         resolved_fks = resolved_fks or {}
         lookup = {}
         for k in keys:
+            if k == 'branch_id':
+                value = incoming_branch or data.get(k)
+                if not value:
+                    return None
+                lookup[k] = value
+                continue
             if k in resolved_fks:
                 lookup[k] = resolved_fks[k]
                 continue
@@ -245,9 +252,16 @@ class SyncMixin(models.Model):
             return data
         import logging
         logger = logging.getLogger(__name__)
+        effective_mode = mode or getattr(settings, 'DEPLOYMENT_MODE', 'local')
         cleaned = {}
         for key, value in data.items():
             if key in denied:
+                if creating and effective_mode == 'local':
+                    # Trusted cloud -> branch create. There is no existing local
+                    # money value to protect; dropping fields with model defaults
+                    # turns real orders into zero-value placeholders.
+                    cleaned[key] = value
+                    continue
                 if creating and cls._sync_required_no_default(key):
                     # Required column on a brand-new row — keep the origin value
                     # so the record can be inserted; nothing local to protect.
@@ -255,7 +269,7 @@ class SyncMixin(models.Model):
                     continue
                 logger.warning(
                     'sync ingest: dropping denylisted field %s on %s (mode=%s)',
-                    key, cls.__name__, mode or getattr(settings, 'DEPLOYMENT_MODE', 'local'),
+                    key, cls.__name__, effective_mode,
                 )
                 continue
             cleaned[key] = value
@@ -394,7 +408,9 @@ class SyncMixin(models.Model):
             # user). If so, reconcile onto that row — converging on the incoming
             # uuid — rather than INSERTing a duplicate that would raise
             # IntegrityError and be silently dropped, never to retry.
-            natural = cls._find_by_natural_key(data, resolved_fks)
+            natural = cls._find_by_natural_key(
+                data, resolved_fks, incoming_branch=incoming_branch,
+            )
             if natural is not None:
                 instance = natural
                 instance.uuid = uuid_val
@@ -1120,6 +1136,8 @@ class Order(SyncMixin, models.Model):
         user_uuid = data.pop('user_uuid', None)
         cashier_uuid = data.pop('cashier_uuid', None)
         delivery_person_uuid = data.pop('delivery_person_uuid', None)
+        place_uuid = data.pop('place_uuid', None)
+        table_uuid = data.pop('table_uuid', None)
         customer_uuid = data.pop('customer_uuid', None)
         uuid_val = data.pop('uuid')
         sync_version = data.pop('sync_version', 1)
@@ -1141,6 +1159,8 @@ class Order(SyncMixin, models.Model):
         user = None
         cashier = None
         delivery_person = None
+        place = None
+        table = None
 
         if user_uuid:
             try:
@@ -1165,6 +1185,20 @@ class Order(SyncMixin, models.Model):
                 delivery_person = DeliveryPerson.objects.get(uuid=delivery_person_uuid)
             except DeliveryPerson.DoesNotExist:
                 delivery_unresolved = True
+
+        place_unresolved = False
+        if place_uuid:
+            try:
+                place = Place.objects.get(uuid=place_uuid)
+            except Place.DoesNotExist:
+                place_unresolved = True
+
+        table_unresolved = False
+        if table_uuid:
+            try:
+                table = Table.objects.get(uuid=table_uuid)
+            except Table.DoesNotExist:
+                table_unresolved = True
 
         # Optional client link — same soft-FK rule as cashier/delivery_person: a
         # uuid not yet synced locally must not wipe an existing link on update.
@@ -1208,6 +1242,10 @@ class Order(SyncMixin, models.Model):
                 instance.cashier = cashier
             if not delivery_unresolved:
                 instance.delivery_person = delivery_person
+            if not place_unresolved:
+                instance.place = place
+            if not table_unresolved:
+                instance.table = table
             if not customer_unresolved:
                 instance.customer = customer
             instance.sync_version = sync_version
@@ -1217,6 +1255,9 @@ class Order(SyncMixin, models.Model):
             if incoming_updated:
                 cls.objects.filter(pk=instance.pk).update(updated_at=incoming_updated)
                 instance.updated_at = incoming_updated
+            if incoming_created:
+                cls.objects.filter(pk=instance.pk).update(created_at=incoming_created)
+                instance.created_at = incoming_created
             return instance, 'updated'
         except cls.DoesNotExist:
             instance = cls(
@@ -1228,6 +1269,8 @@ class Order(SyncMixin, models.Model):
                 user=user,
                 cashier=cashier,
                 delivery_person=delivery_person,
+                place=place,
+                table=table,
                 customer=customer,
             )
             for key, value in cls._strip_sync_denied(data, creating=True).items():
@@ -1338,13 +1381,37 @@ class OrderItem(SyncMixin, models.Model):
 
 
 class CashRegister(SyncMixin, models.Model):
+    """The physical till balance for one branch.
+
+    A cloud database holds a synchronized copy for every branch, so selecting a
+    global ``.first()`` is never valid. The partial unique constraint makes the
+    ownership invariant explicit: one live register per branch; soft-deleted
+    history may remain for audit/recovery.
+    """
     current_balance = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     last_updated = models.DateTimeField(auto_now=True)
 
     objects = SyncManager()
 
+    # A branch owns its drawer. Cloud receives the amount, but a pull must not
+    # overwrite the till's local balance. branch_id is also the sync identity so
+    # independently-created rows converge rather than violating the constraint.
+    SYNC_WRITE_DENYLIST = frozenset({'current_balance'})
+    SYNC_NATURAL_KEYS = ('branch_id',)
+
     class Meta:
         db_table = 'cash_register'
+        constraints = [
+            models.UniqueConstraint(
+                fields=['branch_id'],
+                condition=models.Q(is_deleted=False),
+                name='uniq_cash_register_active_branch',
+            ),
+            models.CheckConstraint(
+                condition=models.Q(is_deleted=True) | ~models.Q(branch_id=''),
+                name='cash_register_active_branch_required',
+            ),
+        ]
 
     def __str__(self):
         return f"Cash Register: {self.current_balance}"
