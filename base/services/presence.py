@@ -37,15 +37,22 @@ def mark_device_live(device_id, branch_id=None, cashier_id=None):
     No-op without a device_id (older tills that don't send the header)."""
     if not device_id:
         return
+    cashier_ref = (
+        str(cashier_id) if cashier_id not in (None, '', 'None') else None
+    )
+    # Retain the integer field for heartbeats from older desktop builds. New
+    # builds send the stable User.uuid because local/cloud database PKs are not
+    # guaranteed to match.
     try:
-        cashier_id = int(cashier_id) if cashier_id not in (None, '', 'None') else None
+        legacy_cashier_id = int(cashier_ref) if cashier_ref else None
     except (TypeError, ValueError):
-        cashier_id = None
+        legacy_cashier_id = None
     now = time.time()                      # float: sub-second 'most recent' tiebreak
     entry = {
         'device_id': str(device_id),
         'branch_id': str(branch_id or ''),
-        'cashier_id': cashier_id,
+        'cashier_ref': cashier_ref,
+        'cashier_id': legacy_cashier_id,
         'ts': now,
     }
     try:
@@ -88,18 +95,38 @@ def resolve_active_cashier(branch_id=None):
     that branch; otherwise any live till qualifies (single-restaurant default).
     Iterates live devices most-recent-first (the multi-till tiebreak)."""
     from base.models import Shift
+    requested_branch = str(branch_id or '')
     for entry in live_devices():
-        if branch_id and entry.get('branch_id') and entry['branch_id'] != str(branch_id):
+        entry_branch = str(entry.get('branch_id') or '')
+        if requested_branch and entry_branch and entry_branch != requested_branch:
             continue
-        cid = entry.get('cashier_id')
-        if not cid:
+        cashier_ref = entry.get('cashier_ref')
+        legacy_id = entry.get('cashier_id')
+        if not cashier_ref and not legacy_id:
             continue
-        shift = (Shift.objects.filter(user_id=cid, status='ACTIVE', is_deleted=False)
-                 .order_by('-start_time').first())
+        shift_qs = Shift.objects.filter(status='ACTIVE', is_deleted=False)
+        # Old heartbeat entries may have no branch. In a branch-scoped lookup,
+        # the requested branch must still constrain the Shift query; otherwise
+        # a UUID/legacy-PK collision can select an active cashier at a different
+        # restaurant. A populated entry branch remains authoritative for the
+        # unscoped single-restaurant lookup.
+        effective_branch = entry_branch or requested_branch
+        if effective_branch:
+            shift_qs = shift_qs.filter(branch_id=effective_branch)
+        if cashier_ref and not str(cashier_ref).isdigit():
+            try:
+                import uuid
+                cashier_uuid = uuid.UUID(str(cashier_ref))
+            except (TypeError, ValueError, AttributeError):
+                continue
+            shift_qs = shift_qs.filter(user__uuid=cashier_uuid)
+        else:
+            shift_qs = shift_qs.filter(user_id=legacy_id or int(cashier_ref))
+        shift = shift_qs.order_by('-start_time').first()
         if shift:
             return {
-                'cashier_id': cid,
-                'branch_id': entry.get('branch_id') or (shift.branch_id or ''),
+                'cashier_id': shift.user_id,
+                'branch_id': effective_branch or (shift.branch_id or ''),
                 'device_id': entry.get('device_id'),
                 'shift_id': shift.id,
             }
@@ -116,10 +143,13 @@ def device_presence_headers():
     headers = {'X-Device-Id': str(device_id)}
     try:
         from base.models import Shift
-        shift = (Shift.objects.filter(status='ACTIVE', is_deleted=False)
-                 .order_by('-start_time').first())
+        shifts = Shift.objects.filter(status='ACTIVE', is_deleted=False)
+        local_branch = str(getattr(settings, 'BRANCH_ID', '') or '')
+        if local_branch:
+            shifts = shifts.filter(branch_id=local_branch)
+        shift = shifts.select_related('user').order_by('-start_time').first()
         if shift:
-            headers['X-Active-Cashier'] = str(shift.user_id)
+            headers['X-Active-Cashier'] = str(shift.user.uuid)
     except Exception:  # noqa: BLE001 — never break a sync over presence
         logger.debug('active-cashier header lookup failed', exc_info=True)
     return headers

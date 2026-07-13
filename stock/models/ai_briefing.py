@@ -1,9 +1,9 @@
 """AI Morning Briefing — a once-per-business-day proactive digest.
 
-One row per (operator, business day): the 5 bullets an LLM composed overnight from
-the day's overview + inventory + menu-engineering snapshot. Cached so only ONE
-Anthropic call is spent per business per morning; `dismissed` collapses the card for
-the rest of the business day. Non-synced (back-office, per-operator, local meaning).
+One row per (operator, business day, stock location): the 5 bullets an LLM composed
+from the day's overview + inventory + menu-engineering snapshot. Cached so only ONE
+Anthropic call is spent per location per morning; `dismissed` collapses the card for
+the rest of that business day. Non-synced (back-office, per-operator, local meaning).
 """
 from django.db import models
 
@@ -11,6 +11,10 @@ from django.db import models
 class AIBriefing(models.Model):
     user_id = models.IntegerField(db_index=True)
     business_date = models.DateField(db_index=True)
+    # 0 means an intentionally global/unscoped briefing. A concrete stock
+    # location gets its own cache row so switching branches cannot reuse the
+    # first branch's money and stock bullets for the rest of the day.
+    location_id = models.PositiveBigIntegerField(default=0, db_index=True)
     generated_at = models.DateTimeField(auto_now_add=True)
     valid_until = models.DateTimeField(null=True, blank=True)
     # [{icon, title, body, deep_link, ai_seed_prompt}, ...] — priority order.
@@ -19,8 +23,11 @@ class AIBriefing(models.Model):
 
     class Meta:
         db_table = 'ai_briefing'
-        unique_together = (('user_id', 'business_date'),)
+        unique_together = (('user_id', 'business_date', 'location_id'),)
         ordering = ['-business_date']
 
     def __str__(self):
-        return f"AIBriefing<u{self.user_id} {self.business_date} bullets={len(self.bullets or [])}>"
+        return (
+            f"AIBriefing<u{self.user_id} {self.business_date} "
+            f"loc={self.location_id or 'global'} bullets={len(self.bullets or [])}>"
+        )

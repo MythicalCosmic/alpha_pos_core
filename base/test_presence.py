@@ -73,6 +73,30 @@ class TestPresence:
         res = presence.resolve_active_cashier()
         assert res['device_id'] == 'dev-NEW' and res['cashier_id'] == u2.id
 
+    def test_resolve_stable_cashier_uuid_instead_of_foreign_local_pk(self):
+        u = _cashier('uuid-ref@x.local')
+        _shift(u)
+        presence.mark_device_live('dev-UUID', 'branch-1', str(u.uuid))
+
+        res = presence.resolve_active_cashier()
+
+        assert res is not None
+        assert res['cashier_id'] == u.id
+
+    def test_device_branch_cannot_resolve_users_shift_on_another_branch(self):
+        u = _cashier('wrong-branch@x.local')
+        _shift(u, branch_id='branch-2')
+        presence.mark_device_live('dev-A', 'branch-1', str(u.uuid))
+
+        assert presence.resolve_active_cashier(branch_id='branch-1') is None
+
+    def test_blank_legacy_device_branch_still_obeys_requested_branch(self):
+        u = _cashier('blank-entry-branch@x.local')
+        _shift(u, branch_id='branch-2')
+        presence.mark_device_live('dev-LEGACY', '', str(u.uuid))
+
+        assert presence.resolve_active_cashier(branch_id='branch-1') is None
+
 
 @pytest.mark.django_db
 class TestPresenceHeaders:
@@ -82,8 +106,21 @@ class TestPresenceHeaders:
 
     def test_headers_include_device_and_active_cashier(self, settings):
         settings.DEVICE_ID = 'dev-Z'
+        settings.BRANCH_ID = 'branch-1'
         u = _cashier('h1@x.local')
         _shift(u)
         headers = presence.device_presence_headers()
         assert headers['X-Device-Id'] == 'dev-Z'
-        assert headers['X-Active-Cashier'] == str(u.id)
+        assert headers['X-Active-Cashier'] == str(u.uuid)
+
+    def test_header_ignores_newer_active_shift_from_another_branch(self, settings):
+        settings.DEVICE_ID = 'dev-Z'
+        settings.BRANCH_ID = 'branch-1'
+        own = _cashier('own-branch@x.local')
+        other = _cashier('other-branch@x.local')
+        _shift(own, branch_id='branch-1')
+        _shift(other, branch_id='branch-2')
+
+        headers = presence.device_presence_headers()
+
+        assert headers['X-Active-Cashier'] == str(own.uuid)

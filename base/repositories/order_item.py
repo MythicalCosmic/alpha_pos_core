@@ -41,12 +41,13 @@ class OrderItemRepository(BaseSyncRepository):
     @classmethod
     def get_existing_unready(cls, order_id, product_id):
         return cls.model.objects.filter(
-            order_id=order_id, product_id=product_id, ready_at__isnull=True
+            is_deleted=False, order_id=order_id, product_id=product_id,
+            ready_at__isnull=True,
         ).first()
 
     @classmethod
     def calculate_order_total(cls, order):
-        return order.items.aggregate(
+        return order.items.filter(is_deleted=False).aggregate(
             total=Coalesce(
                 Sum(F('price') * F('quantity'), output_field=DecimalField(max_digits=12, decimal_places=2)),
                 Decimal('0.00')
@@ -62,9 +63,9 @@ class OrderItemRepository(BaseSyncRepository):
             is_deleted=False, order__is_deleted=False, order__is_paid=True,
         ).exclude(order__status='CANCELED')
         if date_from:
-            qs = qs.filter(order__created_at__gte=date_from)
+            qs = qs.filter(order__paid_at__gte=date_from)
         if date_to:
-            qs = qs.filter(order__created_at__lte=date_to)
+            qs = qs.filter(order__paid_at__lte=date_to)
 
         return list(qs.values(
             'product_id', 'product__name', 'product__category__name'
@@ -111,9 +112,9 @@ class OrderItemRepository(BaseSyncRepository):
             is_deleted=False, order__is_deleted=False, order__is_paid=True,
         ).exclude(order__status='CANCELED')
         if date_from:
-            qs = qs.filter(order__created_at__gte=date_from)
+            qs = qs.filter(order__paid_at__gte=date_from)
         if date_to:
-            qs = qs.filter(order__created_at__lte=date_to)
+            qs = qs.filter(order__paid_at__lte=date_to)
 
         return list(qs.values(
             'product_id', 'product__name', 'product__category__name'
@@ -135,9 +136,9 @@ class OrderItemRepository(BaseSyncRepository):
             is_deleted=False, order__is_deleted=False, order__is_paid=True,
         ).exclude(order__status='CANCELED')
         if date_from:
-            qs = qs.filter(order__created_at__gte=date_from)
+            qs = qs.filter(order__paid_at__gte=date_from)
         if date_to:
-            qs = qs.filter(order__created_at__lte=date_to)
+            qs = qs.filter(order__paid_at__lte=date_to)
 
         return list(qs.values(
             'product__category_id', 'product__category__name'

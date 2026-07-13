@@ -122,20 +122,29 @@ class ShiftNotification:
         if cashier_id:
             base_q &= Q(cashier_id=cashier_id)
 
-        orders = Order.objects.filter(base_q)
+        orders = Order.objects.filter(base_q, is_deleted=False)
+        paid_orders = Order.objects.filter(
+            is_deleted=False,
+            is_paid=True,
+            paid_at__gte=start_time,
+            paid_at__lte=end_time,
+        ).exclude(status='CANCELED')
+        if cashier_id:
+            paid_orders = paid_orders.filter(cashier_id=cashier_id)
 
         agg = orders.aggregate(
             total=Count('id'),
-            paid=Count('id', filter=Q(is_paid=True)),
             unpaid=Count('id', filter=Q(is_paid=False) & ~Q(status='CANCELED')),
             cancelled=Count('id', filter=Q(status='CANCELED')),
             completed=Count('id', filter=Q(status='COMPLETED')),
-            revenue=Sum('total_amount', filter=Q(is_paid=True)),
-            avg_value=Avg('total_amount', filter=Q(is_paid=True)),
         )
 
-        revenue = agg['revenue'] or Decimal('0')
-        avg_value = agg['avg_value'] or Decimal('0')
+        money = paid_orders.aggregate(
+            revenue=Sum('total_amount'), avg_value=Avg('total_amount'),
+            paid=Count('id'),
+        )
+        revenue = money['revenue'] or Decimal('0')
+        avg_value = money['avg_value'] or Decimal('0')
 
         ready_orders = orders.filter(
             ready_at__isnull=False, status__in=['READY', 'COMPLETED']
@@ -147,10 +156,13 @@ class ShiftNotification:
             total_secs = sum((o.prep.total_seconds() for o in ready_orders if o.prep), 0)
             avg_prep = total_secs / ready_orders.count()
 
-        type_data = orders.values('order_type').annotate(
-            count=Count('id'),
-            rev=Sum('total_amount', filter=Q(is_paid=True)),
-        )
+        type_data = orders.values('order_type').annotate(count=Count('id'))
+        type_revenue = {
+            row['order_type']: row['rev'] or Decimal('0')
+            for row in paid_orders.values('order_type').annotate(
+                rev=Sum('total_amount'),
+            )
+        }
         order_types = {
             'HALL': {'count': 0, 'revenue': Decimal('0')},
             'DELIVERY': {'count': 0, 'revenue': Decimal('0')},
@@ -159,7 +171,9 @@ class ShiftNotification:
         for t in type_data:
             if t['order_type'] in order_types:
                 order_types[t['order_type']]['count'] = t['count']
-                order_types[t['order_type']]['revenue'] = t['rev'] or Decimal('0')
+        for order_type, type_rev in type_revenue.items():
+            if order_type in order_types:
+                order_types[order_type]['revenue'] = type_rev
 
         hourly = orders.annotate(
             hour=ExtractHour('created_at')
@@ -170,7 +184,11 @@ class ShiftNotification:
             if h['count'] > peak['count']:
                 peak = {'hour': h['hour'], 'count': h['count']}
 
-        item_q = Q(order__created_at__gte=start_time, order__created_at__lte=end_time, order__is_paid=True)
+        item_q = Q(
+            order__paid_at__gte=start_time,
+            order__paid_at__lte=end_time,
+            order__is_paid=True,
+        )
         if cashier_id:
             item_q &= Q(order__cashier_id=cashier_id)
 
@@ -186,7 +204,7 @@ class ShiftNotification:
 
         return {
             'total_orders': agg['total'],
-            'paid_orders': agg['paid'],
+            'paid_orders': money['paid'],
             'unpaid_orders': agg['unpaid'],
             'cancelled_orders': agg['cancelled'],
             'completed_orders': agg['completed'],

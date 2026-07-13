@@ -9,7 +9,7 @@ from stock.models import (
 from stock.services.base_service import to_decimal
 from stock.repositories import (
     ProductStockLinkRepository, ProductComponentStockRepository,
-    RecipeRepository, RecipeIngredientRepository,
+    RecipeRepository,
     StockItemRepository, StockUnitRepository,
     StockSettingsRepository,
 )
@@ -27,6 +27,36 @@ def _pagination_data(page_obj, paginator):
 
 
 class ProductStockLinkService:
+
+    @classmethod
+    def has_cost_definition(cls, link: ProductStockLink) -> bool:
+        """Whether a live link has enough stock metadata to calculate COGS."""
+        if not link or link.is_deleted or not link.is_active:
+            return False
+        if link.link_type == ProductStockLink.LinkType.RECIPE:
+            return bool(
+                link.recipe and not link.recipe.is_deleted
+                and link.recipe.is_active and link.recipe.is_active_version
+                and not link.recipe.output_item.is_deleted
+                and link.recipe.output_item.is_active
+                and to_decimal(link.recipe.output_quantity) > 0
+                and to_decimal(link.recipe.yield_percentage) > 0
+                and link.recipe.ingredients.filter(
+                    is_deleted=False,
+                    stock_item__is_deleted=False,
+                    stock_item__is_active=True,
+                ).exists()
+            )
+        if link.link_type == ProductStockLink.LinkType.DIRECT_ITEM:
+            return bool(
+                link.stock_item and not link.stock_item.is_deleted
+                and link.stock_item.is_active
+            )
+        if link.link_type == ProductStockLink.LinkType.COMPONENT_BASED:
+            return ProductComponentStockRepository.get_defaults(link.id).filter(
+                stock_item__is_deleted=False, stock_item__is_active=True,
+            ).exists()
+        return False
 
     @classmethod
     def serialize(cls, link: ProductStockLink, include_components: bool = False) -> Dict[str, Any]:
@@ -293,10 +323,53 @@ class ProductStockLinkService:
         return ServiceResponse.success(message="Product unlinked from stock")
 
     @classmethod
+    def calculate_unit_cost(cls, link: ProductStockLink) -> Decimal:
+        """Canonical stock COGS for one POS sale represented by ``link``.
+
+        All item quantities are converted to the item's base unit before applying
+        ``avg_cost_price``. Recipe links additionally account for full-batch
+        output, yield, waste, and ``quantity_per_sale``. Repository access keeps
+        soft-deleted components/ingredients out of the result.
+        """
+        if not cls.has_cost_definition(link):
+            return Decimal('0')
+
+        from stock.services.recipe_service import RecipeService
+        from stock.services.unit_service import StockItemUnitService
+
+        if link.link_type == ProductStockLink.LinkType.RECIPE:
+            return RecipeService.calculate_portion_cost(
+                link.recipe,
+                quantity=link.quantity_per_sale,
+                unit_id=link.unit_id or link.recipe.output_unit_id,
+            )
+
+        if link.link_type == ProductStockLink.LinkType.DIRECT_ITEM:
+            base_qty = StockItemUnitService.convert_for_item(
+                link.stock_item_id,
+                link.quantity_per_sale,
+                link.unit_id or link.stock_item.base_unit_id,
+            )
+            return base_qty * to_decimal(link.stock_item.avg_cost_price)
+
+        if link.link_type == ProductStockLink.LinkType.COMPONENT_BASED:
+            total = Decimal('0')
+            for comp in ProductComponentStockRepository.get_defaults(link.id):
+                if comp.stock_item.is_deleted or not comp.stock_item.is_active:
+                    continue
+                base_qty = StockItemUnitService.convert_for_item(
+                    comp.stock_item_id, comp.quantity, comp.unit_id,
+                )
+                total += base_qty * to_decimal(comp.stock_item.avg_cost_price)
+            return total
+
+        return Decimal('0')
+
+    @classmethod
     def get_deduction_items(cls, product_id: int, quantity: int = 1) -> List[Dict]:
         link = ProductStockLinkRepository.get_active_for_product(product_id)
 
-        if not link:
+        if not cls.has_cost_definition(link):
             return []
 
         deductions = []
@@ -312,20 +385,25 @@ class ProductStockLinkService:
 
         elif link.link_type == "RECIPE":
             if link.recipe:
-                # Recipe ingredient quantities are for the full recipe yield
-                # (recipe.output_quantity). Scale by sale_qty * quantity_per_sale
-                # divided by output_quantity to deduct only what one sold portion uses.
-                output_qty = to_decimal(link.recipe.output_quantity) or to_decimal(1)
-                ingredients = RecipeIngredientRepository.get_for_recipe(link.recipe_id)
-                for ingredient in ingredients:
+                from stock.services.recipe_service import RecipeService
+
+                portion_ratio = RecipeService.output_portion_ratio(
+                    link.recipe,
+                    quantity=link.quantity_per_sale * sale_qty,
+                    unit_id=link.unit_id or link.recipe.output_unit_id,
+                )
+                for row in RecipeService.ingredient_cost_breakdown(link.recipe):
+                    ingredient = row['ingredient']
                     deductions.append({
                         "stock_item_id": ingredient.stock_item_id,
-                        "quantity": ingredient.quantity * sale_qty * link.quantity_per_sale / output_qty,
+                        "quantity": row['quantity_with_waste'] * portion_ratio,
                         "unit_id": ingredient.unit_id,
                     })
 
         elif link.link_type == "COMPONENT_BASED":
-            defaults = ProductComponentStockRepository.get_defaults(link.id)
+            defaults = ProductComponentStockRepository.get_defaults(link.id).filter(
+                stock_item__is_deleted=False, stock_item__is_active=True,
+            )
             for comp in defaults:
                 deductions.append({
                     "stock_item_id": comp.stock_item_id,

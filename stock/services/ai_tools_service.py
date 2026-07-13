@@ -15,9 +15,10 @@ read-only (no writes, no deletes) and excludes soft-deleted rows. Sensitive fiel
 from datetime import date, timedelta
 import json
 import logging
+from uuid import UUID
 
 from django.db.models import Sum, Count, F, Q, Avg, Min, Max
-from django.db.models.functions import TruncDate, TruncHour
+from django.db.models.functions import TruncHour
 from django.utils import timezone
 
 from base.models import (
@@ -25,6 +26,12 @@ from base.models import (
     CashRegister, Inkassa, Shift, CashReconciliation,
 )
 from stock.models import StockLevel, StockBatch, StockLocation
+from base.services.business_day import business_day_date_expr
+from base.services.revenue import net_line_revenue
+from stock.services.ai_context import (
+    AIDataContext, current_cash_register, resolve_ai_context, scope_branch,
+    scope_location_owned,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,11 +81,38 @@ def _parse_date(s):
         return None
 
 
-# Reporting/revenue basis, SHARED with dashboard_service + ai_assistant_service so
-# the AI always agrees with the admin panel: a sale counts when PLACED (created_at)
-# inside the BUSINESS-DAY window (03:00 cutover, not calendar midnight) and only if
-# PAID and not CANCELLED. (Cash-drawer settlement uses paid_at — a separate concern.)
-_REV = Q(is_paid=True) & ~Q(status='CANCELED')
+def _context(args):
+    """Context injected by :meth:`AIToolbox.execute` after validation."""
+    return AIDataContext(
+        location_id=args.get('_location_id'),
+        branch_id=args.get('_branch_id') or None,
+    )
+
+
+def _scope_orders(qs, args, field='branch_id'):
+    return scope_branch(qs, _context(args).branch_id, field)
+
+
+def _paid_orders_in(lo, hi, args):
+    """Canonical settled sales in a half-open paid-at reporting window."""
+    qs = Order.objects.filter(
+        is_deleted=False, is_paid=True,
+        paid_at__gte=lo, paid_at__lt=hi,
+    ).exclude(status=Order.Status.CANCELED)
+    return _scope_orders(qs, args)
+
+
+def _parse_uuid(value):
+    if not value:
+        return None
+    try:
+        return UUID(str(value))
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+# BUSINESS-DAY reporting uses a 03:00 cutover. Operational volume is attributed
+# by created_at; settled money and product sales are attributed by paid_at.
 
 
 def _bd_today_window():
@@ -175,10 +209,12 @@ def _order_summary(o):
     with a short item preview, without serializing every line."""
     items = [it for it in o.items.all() if not it.is_deleted]
     preview = [f"{it.quantity} x {it.product.name if it.product else '?'}" for it in items[:8]]
-    due = _f(o.total_amount) * (1 - _f(o.discount_percent) / 100)
     return {
         "id": o.id,
+        "uuid": str(o.uuid),
+        "order_number": o.order_number,
         "display_id": o.display_id,
+        "branch_id": o.branch_id or None,
         "created_at": _iso(o.created_at),
         "status": o.status,
         "order_type": o.order_type,
@@ -188,7 +224,10 @@ def _order_summary(o):
         "discount_amount_uzs": _f(o.discount_amount),
         "discount_percent": _f(o.discount_percent),
         "total_amount_uzs": _f(o.total_amount),
-        "amount_due_uzs": round(due, 2),
+        # Order.total_amount is already the net amount collected after the
+        # order-level discount. Applying discount_percent again understated
+        # every discounted ticket in AI order detail.
+        "amount_due_uzs": _f(o.total_amount),
         "cashier": _name(o.cashier),
         "cashier_id": o.cashier_id,
         "customer": _customer_brief(o.customer),
@@ -237,18 +276,33 @@ def _shift_orders_qs(shift):
     """Orders attributed to a shift. There is no Order->Shift FK; attribution is
     by cashier + the shift's time window (open shifts run up to 'now')."""
     end = shift.end_time or timezone.now()
-    return Order.objects.filter(
+    qs = Order.objects.filter(
         is_deleted=False, cashier=shift.user,
         created_at__gte=shift.start_time, created_at__lt=end,
     )
+    return scope_branch(qs, shift.branch_id or None)
+
+
+def _shift_paid_orders_qs(shift):
+    """Paid sales settled during a shift, matching drawer reconciliation.
+
+    An order may be opened before a cashier starts (or near shift close) and paid
+    during a different shift.  Revenue therefore belongs to the paid-at window;
+    order volume/detail remains based on created-at.
+    """
+    end = shift.end_time or timezone.now()
+    qs = Order.objects.filter(
+        is_deleted=False, cashier=shift.user, is_paid=True,
+        paid_at__gte=shift.start_time, paid_at__lt=end,
+    ).exclude(status=Order.Status.CANCELED)
+    return scope_branch(qs, shift.branch_id or None)
 
 
 def _shift_dict(s, with_orders=False):
     oqs = _shift_orders_qs(s)
-    agg = oqs.aggregate(
-        cnt=Count("id"),
-        revenue=Sum("total_amount", filter=_REV),
-        gross=Sum("total_amount"),
+    volume = oqs.aggregate(cnt=Count("id"))
+    money = _shift_paid_orders_qs(s).aggregate(
+        total=Sum("total_amount"), gross=Sum("subtotal"),
     )
     # Reverse one-to-one: accessing a missing .reconciliation raises DoesNotExist
     # (not AttributeError), so getattr(..., None) would not catch it.
@@ -268,9 +322,9 @@ def _shift_dict(s, with_orders=False):
         "notes": s.notes or None,
         # Live figures computed from orders in the window (the stored counters on
         # the Shift row are only frozen at close, so they can lag for open shifts).
-        "live_orders": agg["cnt"] or 0,
-        "live_paid_revenue_uzs": _f(agg["revenue"]),
-        "live_gross_uzs": _f(agg["gross"]),
+        "live_orders": volume["cnt"] or 0,
+        "live_paid_revenue_uzs": _f(money["total"]),
+        "live_gross_uzs": _f(money["gross"]),
         # Stored counters (authoritative once the shift is ENDED/COMPLETED).
         "stored_total_orders": s.total_orders,
         "stored_total_revenue_uzs": _f(s.total_revenue),
@@ -334,9 +388,11 @@ def _stock_dict(level):
     }
 
 
-def _cashier_dict(u, with_today=True):
-    open_shift = (Shift.objects.filter(is_deleted=False, user=u, status=Shift.Status.ACTIVE)
-                  .order_by("-start_time").first())
+def _cashier_dict(u, with_today=True, branch_id=None):
+    open_shifts = Shift.objects.filter(
+        is_deleted=False, user=u, status=Shift.Status.ACTIVE,
+    )
+    open_shift = scope_branch(open_shifts, branch_id).order_by("-start_time").first()
     data = {
         "id": u.id,
         "name": _name(u),
@@ -352,11 +408,19 @@ def _cashier_dict(u, with_today=True):
         # "Today" = the current BUSINESS day (03:00 cutover), matching the admin
         # dashboard, not a plain calendar date. Revenue = paid, non-cancelled.
         _lo, _hi = _bd_today_window()
-        agg = Order.objects.filter(
+        orders = Order.objects.filter(
             is_deleted=False, cashier=u, created_at__gte=_lo, created_at__lt=_hi,
-        ).aggregate(cnt=Count("id"), rev=Sum("total_amount", filter=_REV))
-        data["today_orders"] = agg["cnt"] or 0
-        data["today_revenue_uzs"] = _f(agg["rev"])
+        )
+        volume = scope_branch(orders, branch_id).count()
+        sales = Order.objects.filter(
+            is_deleted=False, cashier=u, is_paid=True,
+            paid_at__gte=_lo, paid_at__lt=_hi,
+        ).exclude(status=Order.Status.CANCELED)
+        revenue = scope_branch(sales, branch_id).aggregate(
+            rev=Sum("total_amount"),
+        )["rev"]
+        data["today_orders"] = volume
+        data["today_revenue_uzs"] = _f(revenue)
     return data
 
 
@@ -401,6 +465,9 @@ class AIToolbox:
                     "order_type": {"type": "string", "enum": ["HALL", "DELIVERY", "PICKUP"]},
                     "payment_method": {"type": "string", "enum": ["CASH", "UZCARD", "HUMO", "CARD", "PAYME", "MIXED"], "description": "STORED roll-up value. Reporting folds UZCARD/HUMO/CARD into one `card` tender; MIXED means the sale was split (its real tenders live in the order's payment lines)."},
                     "is_paid": {"type": "boolean"},
+                    "order_number": {"type": "integer", "description": "Stable per-business-day receipt number"},
+                    "order_uuid": {"type": "string", "description": "Globally unique synced order UUID"},
+                    "branch_id": {"type": "string", "description": "Branch id (normally supplied by the selected location context)"},
                     "cashier_id": {"type": "integer", "description": "Filter by cashier user id"},
                     "customer_phone": {"type": "string", "description": "Match order or customer phone (partial ok)"},
                     "product_name": {"type": "string", "description": "Only orders containing a product whose name matches (partial)"},
@@ -411,13 +478,16 @@ class AIToolbox:
         },
         {
             "name": "get_order",
-            "description": "Full detail of ONE order: every line item (product, quantity, unit price, discounts, notes), every payment line (for split payments), customer, cashier, table/place, and all timestamps. This is how you see exactly what is inside an order.",
+            "description": "Full detail of ONE order: every line item, payment, customer, cashier and timestamp. Prefer order_uuid, database order_id, or order_number. display_id is legacy/local and may be duplicated after sync.",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "order_id": {"type": "integer", "description": "Database id of the order (preferred, unambiguous)"},
+                    "order_id": {"type": "integer", "description": "Database id of the order (unambiguous on this server)"},
+                    "order_uuid": {"type": "string", "description": "Globally unique synced order UUID (preferred)"},
+                    "order_number": {"type": "integer", "description": "Stable per-business-day order number; pass date when known"},
+                    "branch_id": {"type": "string", "description": "Branch id; selected-location context normally supplies it"},
                     "display_id": {"type": "integer", "description": "Receipt/screen number (per-branch, wraps at 100 — pass 'date' to disambiguate)"},
-                    "date": {"type": "string", "description": "YYYY-MM-DD to disambiguate a display_id"},
+                    "date": {"type": "string", "description": "Business date YYYY-MM-DD to disambiguate a human order number"},
                 },
             },
         },
@@ -504,7 +574,7 @@ class AIToolbox:
         },
         {
             "name": "sales_report",
-            "description": "Aggregated sales for any date or date range: totals, per-day, per-cashier, per-category, top products, per payment method, per order type (and hourly for a single day). Use for revenue/trend questions over arbitrary dates.",
+            "description": "Aggregated sales for any date or date range: operational order volume by created_at, settled revenue/product sales by paid_at, plus per-day, cashier, category, product, payment method, order type, and hourly breakdowns.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -535,9 +605,12 @@ class AIToolbox:
                 "fields) OR aggregate (count / sum:field / avg:field / min:field / max:field, "
                 "optionally grouped). Queryable models: order, orderitem, product, category, "
                 "customer, user, shift, cashreconciliation, cashregister, inkassa, stocklevel, "
-                "stockbatch, stocklocation. Field lookups use '__': "
-                '{"status":"COMPLETED","created_at__date":"2026-07-04","total_amount__gte":50000}. '
-                'Aggregate example: aggregate {"revenue":"sum:total_amount","orders":"count"} '
+                "stockbatch, stocklocation. For money/revenue or product-sales windows, "
+                "filter orders by paid_at (order items by order__paid_at), is_paid=true, "
+                "and exclude CANCELED; use created_at for operational creation/status volume. "
+                'Revenue filters: {"is_paid":true,"paid_at__date":"2026-07-04"}, '
+                'exclude {"status":"CANCELED"}. Aggregate example: '
+                'aggregate {"revenue":"sum:total_amount","orders":"count"} '
                 'group_by ["cashier"]. Row example: fields ["id","total_amount","status",'
                 '"cashier__first_name"]. Prefer a specific tool when it already computes the exact '
                 "metric (those are pre-validated); use query_db for anything they can't. Read-only; "
@@ -547,7 +620,7 @@ class AIToolbox:
                 "type": "object",
                 "properties": {
                     "model": {"type": "string", "description": "order, orderitem, product, category, customer, user, shift, cashreconciliation, cashregister, inkassa, stocklevel, stockbatch, stocklocation"},
-                    "filters": {"type": "object", "description": 'Django field lookups, e.g. {"status":"COMPLETED","created_at__gte":"2026-07-01"}'},
+                    "filters": {"type": "object", "description": 'Django lookups. Revenue: {"is_paid":true,"paid_at__gte":"2026-07-01"}; operational volume: {"created_at__gte":"2026-07-01"}.'},
                     "exclude": {"type": "object", "description": "Same shape as filters, rows to exclude"},
                     "aggregate": {"type": "object", "description": '{alias:"func:field" | "count"}, func: sum/avg/min/max. e.g. {"revenue":"sum:total_amount","n":"count"}'},
                     "group_by": {"type": "array", "items": {"type": "string"}, "description": 'Group aggregates by these field paths, e.g. ["cashier","status"]'},
@@ -564,7 +637,14 @@ class AIToolbox:
     # ── dispatcher ──
     @classmethod
     def execute(cls, name, args, location_id=None):
-        args = args or {}
+        context, context_error = resolve_ai_context(location_id)
+        if context_error:
+            return json.dumps({"error": context_error}, ensure_ascii=False)
+        # Never mutate the model SDK's input object. Internal keys carry the
+        # validated location/branch through the existing one-argument handlers.
+        args = dict(args or {})
+        args['_location_id'] = context.location_id
+        args['_branch_id'] = context.branch_id
         handler = {
             "get_datetime": cls._t_datetime,
             "get_overview": cls._t_overview,
@@ -606,6 +686,25 @@ class AIToolbox:
         if any(f.name == 'is_deleted' for f in model._meta.concrete_fields) \
                 and args.get('include_deleted') is not True:
             qs = qs.filter(is_deleted=False)
+
+        # Operational rows are branch-owned on the cloud. A selected stock
+        # location must constrain the generic escape-hatch just like the purpose-
+        # built tools, otherwise the model can accidentally sum every branch.
+        context = _context(args)
+        branch_models = {
+            Order, OrderItem, Customer, Shift, CashReconciliation, CashRegister, Inkassa,
+            StockLocation,
+        }
+        if model in (StockLevel, StockBatch):
+            qs = scope_location_owned(qs, context)
+        elif model in branch_models:
+            branch_field = {
+                OrderItem: 'order__branch_id',
+                CashReconciliation: 'shift__branch_id',
+            }.get(model, 'branch_id')
+            qs = scope_branch(qs, context.branch_id, branch_field)
+        if context.location_id and model is StockLocation:
+            qs = qs.filter(id=context.location_id)
 
         filters = args.get('filters') or {}
         excludes = args.get('exclude') or {}
@@ -712,30 +811,42 @@ class AIToolbox:
     @classmethod
     def _t_overview(cls, args):
         now = timezone.now()
+        context = _context(args)
         today_local = timezone.localdate()  # calendar date — used for stock expiry below
         # Sales "today" = the current BUSINESS day (03:00 cutover) so it matches the
         # admin dashboard, not a plain calendar day. Revenue = paid, non-cancelled.
         _lo, _hi = _bd_today_window()
-        today = Order.objects.filter(is_deleted=False, created_at__gte=_lo, created_at__lt=_hi)
-        t_agg = today.aggregate(
+        today = _scope_orders(Order.objects.filter(
+            is_deleted=False, created_at__gte=_lo, created_at__lt=_hi,
+        ), args)
+        volume_agg = today.aggregate(
             cnt=Count("id"),
-            revenue=Sum("total_amount", filter=_REV),
-            paid=Count("id", filter=Q(is_paid=True)),
-            unpaid=Count("id", filter=Q(is_paid=False)),
+            unpaid=Count(
+                "id",
+                filter=Q(is_paid=False) & ~Q(status=Order.Status.CANCELED),
+            ),
+        )
+        sales_agg = _paid_orders_in(_lo, _hi, args).aggregate(
+            revenue=Sum("total_amount"), paid=Count("id"),
         )
         open_shifts = (Shift.objects.filter(is_deleted=False, status=Shift.Status.ACTIVE)
                        .select_related("user").order_by("-start_time"))
+        open_shifts = scope_branch(open_shifts, context.branch_id)
         open_list = []
         for s in open_shifts[:50]:
-            a = _shift_orders_qs(s).aggregate(c=Count("id"), r=Sum("total_amount", filter=_REV))
+            count = _shift_orders_qs(s).count()
+            revenue = _shift_paid_orders_qs(s).aggregate(r=Sum("total_amount"))["r"]
             open_list.append({
                 "cashier": _name(s.user), "cashier_id": s.user_id,
                 "since": _iso(s.start_time), "shift_id": s.id,
-                "live_orders": a["c"] or 0, "live_revenue_uzs": _f(a["r"]),
+                "live_orders": count, "live_revenue_uzs": _f(revenue),
             })
 
         levels = StockLevel.objects.filter(
-            is_deleted=False, stock_item__is_active=True).select_related("stock_item")
+            is_deleted=False, stock_item__is_deleted=False,
+            stock_item__is_active=True,
+        ).select_related("stock_item")
+        levels = scope_location_owned(levels, context)
         total_val = low = out = 0
         for lv in levels:
             q = _f(lv.quantity)
@@ -747,26 +858,28 @@ class AIToolbox:
         expiring = StockBatch.objects.filter(
             is_deleted=False, current_quantity__gt=0,
             expiry_date__gt=today_local, expiry_date__lte=today_local + timedelta(days=14),
-        ).count()
-        cash = CashRegister.objects.first()
+        )
+        expiring = scope_location_owned(expiring, context)
+        cash = current_cash_register(context.branch_id)
         return {
             "now": _iso(now),
             "today": today_local.isoformat(),
             "today_sales": {
-                "orders": t_agg["cnt"] or 0,
-                "paid_revenue_uzs": _f(t_agg["revenue"]),
-                "paid_orders": t_agg["paid"] or 0,
-                "unpaid_orders": t_agg["unpaid"] or 0,
+                "orders": volume_agg["cnt"] or 0,
+                "paid_revenue_uzs": _f(sales_agg["revenue"]),
+                "paid_orders": sales_agg["paid"] or 0,
+                "unpaid_orders": volume_agg["unpaid"] or 0,
             },
             "open_shifts_count": len(open_list),
             "open_shifts": open_list,
-            "cash_register_balance_uzs": _f(cash.current_balance) if cash else 0.0,
+            "cash_register_balance_uzs": _f(cash.current_balance) if cash else None,
+            "cash_register_branch_id": cash.branch_id if cash else context.branch_id,
             "stock": {
                 "total_levels": levels.count(),
                 "total_value_uzs": round(total_val, 2),
                 "low_stock_count": low,
                 "out_of_stock_count": out,
-                "expiring_14d": expiring,
+                "expiring_14d": expiring.count(),
             },
             "counts": {
                 "products": Product.objects.filter(is_deleted=False).count(),
@@ -782,6 +895,7 @@ class AIToolbox:
         qs = (Order.objects.filter(is_deleted=False)
               .select_related("cashier", "customer", "table", "place")
               .prefetch_related("items__product"))
+        qs = _scope_orders(qs, args)
         # Business-day window (03:00 cutover) so "orders on date X" matches the
         # dashboard's day for X (a 01:00 sale belongs to the previous business day).
         d = _parse_date(args.get("date"))
@@ -800,6 +914,15 @@ class AIToolbox:
             qs = qs.filter(payment_method=str(args["payment_method"]).upper())
         if args.get("is_paid") is not None:
             qs = qs.filter(is_paid=bool(args["is_paid"]))
+        if args.get("order_number") is not None:
+            qs = qs.filter(order_number=args["order_number"])
+        if args.get("order_uuid"):
+            order_uuid = _parse_uuid(args["order_uuid"])
+            if order_uuid is None:
+                return {"error": "invalid order_uuid"}
+            qs = qs.filter(uuid=order_uuid)
+        if args.get("branch_id"):
+            qs = qs.filter(branch_id=str(args["branch_id"]))
         if args.get("cashier_id"):
             qs = qs.filter(cashier_id=args["cashier_id"])
         if args.get("customer_phone"):
@@ -826,23 +949,57 @@ class AIToolbox:
         base = (Order.objects.filter(is_deleted=False)
                 .select_related("cashier", "customer", "table", "place", "delivery_person")
                 .prefetch_related("items__product__category", "payments"))
+        base = _scope_orders(base, args)
+        if args.get("branch_id"):
+            base = base.filter(branch_id=str(args["branch_id"]))
+
+        d = _parse_date(args.get("date"))
+
+        def dated(qs):
+            if not d:
+                return qs
+            lo, hi = _bd_range_window(d, d)
+            return qs.filter(created_at__gte=lo, created_at__lt=hi)
+
+        def unique_or_error(qs, reference):
+            matches = list(qs.order_by("-created_at")[:2])
+            if len(matches) > 1:
+                return None, {
+                    "error": f"ambiguous {reference}; pass date, order_uuid, or order_id",
+                    "matching_at_least": 2,
+                }
+            return (matches[0] if matches else None), None
+
         o = None
+        error = None
         if args.get("order_id"):
             o = base.filter(id=args["order_id"]).first()
+        elif args.get("order_uuid"):
+            order_uuid = _parse_uuid(args["order_uuid"])
+            if order_uuid is None:
+                return {"error": "invalid order_uuid"}
+            o = base.filter(uuid=order_uuid).first()
+        elif args.get("order_number") is not None:
+            o, error = unique_or_error(
+                dated(base.filter(order_number=args["order_number"])),
+                "order_number",
+            )
         elif args.get("display_id"):
-            q = base.filter(display_id=args["display_id"])
-            d = _parse_date(args.get("date"))
-            if d:
-                q = q.filter(created_at__date=d)
-            o = q.order_by("-created_at").first()
+            o, error = unique_or_error(
+                dated(base.filter(display_id=args["display_id"])),
+                "display_id",
+            )
+        if error:
+            return error
         if o is None:
-            return {"error": "order not found", "args": args}
+            return {"error": "order not found"}
         return _order_full(o)
 
     @classmethod
     def _t_open_shifts(cls, args):
         qs = (Shift.objects.filter(is_deleted=False, status=Shift.Status.ACTIVE)
               .select_related("user", "shift_template", "reconciliation").order_by("-start_time"))
+        qs = _scope_orders(qs, args)
         total = qs.count()
         data = [_shift_dict(s) for s in qs[:MAX_LIST]]
         return {"open_shifts_count": total, "returned": len(data), "open_shifts": data}
@@ -850,6 +1007,7 @@ class AIToolbox:
     @classmethod
     def _t_list_shifts(cls, args):
         qs = Shift.objects.filter(is_deleted=False).select_related("user", "shift_template", "reconciliation")
+        qs = _scope_orders(qs, args)
         if args.get("status"):
             qs = qs.filter(status=str(args["status"]).upper())
         if args.get("cashier_id"):
@@ -872,56 +1030,74 @@ class AIToolbox:
 
     @classmethod
     def _t_get_shift(cls, args):
-        s = (Shift.objects.filter(is_deleted=False, id=args.get("shift_id"))
-             .select_related("user", "shift_template", "reconciliation").first())
+        shifts = Shift.objects.filter(is_deleted=False, id=args.get("shift_id"))
+        shifts = _scope_orders(shifts, args)
+        s = shifts.select_related(
+            "user", "shift_template", "reconciliation",
+        ).first()
         if s is None:
             return {"error": "shift not found", "args": args}
         return _shift_dict(s, with_orders=True)
 
     @classmethod
     def _t_list_cashiers(cls, args):
+        context = _context(args)
         qs = User.objects.filter(is_deleted=False)
         if args.get("role"):
             qs = qs.filter(role=str(args["role"]).upper())
         if args.get("only_on_shift"):
             # Filter at the DB level (before slicing) so an on-shift cashier past
             # the page cap isn't silently dropped from a "who is working" answer.
-            qs = qs.filter(shifts__is_deleted=False,
-                           shifts__status=Shift.Status.ACTIVE).distinct()
+            shift_filters = {
+                'shifts__is_deleted': False,
+                'shifts__status': Shift.Status.ACTIVE,
+            }
+            if context.branch_id:
+                shift_filters['shifts__branch_id'] = context.branch_id
+            qs = qs.filter(**shift_filters).distinct()
         total = qs.count()
         limit = _clamp(args.get("limit"), MAX_LIST, 1, MAX_LIST)
         offset = _clamp(args.get("offset"), 0, 0, _OFFSET_MAX)
         rows = list(qs.order_by("first_name", "last_name")[offset:offset + limit])
         return {"total_matching": total, "returned": len(rows), "offset": offset, "limit": limit,
-                "cashiers": [_cashier_dict(u) for u in rows]}
+                "cashiers": [_cashier_dict(u, branch_id=context.branch_id) for u in rows]}
 
     @classmethod
     def _t_get_cashier(cls, args):
+        context = _context(args)
         u = User.objects.filter(is_deleted=False, id=args.get("cashier_id")).first()
         if u is None:
             return {"error": "cashier not found", "args": args}
-        data = _cashier_dict(u)
+        data = _cashier_dict(u, branch_id=context.branch_id)
         _lo, _hi = _bd_range_window(_bd_today() - timedelta(days=29), _bd_today())
-        perf = Order.objects.filter(
+        perf_orders = Order.objects.filter(
             is_deleted=False, cashier=u, created_at__gte=_lo, created_at__lt=_hi,
-        ).aggregate(
+        )
+        perf = scope_branch(perf_orders, context.branch_id).aggregate(
             orders=Count("id"),
-            revenue=Sum("total_amount", filter=_REV),
-            avg=Avg("total_amount", filter=_REV),
             completed=Count("id", filter=Q(status="COMPLETED")),
             canceled=Count("id", filter=Q(status="CANCELED")),
         )
+        sales = Order.objects.filter(
+            is_deleted=False, cashier=u, is_paid=True,
+            paid_at__gte=_lo, paid_at__lt=_hi,
+        ).exclude(status=Order.Status.CANCELED)
+        sales = scope_branch(sales, context.branch_id).aggregate(
+            revenue=Sum("total_amount"), avg=Avg("total_amount"),
+        )
         data["performance_30d"] = {
             "orders": perf["orders"] or 0,
-            "paid_revenue_uzs": _f(perf["revenue"]),
-            "avg_order_uzs": _f(perf["avg"]),
+            "paid_revenue_uzs": _f(sales["revenue"]),
+            "avg_order_uzs": _f(sales["avg"]),
             "completed": perf["completed"] or 0,
             "canceled": perf["canceled"] or 0,
         }
-        shifts = (Shift.objects.filter(is_deleted=False, user=u)
+        shifts = Shift.objects.filter(is_deleted=False, user=u)
+        shifts = (scope_branch(shifts, context.branch_id)
                   .select_related("shift_template", "reconciliation").order_by("-start_time")[:10])
         data["recent_shifts"] = [_shift_dict(s) for s in shifts]
-        recent = (Order.objects.filter(is_deleted=False, cashier=u)
+        recent = Order.objects.filter(is_deleted=False, cashier=u)
+        recent = (scope_branch(recent, context.branch_id)
                   .select_related("customer", "table", "place")
                   .prefetch_related("items__product").order_by("-created_at")[:20])
         data["recent_orders"] = [_order_summary(o) for o in recent]
@@ -943,8 +1119,12 @@ class AIToolbox:
 
     @classmethod
     def _t_list_stock(cls, args):
-        qs = (StockLevel.objects.filter(is_deleted=False)
+        context = _context(args)
+        qs = (StockLevel.objects.filter(
+                  is_deleted=False, stock_item__is_deleted=False,
+              )
               .select_related("stock_item", "stock_item__base_unit", "location"))
+        qs = scope_location_owned(qs, context)
         if not args.get("include_inactive"):
             qs = qs.filter(stock_item__is_active=True)
         if args.get("search"):
@@ -971,71 +1151,115 @@ class AIToolbox:
 
     @classmethod
     def _t_sales_report(cls, args):
+        context = _context(args)
         d = _parse_date(args.get("date"))
         df, dt = _parse_date(args.get("date_from")), _parse_date(args.get("date_to"))
         if d:
             df = dt = d
         if not df and not dt:
-            dt = timezone.now().date()
+            dt = _bd_today()
             df = dt - timedelta(days=29)
         elif df and not dt:
             dt = df
         elif dt and not df:
             df = dt
 
-        # Business-day window (03:00 cutover) so the AI's sales report matches the
-        # admin dashboard for the same dates. Volume on created_at; revenue via _REV.
+        # Business-day window (03:00 cutover). Operational volume belongs to the
+        # creation day; settled money and product sales belong to the payment day.
         _lo, _hi = _bd_range_window(df, dt)
-        orders = Order.objects.filter(is_deleted=False, created_at__gte=_lo, created_at__lt=_hi)
+        volume_orders = _scope_orders(Order.objects.filter(
+            is_deleted=False, created_at__gte=_lo, created_at__lt=_hi,
+        ), args)
+        sales_orders = _paid_orders_in(_lo, _hi, args)
         items = OrderItem.objects.filter(
             is_deleted=False, order__is_deleted=False, order__is_paid=True,
-            order__created_at__gte=_lo, order__created_at__lt=_hi,
+            order__paid_at__gte=_lo, order__paid_at__lt=_hi,
         ).exclude(order__status='CANCELED')
+        items = scope_branch(items, context.branch_id, 'order__branch_id')
 
-        totals = orders.aggregate(
+        volume_totals = volume_orders.aggregate(
             orders=Count("id"),
-            revenue=Sum("total_amount", filter=_REV),
-            gross=Sum("total_amount"),
-            avg=Avg("total_amount", filter=_REV),
-            paid=Count("id", filter=Q(is_paid=True)),
-            unpaid=Count("id", filter=Q(is_paid=False)),
+            unpaid=Count(
+                "id",
+                filter=Q(is_paid=False) & ~Q(status=Order.Status.CANCELED),
+            ),
+        )
+        money_totals = sales_orders.aggregate(
+            revenue=Sum("total_amount"),
+            gross=Sum("subtotal"),
+            avg=Avg("total_amount"),
+            paid=Count("id"),
             discount=Sum("discount_amount"),
         )
+
+        day_rows = {}
+        for row in volume_orders.annotate(
+            day=business_day_date_expr("created_at"),
+        ).values("day").annotate(c=Count("id")):
+            day_rows[row['day']] = {'orders': row['c'], 'revenue': 0}
+        for row in sales_orders.annotate(
+            day=business_day_date_expr("paid_at"),
+        ).values("day").annotate(rev=Sum("total_amount")):
+            day_rows.setdefault(
+                row['day'], {'orders': 0, 'revenue': 0},
+            )['revenue'] = row['rev'] or 0
         by_day = [{
-            "date": r["day"].isoformat() if r["day"] else None,
-            "orders": r["c"], "revenue_uzs": _f(r["rev"]),
-        } for r in orders.annotate(day=TruncDate("created_at")).values("day").annotate(
-            c=Count("id"), rev=Sum("total_amount", filter=_REV)).order_by("day")]
-        by_cashier = [{
-            "cashier": f"{r['cashier__first_name']} {r['cashier__last_name']}".strip(),
-            "cashier_id": r["cashier__id"], "orders": r["c"], "revenue_uzs": _f(r["rev"]),
-        } for r in orders.filter(cashier__isnull=False).values(
-            "cashier__id", "cashier__first_name", "cashier__last_name").annotate(
-            c=Count("id"), rev=Sum("total_amount", filter=_REV)).order_by("-rev")]
+            "date": day.isoformat() if day else None,
+            "orders": day_rows[day]['orders'],
+            "revenue_uzs": _f(day_rows[day]['revenue']),
+        } for day in sorted(day_rows, key=lambda value: value or df)]
+
+        cashier_rows = {}
+        for row in volume_orders.filter(cashier__isnull=False).values(
+            "cashier__id", "cashier__first_name", "cashier__last_name",
+        ).annotate(c=Count("id")):
+            cashier_rows[row['cashier__id']] = {
+                'cashier': f"{row['cashier__first_name']} {row['cashier__last_name']}".strip(),
+                'cashier_id': row['cashier__id'], 'orders': row['c'], 'revenue_uzs': 0.0,
+            }
+        for row in sales_orders.filter(cashier__isnull=False).values(
+            "cashier__id", "cashier__first_name", "cashier__last_name",
+        ).annotate(rev=Sum("total_amount")):
+            merged = cashier_rows.setdefault(row['cashier__id'], {
+                'cashier': f"{row['cashier__first_name']} {row['cashier__last_name']}".strip(),
+                'cashier_id': row['cashier__id'], 'orders': 0, 'revenue_uzs': 0.0,
+            })
+            merged['revenue_uzs'] = _f(row['rev'])
+        by_cashier = sorted(
+            cashier_rows.values(),
+            key=lambda row: (-row['revenue_uzs'], row['cashier']),
+        )
         by_category = [{
             "category": r["product__category__name"], "qty": r["q"], "revenue_uzs": _f(r["rev"]),
         } for r in items.values("product__category__name").annotate(
-            q=Sum("quantity"), rev=Sum(F("quantity") * F("price"))).order_by("-rev")[:25]]
+            q=Sum("quantity"), rev=Sum(net_line_revenue())).order_by("-rev")[:25]]
         top_products = [{
             "name": r["product__name"], "qty": r["q"], "revenue_uzs": _f(r["rev"]),
         } for r in items.values("product__name").annotate(
-            q=Sum("quantity"), rev=Sum(F("quantity") * F("price"))).order_by("-rev")[:25]]
-        by_method = {r["payment_method"] or "UNSET": {"orders": r["c"], "revenue_uzs": _f(r["rev"])}
-                     for r in orders.values("payment_method").annotate(
-                         c=Count("id"), rev=Sum("total_amount", filter=_REV))}
-        by_type = {r["order_type"]: r["c"] for r in orders.values("order_type").annotate(c=Count("id"))}
+            q=Sum("quantity"), rev=Sum(net_line_revenue())).order_by("-rev")[:25]]
+        from base.services.tender import breakdown_for_orders
+
+        tender_split, card_detail = breakdown_for_orders(sales_orders)
+        by_method = {
+            method: {"revenue_uzs": _f(amount)}
+            for method, amount in tender_split.items()
+        }
+        by_type = {
+            r["order_type"]: r["c"]
+            for r in volume_orders.values("order_type").annotate(c=Count("id"))
+        }
 
         result = {
             "date_from": df.isoformat(),
             "date_to": dt.isoformat(),
             "totals": {
-                "orders": totals["orders"] or 0,
-                "paid_revenue_uzs": _f(totals["revenue"]),
-                "gross_uzs": _f(totals["gross"]),
-                "avg_order_uzs": _f(totals["avg"]),
-                "paid_orders": totals["paid"] or 0,
-                "unpaid_orders": totals["unpaid"] or 0,
-                "total_discount_uzs": _f(totals["discount"]),
+                "orders": volume_totals["orders"] or 0,
+                "paid_revenue_uzs": _f(money_totals["revenue"]),
+                "gross_uzs": _f(money_totals["gross"]),
+                "avg_order_uzs": _f(money_totals["avg"]),
+                "paid_orders": money_totals["paid"] or 0,
+                "unpaid_orders": volume_totals["unpaid"] or 0,
+                "total_discount_uzs": _f(money_totals["discount"]),
                 "items_sold": items.aggregate(q=Sum("quantity"))["q"] or 0,
             },
             "by_day": by_day,
@@ -1043,14 +1267,28 @@ class AIToolbox:
             "by_category": by_category,
             "top_products": top_products,
             "by_payment_method": by_method,
+            "card_tender_detail": {
+                method: _f(amount) for method, amount in card_detail.items()
+            },
             "by_order_type": by_type,
         }
         if df == dt:
+            hour_rows = {}
+            for row in volume_orders.annotate(
+                h=TruncHour("created_at"),
+            ).values("h").annotate(c=Count("id")):
+                hour_rows[row['h']] = {'orders': row['c'], 'revenue': 0}
+            for row in sales_orders.annotate(
+                h=TruncHour("paid_at"),
+            ).values("h").annotate(rev=Sum("total_amount")):
+                hour_rows.setdefault(
+                    row['h'], {'orders': 0, 'revenue': 0},
+                )['revenue'] = row['rev'] or 0
             result["by_hour"] = [{
-                "hour": r["h"].strftime("%H:%M") if r["h"] else None,
-                "orders": r["c"], "revenue_uzs": _f(r["rev"]),
-            } for r in orders.annotate(h=TruncHour("created_at")).values("h").annotate(
-                c=Count("id"), rev=Sum("total_amount", filter=_REV)).order_by("h")]
+                "hour": hour.strftime("%H:%M") if hour else None,
+                "orders": hour_rows[hour]['orders'],
+                "revenue_uzs": _f(hour_rows[hour]['revenue']),
+            } for hour in sorted(hour_rows, key=lambda value: value or _lo)]
         return result
 
     @classmethod
@@ -1058,14 +1296,15 @@ class AIToolbox:
         from stock.services.ai_assistant_service import AIStockAssistant
         days = int(args.get("days") or 30)
         kind = str(args.get("kind") or "all").lower()
+        location_id = _context(args).location_id
         builders = {
-            "abc": lambda: AIStockAssistant._get_abc_analysis(days),
-            "xyz": lambda: AIStockAssistant._get_xyz_analysis(days),
-            "abc_xyz": lambda: AIStockAssistant._get_abc_xyz_matrix(days),
-            "menu": lambda: AIStockAssistant._get_menu_engineering(days),
-            "profitability": lambda: AIStockAssistant._get_profitability_analysis(days),
-            "inventory_health": lambda: AIStockAssistant._get_inventory_health(days),
-            "sales_velocity": lambda: AIStockAssistant._get_sales_velocity(days),
+            "abc": lambda: AIStockAssistant._get_abc_analysis(days, location_id),
+            "xyz": lambda: AIStockAssistant._get_xyz_analysis(days, location_id),
+            "abc_xyz": lambda: AIStockAssistant._get_abc_xyz_matrix(days, location_id),
+            "menu": lambda: AIStockAssistant._get_menu_engineering(days, location_id),
+            "profitability": lambda: AIStockAssistant._get_profitability_analysis(days, location_id),
+            "inventory_health": lambda: AIStockAssistant._get_inventory_health(days, location_id),
+            "sales_velocity": lambda: AIStockAssistant._get_sales_velocity(days, location_id),
         }
         if kind == "all":
             return {k: _cap_analytics(b()) for k, b in builders.items()}

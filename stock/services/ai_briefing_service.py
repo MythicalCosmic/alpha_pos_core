@@ -35,20 +35,42 @@ class AIBriefingService:
     @classmethod
     def get_or_generate(cls, user_id, location_id=None):
         from base.services.business_day import business_date
+        from stock.services.ai_context import resolve_ai_context
+
+        context, context_error = resolve_ai_context(location_id)
+        if context_error:
+            return {
+                'success': False,
+                'error': 'invalid_location',
+                'message': context_error,
+            }
         bdate = business_date()
+        scope_location_id = context.location_id or 0
         b, created = AIBriefing.objects.get_or_create(
-            user_id=user_id, business_date=bdate, defaults={'bullets': []})
+            user_id=user_id,
+            business_date=bdate,
+            location_id=scope_location_id,
+            defaults={'bullets': []},
+        )
         if created or not b.bullets:
-            b.bullets = cls._compose(location_id)
+            b.bullets = cls._compose(context.location_id)
             b.valid_until = timezone.now() + timedelta(hours=VALID_HOURS)
             b.save(update_fields=['bullets', 'valid_until'])
         return cls._serialize(b)
 
     @classmethod
-    def dismiss(cls, user_id):
+    def dismiss(cls, user_id, location_id=None):
         from base.services.business_day import business_date
-        AIBriefing.objects.filter(
-            user_id=user_id, business_date=business_date()).update(dismissed=True)
+        from stock.services.ai_context import resolve_ai_context
+
+        context, context_error = resolve_ai_context(location_id)
+        if context_error:
+            return False
+        qs = AIBriefing.objects.filter(
+            user_id=user_id, business_date=business_date(),
+            location_id=context.location_id or 0,
+        )
+        qs.update(dismissed=True)
         return True
 
     @staticmethod
@@ -58,6 +80,7 @@ class AIBriefingService:
             'generated_at': b.generated_at.isoformat() if b.generated_at else None,
             'valid_until': b.valid_until.isoformat() if b.valid_until else None,
             'dismissed': b.dismissed,
+            'location_id': b.location_id or None,
             'bullets': b.bullets or [],
         }
 
@@ -72,9 +95,11 @@ class AIBriefingService:
         except Exception:
             logger.exception('briefing: overview failed')
         for key, fn in (
-            ('inventory_health', AIStockAssistant._get_inventory_health),
-            ('menu_engineering', AIStockAssistant._get_menu_engineering),
-            ('sales', AIStockAssistant._get_sales_data),
+            ('inventory_health', lambda: AIStockAssistant._get_inventory_health(
+                location_id=location_id)),
+            ('menu_engineering', lambda: AIStockAssistant._get_menu_engineering(
+                location_id=location_id)),
+            ('sales', lambda: AIStockAssistant._get_sales_data(location_id)),
         ):
             try:
                 snap[key] = fn()

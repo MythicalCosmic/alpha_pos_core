@@ -395,7 +395,10 @@ class NotificationLog(models.Model):
         QUEUED = 'QUEUED', 'Queued'
 
     notification_type = models.CharField(max_length=50)
-    recipient = models.CharField(max_length=50)
+    # A dispatch can target several Telegram chats. Their comma-joined IDs can
+    # legitimately exceed 50 characters; truncating/failing this observability
+    # field must never turn a successfully delivered message into a retry.
+    recipient = models.TextField()
     message_text = models.TextField()
     status = models.CharField(max_length=10, choices=Status.choices)
     error_message = models.TextField(blank=True, default='')

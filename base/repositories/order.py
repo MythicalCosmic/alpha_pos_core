@@ -15,6 +15,26 @@ from base.models import Order, DisplayIdCounter, ChefQueueCounter, SequenceCount
 DISPLAY_ID_WRAP_AT = 100
 
 
+def _window_queryset(qs, field, date_from=None, date_to=None,
+                     tod_from=None, tod_to=None):
+    """Window a metric by the event that actually owns it.
+
+    Order volume/preparation belongs to ``created_at``; money belongs to
+    ``paid_at``. Keeping the field explicit prevents a ticket opened before a
+    cutover but paid afterwards from moving cash into the wrong business day.
+    """
+    if date_from:
+        qs = qs.filter(**{f'{field}__gte': date_from})
+    if date_to:
+        qs = qs.filter(**{f'{field}__lte': date_to})
+    from base.services.business_day import tod_filter
+    return tod_filter(qs, tod_from, tod_to, field=field)
+
+
+def _rows_by_key(rows, key):
+    return {row[key]: row for row in rows}
+
+
 class OrderRepository(BaseSyncRepository):
     model = Order
 
@@ -226,136 +246,280 @@ class OrderRepository(BaseSyncRepository):
     @classmethod
     def get_stats_aggregate(cls, date_from=None, date_to=None, cashier_id=None,
                             product_ids=None, tod_from=None, tod_to=None):
-        qs = cls.model.objects.filter(is_deleted=False)
-        if date_from:
-            qs = qs.filter(created_at__gte=date_from)
-        if date_to:
-            qs = qs.filter(created_at__lte=date_to)
+        qs = _window_queryset(
+            cls.model.objects.filter(is_deleted=False), 'created_at',
+            date_from, date_to, tod_from, tod_to,
+        )
+        paid_qs = _window_queryset(
+            cls.model.objects.filter(
+                is_deleted=False, is_paid=True, paid_at__isnull=False,
+            )
+            .exclude(status=Order.Status.CANCELED),
+            'paid_at', date_from, date_to, tod_from, tod_to,
+        )
         if cashier_id:
             qs = qs.filter(cashier_id=cashier_id)
+            paid_qs = paid_qs.filter(cashier_id=cashier_id)
         if product_ids:
             # Orders CONTAINING any of these products — via a SUBQUERY, not a join,
             # so the Count/Sum aggregates below don't fan out (an order with two
             # matching products would otherwise be counted twice).
             from base.models import OrderItem
-            qs = qs.filter(id__in=OrderItem.objects.filter(
-                is_deleted=False, product_id__in=product_ids).values('order_id'))
-        from base.services.business_day import tod_filter
-        qs = tod_filter(qs, tod_from, tod_to, field='created_at')
+            product_orders = OrderItem.objects.filter(
+                is_deleted=False, product_id__in=product_ids,
+            ).values('order_id')
+            qs = qs.filter(id__in=product_orders)
+            paid_qs = paid_qs.filter(id__in=product_orders)
 
-        return qs.aggregate(
+        stats = qs.aggregate(
             total=Count('id'),
             open=Count('id', filter=Q(status='OPEN')),
             preparing=Count('id', filter=Q(status='PREPARING')),
             ready=Count('id', filter=Q(status='READY')),
             completed=Count('id', filter=Q(status='COMPLETED')),
             cancelled=Count('id', filter=Q(status='CANCELED')),
-            paid=Count('id', filter=Q(is_paid=True)),
             unpaid=Count('id', filter=Q(is_paid=False, status__in=['PREPARING', 'READY', 'COMPLETED'])),
+        )
+        stats.update(paid_qs.aggregate(
             total_revenue=Coalesce(
-                Sum('total_amount', filter=Q(is_paid=True) & ~Q(status='CANCELED')),
-                Decimal('0.00'),
-                output_field=DecimalField()
+                Sum('total_amount'), Decimal('0.00'), output_field=DecimalField(),
             ),
             avg_order_value=Coalesce(
-                Avg('total_amount', filter=Q(is_paid=True) & ~Q(status='CANCELED')),
-                Decimal('0.00'),
-                output_field=DecimalField()
+                Avg('total_amount'), Decimal('0.00'), output_field=DecimalField(),
             ),
-        )
+            paid=Count('id'),
+        ))
+        return stats
 
     @classmethod
     def get_daily_stats(cls, date_from=None, date_to=None, cashier_id=None,
                         tod_from=None, tod_to=None):
-        from base.services.business_day import business_day_date_expr, tod_filter
-        qs = cls.model.objects.filter(is_deleted=False)
-        if date_from:
-            qs = qs.filter(created_at__gte=date_from)
-        if date_to:
-            qs = qs.filter(created_at__lte=date_to)
+        from base.services.business_day import business_day_date_expr
+        qs = _window_queryset(
+            cls.model.objects.filter(is_deleted=False), 'created_at',
+            date_from, date_to, tod_from, tod_to,
+        )
+        paid_qs = _window_queryset(
+            cls.model.objects.filter(
+                is_deleted=False, is_paid=True, paid_at__isnull=False,
+            )
+            .exclude(status=Order.Status.CANCELED),
+            'paid_at', date_from, date_to, tod_from, tod_to,
+        )
         if cashier_id:
             qs = qs.filter(cashier_id=cashier_id)
-        qs = tod_filter(qs, tod_from, tod_to, field='created_at')
+            paid_qs = paid_qs.filter(cashier_id=cashier_id)
 
         # Bucket by BUSINESS date (03:00 cutover), not calendar midnight, so the
         # daily series matches the business-day windowing used everywhere else.
-        return list(qs.annotate(date=business_day_date_expr('created_at')).values('date').annotate(
+        activity = list(qs.annotate(
+            date=business_day_date_expr('created_at'),
+        ).values('date').annotate(
             orders=Count('id'),
-            revenue=Coalesce(Sum('total_amount', filter=Q(is_paid=True) & ~Q(status='CANCELED')), Decimal('0.00'), output_field=DecimalField()),
-            paid=Count('id', filter=Q(is_paid=True)),
             cancelled=Count('id', filter=Q(status='CANCELED')),
-        ).order_by('date'))
+        ))
+        revenue = list(paid_qs.annotate(
+            date=business_day_date_expr('paid_at'),
+        ).values('date').annotate(
+            revenue=Coalesce(
+                Sum('total_amount'), Decimal('0.00'), output_field=DecimalField(),
+            ),
+            paid=Count('id'),
+        ))
+        by_date = _rows_by_key(activity, 'date')
+        for row in revenue:
+            by_date.setdefault(row['date'], {
+                'date': row['date'], 'orders': 0, 'cancelled': 0,
+            }).update(revenue=row['revenue'], paid=row['paid'])
+        for row in by_date.values():
+            row.setdefault('revenue', Decimal('0.00'))
+            row.setdefault('paid', 0)
+        return [
+            by_date[key]
+            for key in sorted(key for key in by_date if key is not None)
+        ]
 
     @classmethod
     def get_monthly_stats(cls, date_from=None, date_to=None):
-        qs = cls.model.objects.filter(is_deleted=False)
-        if date_from:
-            qs = qs.filter(created_at__gte=date_from)
-        if date_to:
-            qs = qs.filter(created_at__lte=date_to)
+        from base.services.business_day import business_day_date_expr
 
-        return list(qs.annotate(month=TruncMonth('created_at')).values('month').annotate(
+        qs = _window_queryset(
+            cls.model.objects.filter(is_deleted=False), 'created_at',
+            date_from, date_to,
+        )
+        paid_qs = _window_queryset(
+            cls.model.objects.filter(
+                is_deleted=False, is_paid=True, paid_at__isnull=False,
+            ).exclude(status=Order.Status.CANCELED),
+            'paid_at', date_from, date_to,
+        )
+        activity = list(qs.annotate(
+            month=TruncMonth(business_day_date_expr('created_at')),
+        ).values('month').annotate(
             orders=Count('id'),
-            revenue=Coalesce(Sum('total_amount', filter=Q(is_paid=True) & ~Q(status='CANCELED')), Decimal('0.00'), output_field=DecimalField()),
-            paid=Count('id', filter=Q(is_paid=True)),
             cancelled=Count('id', filter=Q(status='CANCELED')),
-            avg_order_value=Coalesce(Avg('total_amount', filter=Q(is_paid=True) & ~Q(status='CANCELED')), Decimal('0.00'), output_field=DecimalField()),
-        ).order_by('month'))
+        ))
+        money = list(paid_qs.annotate(
+            month=TruncMonth(business_day_date_expr('paid_at')),
+        ).values('month').annotate(
+            revenue=Coalesce(
+                Sum('total_amount'), Decimal('0.00'), output_field=DecimalField(),
+            ),
+            avg_order_value=Coalesce(
+                Avg('total_amount'), Decimal('0.00'), output_field=DecimalField(),
+            ),
+            paid=Count('id'),
+        ))
+        by_month = _rows_by_key(activity, 'month')
+        for row in money:
+            target = by_month.setdefault(row['month'], {
+                'month': row['month'], 'orders': 0, 'cancelled': 0,
+            })
+            target.update(
+                revenue=row['revenue'], avg_order_value=row['avg_order_value'],
+                paid=row['paid'],
+            )
+        for row in by_month.values():
+            row.setdefault('revenue', Decimal('0.00'))
+            row.setdefault('avg_order_value', Decimal('0.00'))
+            row.setdefault('paid', 0)
+        return [
+            by_month[key]
+            for key in sorted(key for key in by_month if key is not None)
+        ]
 
     @classmethod
     def get_yearly_stats(cls):
-        return list(
-            cls.model.objects.filter(is_deleted=False)
-            .annotate(year=TruncYear('created_at')).values('year').annotate(
-                orders=Count('id'),
-                revenue=Coalesce(Sum('total_amount', filter=Q(is_paid=True) & ~Q(status='CANCELED')), Decimal('0.00'), output_field=DecimalField()),
-                paid=Count('id', filter=Q(is_paid=True)),
-                cancelled=Count('id', filter=Q(status='CANCELED')),
-            ).order_by('year')
-        )
+        from base.services.business_day import business_day_date_expr
+
+        activity = list(cls.model.objects.filter(is_deleted=False).annotate(
+            year=TruncYear(business_day_date_expr('created_at')),
+        ).values('year').annotate(
+            orders=Count('id'),
+            cancelled=Count('id', filter=Q(status='CANCELED')),
+        ))
+        money = list(cls.model.objects.filter(
+            is_deleted=False, is_paid=True, paid_at__isnull=False,
+        ).exclude(status=Order.Status.CANCELED).annotate(
+            year=TruncYear(business_day_date_expr('paid_at')),
+        ).values('year').annotate(
+            revenue=Coalesce(
+                Sum('total_amount'), Decimal('0.00'), output_field=DecimalField(),
+            ),
+            paid=Count('id'),
+        ))
+        by_year = _rows_by_key(activity, 'year')
+        for row in money:
+            by_year.setdefault(row['year'], {
+                'year': row['year'], 'orders': 0, 'cancelled': 0,
+            }).update(revenue=row['revenue'], paid=row['paid'])
+        for row in by_year.values():
+            row.setdefault('revenue', Decimal('0.00'))
+            row.setdefault('paid', 0)
+        return [
+            by_year[key]
+            for key in sorted(key for key in by_year if key is not None)
+        ]
 
     @classmethod
     def get_by_cashier_stats(cls, date_from=None, date_to=None):
-        qs = cls.model.objects.filter(is_deleted=False, cashier__isnull=False)
-        if date_from:
-            qs = qs.filter(created_at__gte=date_from)
-        if date_to:
-            qs = qs.filter(created_at__lte=date_to)
-
-        return list(qs.values(
+        qs = _window_queryset(
+            cls.model.objects.filter(is_deleted=False, cashier__isnull=False),
+            'created_at', date_from, date_to,
+        )
+        paid_qs = _window_queryset(
+            cls.model.objects.filter(
+                is_deleted=False, is_paid=True, paid_at__isnull=False,
+                cashier__isnull=False,
+            ).exclude(status=Order.Status.CANCELED),
+            'paid_at', date_from, date_to,
+        )
+        activity = list(qs.values(
             'cashier_id', 'cashier__first_name', 'cashier__last_name'
         ).annotate(
             orders=Count('id'),
-            revenue=Coalesce(Sum('total_amount', filter=Q(is_paid=True) & ~Q(status='CANCELED')), Decimal('0.00'), output_field=DecimalField()),
-            paid=Count('id', filter=Q(is_paid=True)),
             cancelled=Count('id', filter=Q(status='CANCELED')),
-        ).order_by('-orders'))
+        ))
+        money = list(paid_qs.values(
+            'cashier_id', 'cashier__first_name', 'cashier__last_name',
+        ).annotate(
+            revenue=Coalesce(
+                Sum('total_amount'), Decimal('0.00'), output_field=DecimalField(),
+            ),
+            paid=Count('id'),
+        ))
+        by_cashier = _rows_by_key(activity, 'cashier_id')
+        for row in money:
+            target = by_cashier.setdefault(row['cashier_id'], {
+                'cashier_id': row['cashier_id'],
+                'cashier__first_name': row['cashier__first_name'],
+                'cashier__last_name': row['cashier__last_name'],
+                'orders': 0, 'cancelled': 0,
+            })
+            target['revenue'] = row['revenue']
+            target['paid'] = row['paid']
+        for row in by_cashier.values():
+            row.setdefault('revenue', Decimal('0.00'))
+            row.setdefault('paid', 0)
+        return sorted(
+            by_cashier.values(), key=lambda row: row['orders'], reverse=True,
+        )
 
     @classmethod
     def get_by_status_stats(cls, date_from=None, date_to=None):
-        qs = cls.model.objects.filter(is_deleted=False)
-        if date_from:
-            qs = qs.filter(created_at__gte=date_from)
-        if date_to:
-            qs = qs.filter(created_at__lte=date_to)
-
-        return list(qs.values('status').annotate(
-            count=Count('id'),
-            revenue=Coalesce(Sum('total_amount', filter=Q(is_paid=True) & ~Q(status='CANCELED')), Decimal('0.00'), output_field=DecimalField()),
-        ).order_by('status'))
+        qs = _window_queryset(
+            cls.model.objects.filter(is_deleted=False), 'created_at',
+            date_from, date_to,
+        )
+        paid_qs = _window_queryset(
+            cls.model.objects.filter(
+                is_deleted=False, is_paid=True, paid_at__isnull=False,
+            )
+            .exclude(status=Order.Status.CANCELED),
+            'paid_at', date_from, date_to,
+        )
+        activity = list(qs.values('status').annotate(count=Count('id')))
+        money = list(paid_qs.values('status').annotate(
+            revenue=Coalesce(
+                Sum('total_amount'), Decimal('0.00'), output_field=DecimalField(),
+            ),
+        ))
+        by_status = _rows_by_key(activity, 'status')
+        for row in money:
+            by_status.setdefault(row['status'], {
+                'status': row['status'], 'count': 0,
+            })['revenue'] = row['revenue']
+        for row in by_status.values():
+            row.setdefault('revenue', Decimal('0.00'))
+        return [by_status[key] for key in sorted(by_status)]
 
     @classmethod
     def get_by_order_type_stats(cls, date_from=None, date_to=None):
-        qs = cls.model.objects.filter(is_deleted=False)
-        if date_from:
-            qs = qs.filter(created_at__gte=date_from)
-        if date_to:
-            qs = qs.filter(created_at__lte=date_to)
-
-        return list(qs.values('order_type').annotate(
-            count=Count('id'),
-            revenue=Coalesce(Sum('total_amount', filter=Q(is_paid=True) & ~Q(status='CANCELED')), Decimal('0.00'), output_field=DecimalField()),
-        ).order_by('order_type'))
+        qs = _window_queryset(
+            cls.model.objects.filter(is_deleted=False), 'created_at',
+            date_from, date_to,
+        )
+        paid_qs = _window_queryset(
+            cls.model.objects.filter(
+                is_deleted=False, is_paid=True, paid_at__isnull=False,
+            )
+            .exclude(status=Order.Status.CANCELED),
+            'paid_at', date_from, date_to,
+        )
+        activity = list(qs.values('order_type').annotate(count=Count('id')))
+        money = list(paid_qs.values('order_type').annotate(
+            revenue=Coalesce(
+                Sum('total_amount'), Decimal('0.00'), output_field=DecimalField(),
+            ),
+        ))
+        by_type = _rows_by_key(activity, 'order_type')
+        for row in money:
+            by_type.setdefault(row['order_type'], {
+                'order_type': row['order_type'], 'count': 0,
+            })['revenue'] = row['revenue']
+        for row in by_type.values():
+            row.setdefault('revenue', Decimal('0.00'))
+        return [by_type[key] for key in sorted(by_type)]
 
     @classmethod
     def get_avg_prep_time(cls, date_from=None, date_to=None):
@@ -390,17 +554,38 @@ class OrderRepository(BaseSyncRepository):
                                 tod_from=None, tod_to=None):
         from django.db.models.functions import ExtractHour
         from django.utils import timezone as _tz
-        from base.services.business_day import tod_filter
-        qs = cls.model.objects.filter(is_deleted=False)
-        if date_from:
-            qs = qs.filter(created_at__gte=date_from)
-        if date_to:
-            qs = qs.filter(created_at__lte=date_to)
-        qs = tod_filter(qs, tod_from, tod_to, field='created_at')
+        qs = _window_queryset(
+            cls.model.objects.filter(is_deleted=False), 'created_at',
+            date_from, date_to, tod_from, tod_to,
+        )
+        paid_qs = _window_queryset(
+            cls.model.objects.filter(
+                is_deleted=False, is_paid=True, paid_at__isnull=False,
+            )
+            .exclude(status=Order.Status.CANCELED),
+            'paid_at', date_from, date_to, tod_from, tod_to,
+        )
 
         # Local hour (Asia/Tashkent) — ExtractHour without tzinfo bucketed on UTC,
         # off by the tz offset from the business-day windowing.
-        return list(qs.annotate(hour=ExtractHour('created_at', tzinfo=_tz.get_current_timezone())).values('hour').annotate(
-            count=Count('id'),
-            revenue=Coalesce(Sum('total_amount', filter=Q(is_paid=True) & ~Q(status='CANCELED')), Decimal('0.00'), output_field=DecimalField()),
-        ).order_by('hour'))
+        activity = list(qs.annotate(
+            hour=ExtractHour('created_at', tzinfo=_tz.get_current_timezone()),
+        ).values('hour').annotate(count=Count('id')))
+        money = list(paid_qs.annotate(
+            hour=ExtractHour('paid_at', tzinfo=_tz.get_current_timezone()),
+        ).values('hour').annotate(
+            revenue=Coalesce(
+                Sum('total_amount'), Decimal('0.00'), output_field=DecimalField(),
+            ),
+        ))
+        by_hour = _rows_by_key(activity, 'hour')
+        for row in money:
+            by_hour.setdefault(row['hour'], {
+                'hour': row['hour'], 'count': 0,
+            })['revenue'] = row['revenue']
+        for row in by_hour.values():
+            row.setdefault('revenue', Decimal('0.00'))
+        return [
+            by_hour[key]
+            for key in sorted(key for key in by_hour if key is not None)
+        ]

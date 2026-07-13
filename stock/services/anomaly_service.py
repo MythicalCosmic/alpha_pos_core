@@ -110,7 +110,7 @@ class RevenueDip(Detector):
         from base.services.business_day import range_window
         lo, hi = range_window(d, d)
         agg = (Order.objects.filter(is_deleted=False, is_paid=True,
-                                    created_at__gte=lo, created_at__lt=hi)
+                                    paid_at__gte=lo, paid_at__lt=hi)
                .exclude(status='CANCELED'))
         from django.db.models import Sum
         return agg.aggregate(t=Sum('total_amount'))['t'] or Decimal('0')

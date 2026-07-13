@@ -2,7 +2,6 @@ import logging
 from decimal import Decimal
 from django.apps import apps
 from django.db import transaction
-from django.utils import timezone
 from base.services.sync.config import FK_UUID_MAPPINGS
 
 logger = logging.getLogger(__name__)
@@ -217,10 +216,12 @@ class CloudReceiver:
                 # Collect the orders touched by this batch so staff notifications
                 # fire AFTER the order + its items are all applied (items arrive
                 # in a separate batch after the order — see _notify_received_orders).
-                if instance is not None and action in ('created', 'updated'):
+                if instance is not None:
                     if model_label == 'Order':
                         affected_order_ids.add(instance.id)
                     elif model_label == 'OrderItem' and instance.order_id:
+                        affected_order_ids.add(instance.order_id)
+                    elif model_label == 'OrderPayment' and instance.order_id:
                         affected_order_ids.add(instance.order_id)
             except Exception as e:
                 rec_uuid = record_data.get("uuid")
@@ -231,9 +232,32 @@ class CloudReceiver:
                 logger.error(f'Receive error: {error_msg}')
 
         if affected_order_ids:
+            cls._reconcile_received_order_money(affected_order_ids)
             cls._notify_received_orders(affected_order_ids)
 
         return result
+
+    @staticmethod
+    def _reconcile_received_order_money(order_ids):
+        """Cloud-side backstop for old tills affected by the queue ACK race."""
+        from django.conf import settings
+        if getattr(settings, 'DEPLOYMENT_MODE', '') != 'cloud':
+            return
+        try:
+            from base.services.order_payment_reconciliation import (
+                reconcile_stale_paid_headers,
+            )
+            repaired = reconcile_stale_paid_headers(order_ids)
+            if repaired:
+                logger.warning(
+                    'sync receive repaired %d stale paid order header(s): %s',
+                    len(repaired), ','.join(sorted(repaired)),
+                )
+        except Exception:
+            # Never reject an otherwise valid sync batch because the defensive
+            # invariant check failed. The durable payment/header evidence stays
+            # available for the next delivery or management-command repair.
+            logger.warning('post-receive money reconciliation failed', exc_info=True)
 
     @staticmethod
     def _notify_received_orders(order_ids):
@@ -374,7 +398,11 @@ class CloudReceiver:
                 instance.sync_version = sync_version
                 if not _del_denied:           # SYNC_DENY_FROM_BRANCH guard (e.g. User.is_deleted)
                     instance.is_deleted = is_deleted
-                instance.synced_at = timezone.now()
+                # Keep this version outside the timestamp feed until its
+                # per-record transaction commits.  A NULL row is still served
+                # by /changes, so a process crash before the callback can cause
+                # a duplicate delivery but never a permanently skipped change.
+                instance.synced_at = None
                 # Preserve the record's OWNER on update. Overwriting branch_id
                 # with the pushing branch stole ownership of a cloud-owned record
                 # (a branch editing a cloud-created user re-tagged it 'branch1'),
@@ -385,6 +413,7 @@ class CloudReceiver:
                 instance.save(_syncing=True)
                 _preserve_updated_at(model_class, instance, incoming_updated)
                 _preserve_created_at(model_class, instance, cleaned.get('created_at'))
+                instance._publish_synced_at_after_commit(using=instance._state.db)
                 return instance, 'updated'
 
             except model_class.DoesNotExist:
@@ -413,7 +442,7 @@ class CloudReceiver:
                     instance.sync_version = sync_version
                     if not _del_denied:       # SYNC_DENY_FROM_BRANCH guard (e.g. User.is_deleted)
                         instance.is_deleted = is_deleted
-                    instance.synced_at = timezone.now()
+                    instance.synced_at = None
                     # Reconcile = update of an existing row: preserve its owner
                     # (see the update branch above). Only tag if untagged.
                     if not instance.branch_id:
@@ -421,6 +450,7 @@ class CloudReceiver:
                     instance.save(_syncing=True)
                     _preserve_updated_at(model_class, instance, incoming_updated)
                     _preserve_created_at(model_class, instance, cleaned.get('created_at'))
+                    instance._publish_synced_at_after_commit(using=instance._state.db)
                     return instance, 'updated'
 
                 instance = model_class(
@@ -428,7 +458,7 @@ class CloudReceiver:
                     sync_version=sync_version,
                     is_deleted=is_deleted,
                     branch_id=incoming_branch,
-                    synced_at=timezone.now(),
+                    synced_at=None,
                 )
 
                 for key, value in _strip_denied(model_class, cleaned, creating=True).items():
@@ -440,4 +470,5 @@ class CloudReceiver:
                 instance.save(_syncing=True)
                 _preserve_updated_at(model_class, instance, incoming_updated)
                 _preserve_created_at(model_class, instance, cleaned.get('created_at'))
+                instance._publish_synced_at_after_commit(using=instance._state.db)
                 return instance, 'created'

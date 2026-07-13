@@ -133,7 +133,7 @@ def _dispatch(item, min_interval):
         # Persist the order.new message ids per chat for later reply threading.
         if thread_role == 'new' and order_id and sent_ids:
             _store_message_ids(order_id, sent_ids)
-        NotificationLog.objects.create(
+        _write_log(
             notification_type=notification_type,
             recipient=','.join(str(c) for c in chat_ids),
             message_text=text,
@@ -146,7 +146,7 @@ def _dispatch(item, min_interval):
             QueueService.add(text, notification_type, chat_ids=failed,
                              order_id=order_id, thread_role=thread_role)
     except Exception as e:
-        NotificationLog.objects.create(
+        _write_log(
             notification_type=notification_type,
             recipient=','.join(str(c) for c in chat_ids),
             message_text=text,
@@ -155,6 +155,20 @@ def _dispatch(item, min_interval):
         )
         QueueService.add(text, notification_type,
                          order_id=order_id, thread_role=thread_role)
+
+
+def _write_log(**fields):
+    """Keep notification observability failures out of delivery semantics.
+
+    A Telegram send that succeeded must not be re-queued (and duplicated) just
+    because its audit-log insert failed. The DB/schema problem is logged for
+    operators while transport retries remain driven only by transport results.
+    """
+    try:
+        from notifications.models import NotificationLog
+        NotificationLog.objects.create(**fields)
+    except Exception:
+        logger.exception('failed to persist notification delivery log')
 
 
 def _new_message_ids(order_id):

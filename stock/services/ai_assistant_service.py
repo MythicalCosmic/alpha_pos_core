@@ -2,7 +2,7 @@ from typing import Dict, Any, List
 from datetime import timedelta
 import math
 from django.db.models import Sum, Count, F, Q, Avg, Max
-from django.db.models.functions import TruncDate, TruncHour, TruncWeek
+from django.db.models.functions import Abs, TruncHour, TruncWeek
 from django.utils import timezone
 from django.conf import settings
 import json
@@ -15,7 +15,13 @@ from stock.models import (
 
 from base.models import (
     User, Order, OrderItem, Product, Category,
-    CashRegister, Inkassa, Session
+    Inkassa, Session
+)
+from base.services.business_day import business_day_date_expr
+from base.services.revenue import net_line_revenue
+from stock.services.ai_context import (
+    current_cash_register, resolve_ai_context, scope_branch,
+    scope_location_owned, scope_optional_location_owned,
 )
 
 
@@ -32,7 +38,7 @@ You have full access to sales data, stock/inventory data, AND pre-computed busin
 - GROUND EVERY NUMBER IN REAL DATA. Never estimate, guess, approximate, round from memory, or invent ANY number, name, date, product, or total. Every figure in your answer must come DIRECTLY from the provided data or a tool result - if it is not in the data, you do not know it.
 - USE TOOLS FOR EVERYTHING NUMERIC. When tools are available, CALL them to fetch the exact rows before answering - never answer a numeric/analytics question from the quick overview alone. Call as many tools as needed, page through capped lists, and narrow with filters. First resolve any relative period ("today", "this week", "yesterday", "this month") with the datetime tool, then query that exact range.
 - SHOW AND RE-CHECK THE MATH. For every computed figure (sum, count, average, %, growth, margin, forecast) compute it explicitly from the data and VERIFY it before stating it: the parts must add up to the stated total, a set of shares must sum to ~100%, an average must equal total / count, a growth % must match (new-old)/old. If a check fails, recompute - never publish a number you have not verified.
-- USE PRECISE DEFINITIONS. Revenue = SUM of total_amount for PAID, non-CANCELED orders. Order counts respect exactly the status/date filters asked. Always state the exact date range and any filters behind each figure so it is auditable.
+- USE PRECISE DEFINITIONS. Revenue = SUM of total_amount for PAID, non-CANCELED orders, attributed and bucketed by paid_at. Product sales use order.paid_at. Operational creation/status volume uses created_at. Always state the exact date range and filters so every figure is auditable.
 - NO GAP-FILLING. If the data needed for an exact answer is missing, capped, or ambiguous, say precisely what is missing and answer only what the data supports. Never fill a gap with a plausible-looking number.
 - WHEN UNSURE, DO NOT ASSERT. If you are not certain a figure is exact, say "I don't have that exact number" rather than state it as fact. A wrong number is far worse than an honest "not available".
 
@@ -153,7 +159,7 @@ BUSINESS ANALYTICS (pre-computed, in the data):
 === PREDICTION METHODOLOGY ===
 When forecasting stockouts, ALWAYS show your calculation:
 1. daily_usage = total_consumed_in_period / number_of_days
-2. days_remaining = current_stock / daily_usage
+2. days_remaining = available_stock (on-hand minus reserved) / daily_usage
 3. stockout_date = today + days_remaining
 4. reorder_by = stockout_date - lead_time - 3_days_safety
 
@@ -215,7 +221,9 @@ open and closed shifts, every cashier, every product, all stock, and any date ra
   query_db rather than giving up or approximating. Prefer a specific tool when it already computes
   the exact metric (those are pre-validated); for everything else compute it directly from the data
   with query_db, then VERIFY the result against the ACCURACY rules (recompute, cross-check the
-  totals) before you state it. Never answer "I can't get that" when query_db could fetch it."""
+  totals) before you state it. In query_db, money/product-sales windows MUST use paid_at
+  (order__paid_at for line items), while creation/status volume uses created_at. Never answer
+  "I can't get that" when query_db could fetch it."""
 
 
 class AIStockAssistant:
@@ -224,56 +232,75 @@ class AIStockAssistant:
     # ANTHROPIC_API_KEY), so a model bump is one env var, not a code change.
 
     @classmethod
-    def _get_sales_data(cls) -> Dict:
+    def _get_sales_data(cls, location_id=None) -> Dict:
         """Gather all sales, users, cashier, and business data from the main app."""
-        now = timezone.now()
+        context, context_error = resolve_ai_context(location_id)
+        if context_error:
+            return {"error": context_error}
         # Business-day windows (03:00 cutover) so the AI's today/week/month match
-        # the admin dashboard instead of a plain calendar day. Revenue is attributed
-        # by created_at (order placement), paid and non-cancelled — the reporting
-        # canonical shared with dashboard_service and the SYSTEM_PROMPT definition.
+        # the admin dashboard instead of a plain calendar day. Operational volume
+        # is attributed by created_at; settled money and product sales by paid_at.
         from base.services.business_day import business_date, range_window, today_window
         bd = business_date()
         today_lo, today_hi = today_window()
         week_lo, week_hi = range_window(bd - timedelta(days=6), bd)
         month_lo, month_hi = range_window(bd - timedelta(days=29), bd)
-        # Revenue = paid, not cancelled. Applied to every total_amount Sum/Avg below
-        # so unpaid carts and cancelled tickets never inflate the numbers the AI cites.
-        _REV = Q(is_paid=True) & ~Q(status='CANCELED')
-
         # ── Orders summary ──
-        all_orders = Order.objects.filter(is_deleted=False)
+        all_orders = scope_branch(
+            Order.objects.filter(is_deleted=False), context.branch_id,
+        )
         today_orders = all_orders.filter(created_at__gte=today_lo, created_at__lt=today_hi)
         week_orders = all_orders.filter(created_at__gte=week_lo, created_at__lt=week_hi)
         month_orders = all_orders.filter(created_at__gte=month_lo, created_at__lt=month_hi)
 
-        def order_stats(qs):
-            agg = qs.aggregate(
+        settled_orders = all_orders.filter(is_paid=True).exclude(
+            status=Order.Status.CANCELED,
+        )
+        today_sales = settled_orders.filter(paid_at__gte=today_lo, paid_at__lt=today_hi)
+        week_sales = settled_orders.filter(paid_at__gte=week_lo, paid_at__lt=week_hi)
+        month_sales = settled_orders.filter(paid_at__gte=month_lo, paid_at__lt=month_hi)
+
+        def order_stats(volume_qs, sales_qs):
+            volume = volume_qs.aggregate(
                 count=Count('id'),
-                total_revenue=Sum('total_amount', filter=_REV),
-                avg_order=Avg('total_amount', filter=_REV),
-                paid_count=Count('id', filter=Q(is_paid=True)),
-                unpaid_count=Count('id', filter=Q(is_paid=False)),
+                unpaid_count=Count(
+                    'id',
+                    filter=Q(is_paid=False) & ~Q(status=Order.Status.CANCELED),
+                ),
             )
-            by_status = dict(qs.values_list('status').annotate(c=Count('id')).values_list('status', 'c'))
-            by_type = dict(qs.values_list('order_type').annotate(c=Count('id')).values_list('order_type', 'c'))
+            money = sales_qs.aggregate(
+                total_revenue=Sum('total_amount'),
+                avg_order=Avg('total_amount'),
+                paid_count=Count('id'),
+            )
+            by_status = dict(volume_qs.values_list('status').annotate(c=Count('id')).values_list('status', 'c'))
+            by_type = dict(volume_qs.values_list('order_type').annotate(c=Count('id')).values_list('order_type', 'c'))
             return {
-                "count": agg['count'] or 0,
-                "total_revenue_uzs": float(agg['total_revenue'] or 0),
-                "avg_order_uzs": float(agg['avg_order'] or 0),
-                "paid": agg['paid_count'] or 0,
-                "unpaid": agg['unpaid_count'] or 0,
+                "count": volume['count'] or 0,
+                "total_revenue_uzs": float(money['total_revenue'] or 0),
+                "avg_order_uzs": float(money['avg_order'] or 0),
+                "paid": money['paid_count'] or 0,
+                "unpaid": volume['unpaid_count'] or 0,
                 "by_status": by_status,
                 "by_type": by_type,
             }
 
         # ── Top products (30 days) ──
+        month_items = OrderItem.objects.filter(
+            is_deleted=False, order__is_deleted=False, order__is_paid=True,
+            order__paid_at__gte=month_lo, order__paid_at__lt=month_hi,
+        ).exclude(order__status='CANCELED')
+        month_items = scope_branch(month_items, context.branch_id, 'order__branch_id')
+        today_items = OrderItem.objects.filter(
+            is_deleted=False, order__is_deleted=False, order__is_paid=True,
+            order__paid_at__gte=today_lo, order__paid_at__lt=today_hi,
+        ).exclude(order__status='CANCELED')
+        today_items = scope_branch(today_items, context.branch_id, 'order__branch_id')
+
         top_products = list(
-            OrderItem.objects.filter(
-                order__is_deleted=False, order__is_paid=True,
-                order__created_at__gte=month_lo, order__created_at__lt=month_hi,
-            ).exclude(order__status='CANCELED').values('product__name', 'product__price').annotate(
+            month_items.values('product__name', 'product__price').annotate(
                 qty_sold=Sum('quantity'),
-                revenue=Sum(F('quantity') * F('price'))
+                revenue=Sum(net_line_revenue())
             ).order_by('-revenue')[:15]
         )
         top_products_data = [{
@@ -285,12 +312,9 @@ class AIStockAssistant:
 
         # ── Top products TODAY ──
         top_products_today = list(
-            OrderItem.objects.filter(
-                order__is_deleted=False, order__is_paid=True,
-                order__created_at__gte=today_lo, order__created_at__lt=today_hi,
-            ).exclude(order__status='CANCELED').values('product__name').annotate(
+            today_items.values('product__name').annotate(
                 qty_sold=Sum('quantity'),
-                revenue=Sum(F('quantity') * F('price'))
+                revenue=Sum(net_line_revenue())
             ).order_by('-revenue')[:10]
         )
         top_products_today_data = [{
@@ -301,11 +325,8 @@ class AIStockAssistant:
 
         # ── Category revenue (30 days) ──
         category_revenue = list(
-            OrderItem.objects.filter(
-                order__is_deleted=False, order__is_paid=True,
-                order__created_at__gte=month_lo, order__created_at__lt=month_hi,
-            ).exclude(order__status='CANCELED').values('product__category__name').annotate(
-                revenue=Sum(F('quantity') * F('price')),
+            month_items.values('product__category__name').annotate(
+                revenue=Sum(net_line_revenue()),
                 qty_sold=Sum('quantity')
             ).order_by('-revenue')[:10]
         )
@@ -316,7 +337,7 @@ class AIStockAssistant:
         } for c in category_revenue]
 
         # ── Cashier performance (30 days) ──
-        cashier_stats = list(
+        cashier_volume = list(
             all_orders.filter(
                 cashier__isnull=False,
                 created_at__gte=month_lo, created_at__lt=month_hi,
@@ -324,50 +345,72 @@ class AIStockAssistant:
                 'cashier__id', 'cashier__first_name', 'cashier__last_name'
             ).annotate(
                 orders_count=Count('id'),
-                total_revenue=Sum('total_amount', filter=_REV),
-                avg_order=Avg('total_amount', filter=_REV),
                 completed=Count('id', filter=Q(status='COMPLETED')),
                 canceled=Count('id', filter=Q(status='CANCELED')),
-            ).order_by('-total_revenue')
+            )
         )
-        cashier_data = [{
-            "name": f"{c['cashier__first_name']} {c['cashier__last_name']}",
-            "orders": c['orders_count'],
-            "revenue_uzs": float(c['total_revenue'] or 0),
-            "avg_order_uzs": float(c['avg_order'] or 0),
-            "completed": c['completed'],
-            "canceled": c['canceled'],
-        } for c in cashier_stats]
+        cashier_money = list(
+            month_sales.filter(cashier__isnull=False).values(
+                'cashier__id', 'cashier__first_name', 'cashier__last_name'
+            ).annotate(
+                total_revenue=Sum('total_amount'), avg_order=Avg('total_amount'),
+            )
+        )
+        cashier_rows = {}
+        for c in cashier_volume:
+            cashier_rows[c['cashier__id']] = {
+                "name": f"{c['cashier__first_name']} {c['cashier__last_name']}",
+                "orders": c['orders_count'], "revenue_uzs": 0.0,
+                "avg_order_uzs": 0.0, "completed": c['completed'],
+                "canceled": c['canceled'],
+            }
+        for c in cashier_money:
+            row = cashier_rows.setdefault(c['cashier__id'], {
+                "name": f"{c['cashier__first_name']} {c['cashier__last_name']}",
+                "orders": 0, "completed": 0, "canceled": 0,
+            })
+            row['revenue_uzs'] = float(c['total_revenue'] or 0)
+            row['avg_order_uzs'] = float(c['avg_order'] or 0)
+        cashier_data = sorted(
+            cashier_rows.values(),
+            key=lambda row: (-row['revenue_uzs'], row['name']),
+        )
 
         # ── Hourly distribution today ──
-        hourly = list(
-            today_orders.annotate(
-                hour=TruncHour('created_at')
-            ).values('hour').annotate(
-                count=Count('id'),
-                revenue=Sum('total_amount', filter=_REV)
-            ).order_by('hour')
-        )
+        hourly_rows = {}
+        for h in today_orders.annotate(hour=TruncHour('created_at')).values(
+            'hour'
+        ).annotate(count=Count('id')):
+            hourly_rows[h['hour']] = {'orders': h['count'], 'revenue': 0}
+        for h in today_sales.annotate(hour=TruncHour('paid_at')).values(
+            'hour'
+        ).annotate(revenue=Sum('total_amount')):
+            hourly_rows.setdefault(
+                h['hour'], {'orders': 0, 'revenue': 0},
+            )['revenue'] = h['revenue'] or 0
         hourly_data = [{
-            "hour": h['hour'].strftime('%H:%M') if h['hour'] else '',
-            "orders": h['count'],
-            "revenue_uzs": float(h['revenue'] or 0),
-        } for h in hourly]
+            "hour": hour.strftime('%H:%M') if hour else '',
+            "orders": hourly_rows[hour]['orders'],
+            "revenue_uzs": float(hourly_rows[hour]['revenue']),
+        } for hour in sorted(hourly_rows, key=lambda value: value or today_lo)]
 
         # ── Daily trend (7 days) ──
-        daily_trend = list(
-            week_orders.annotate(
-                day=TruncDate('created_at')
-            ).values('day').annotate(
-                count=Count('id'),
-                revenue=Sum('total_amount', filter=_REV)
-            ).order_by('day')
-        )
+        daily_rows = {}
+        for d in week_orders.annotate(
+            day=business_day_date_expr('created_at')
+        ).values('day').annotate(count=Count('id')):
+            daily_rows[d['day']] = {'orders': d['count'], 'revenue': 0}
+        for d in week_sales.annotate(
+            day=business_day_date_expr('paid_at')
+        ).values('day').annotate(revenue=Sum('total_amount')):
+            daily_rows.setdefault(
+                d['day'], {'orders': 0, 'revenue': 0},
+            )['revenue'] = d['revenue'] or 0
         daily_data = [{
-            "date": d['day'].isoformat() if d['day'] else '',
-            "orders": d['count'],
-            "revenue_uzs": float(d['revenue'] or 0),
-        } for d in daily_trend]
+            "date": day.isoformat() if day else '',
+            "orders": daily_rows[day]['orders'],
+            "revenue_uzs": float(daily_rows[day]['revenue']),
+        } for day in sorted(daily_rows, key=lambda value: value or bd)]
 
         # ── Users ──
         user_counts = User.objects.filter(is_deleted=False).aggregate(
@@ -396,12 +439,15 @@ class AIStockAssistant:
         } for u in recent_logins]
 
         # ── Cash register ──
-        cash = CashRegister.objects.first()
-        cash_balance = float(cash.current_balance) if cash else 0
+        cash = current_cash_register(context.branch_id)
+        cash_balance = float(cash.current_balance) if cash else None
 
         # ── Inkassa (recent) ──
+        inkassa_qs = scope_branch(
+            Inkassa.objects.filter(is_deleted=False), context.branch_id,
+        )
         recent_inkassa = list(
-            Inkassa.objects.filter(is_deleted=False).order_by('-created_at').values(
+            inkassa_qs.order_by('-created_at').values(
                 'cashier__first_name', 'cashier__last_name',
                 'amount', 'inkass_type', 'balance_before', 'balance_after',
                 'total_orders', 'total_revenue', 'created_at'
@@ -423,9 +469,9 @@ class AIStockAssistant:
         categories_count = Category.objects.filter(is_deleted=False, status='ACTIVE').count()
 
         return {
-            "today": order_stats(today_orders),
-            "this_week": order_stats(week_orders),
-            "this_month": order_stats(month_orders),
+            "today": order_stats(today_orders, today_sales),
+            "this_week": order_stats(week_orders, week_sales),
+            "this_month": order_stats(month_orders, month_sales),
             "top_products_30_days": top_products_data,
             "top_products_today": top_products_today_data,
             "category_revenue": category_data,
@@ -436,19 +482,25 @@ class AIStockAssistant:
             "active_sessions": active_sessions,
             "recent_logins": recent_login_data,
             "cash_register_balance_uzs": cash_balance,
+            "cash_register_branch_id": cash.branch_id if cash else context.branch_id,
             "recent_inkassa": inkassa_data,
             "total_products": products_count,
             "total_categories": categories_count,
         }
 
     @classmethod
-    def _get_all_stock_data(cls) -> Dict:
-        today = timezone.now().date()
+    def _get_all_stock_data(cls, location_id=None) -> Dict:
+        context, context_error = resolve_ai_context(location_id)
+        if context_error:
+            return {"error": context_error}
+        today = timezone.localdate()
         thirty_days_ago = today - timedelta(days=30)
 
         levels = StockLevel.objects.filter(
-            is_deleted=False, stock_item__is_active=True
+            is_deleted=False, stock_item__is_deleted=False,
+            stock_item__is_active=True,
         ).select_related("stock_item", "location", "stock_item__base_unit")
+        levels = scope_location_owned(levels, context)
 
         stock_items = []
         total_value = 0
@@ -488,7 +540,9 @@ class AIStockAssistant:
             expiry_date__lte=today + timedelta(days=14),
             expiry_date__gt=today,
             current_quantity__gt=0
-        ).select_related("stock_item", "location")[:30]
+        ).select_related("stock_item", "location")
+        expiring = scope_location_owned(expiring, context)
+        expiring = expiring[:30]
 
         expiring_batches = [{
             "item": b.stock_item.name,
@@ -503,9 +557,11 @@ class AIStockAssistant:
 
         expired = StockBatch.objects.filter(
             is_deleted=False,
-            expiry_date__lt=today,
+            expiry_date__lte=today,
             current_quantity__gt=0
-        ).select_related("stock_item", "location")[:20]
+        ).select_related("stock_item", "location")
+        expired = scope_location_owned(expired, context)
+        expired = expired[:20]
 
         expired_batches = [{
             "item": b.stock_item.name,
@@ -522,10 +578,13 @@ class AIStockAssistant:
             is_deleted=False,
             movement_type__in=["SALE_OUT", "PRODUCTION_OUT"],
             created_at__date__gte=thirty_days_ago
-        ).values("stock_item__name", "stock_item__base_unit__short_name").annotate(
+        )
+        consumption = scope_location_owned(consumption, context)
+        consumption = consumption.values("stock_item__name", "stock_item__base_unit__short_name").annotate(
             total=Sum("base_quantity"),
+            usage=Abs(Sum("base_quantity")),
             count=Count("id")
-        ).order_by("total")[:30]
+        ).order_by("-usage", "stock_item__name")[:30]
 
         consumption_data = [{
             "item": c["stock_item__name"],
@@ -539,11 +598,11 @@ class AIStockAssistant:
         for c in consumption_data:
             item_levels = [s for s in stock_items if s["name"] == c["item"]]
             if item_levels and c["daily_avg"] > 0:
-                current = sum(s["quantity"] for s in item_levels)
+                current = max(sum(s["available"] for s in item_levels), 0)
                 days = int(current / c["daily_avg"]) if c["daily_avg"] > 0 else 999
                 forecasts.append({
                     "item": c["item"],
-                    "current_stock": current,
+                    "available_stock": current,
                     "unit": c["unit"],
                     "daily_usage": c["daily_avg"],
                     "days_until_stockout": days,
@@ -552,10 +611,13 @@ class AIStockAssistant:
                 })
         forecasts.sort(key=lambda x: x["days_until_stockout"])
 
-        suppliers = Supplier.objects.filter(is_active=True)[:20]
+        suppliers = Supplier.objects.filter(is_active=True, is_deleted=False)[:20]
         supplier_data = []
         for s in suppliers:
-            items = SupplierStockItem.objects.filter(supplier=s).select_related("stock_item", "unit")[:10]
+            items = SupplierStockItem.objects.filter(
+                supplier=s, is_deleted=False,
+                stock_item__is_deleted=False, stock_item__is_active=True,
+            ).select_related("stock_item", "unit")[:10]
             supplier_data.append({
                 "name": s.name,
                 "contact": s.contact_person,
@@ -570,8 +632,11 @@ class AIStockAssistant:
             })
 
         pending_pos = PurchaseOrder.objects.filter(
-            status__in=["SENT", "CONFIRMED", "PARTIAL"]
-        ).select_related("supplier")[:15]
+            is_deleted=False, status__in=["SENT", "CONFIRMED", "PARTIAL"],
+        ).select_related("supplier", "delivery_location")
+        pending_pos = scope_location_owned(
+            pending_pos, context, field='delivery_location',
+        )[:15]
 
         purchase_orders = [{
             "number": po.order_number,
@@ -582,34 +647,65 @@ class AIStockAssistant:
             "expected": po.expected_date.isoformat() if po.expected_date else None
         } for po in pending_pos]
 
-        recipes = Recipe.objects.filter(is_active=True).prefetch_related("ingredients__stock_item", "ingredients__unit")[:15]
+        recipes = Recipe.objects.filter(
+            is_deleted=False, is_active=True, is_active_version=True,
+            output_item__is_deleted=False, output_item__is_active=True,
+        ).select_related(
+            "output_item", "output_unit", "production_location",
+        )
+        recipes = scope_optional_location_owned(
+            recipes, context, field='production_location',
+        )[:15]
+        from stock.services.recipe_service import RecipeService
         recipe_data = []
         for r in recipes:
             ingredients = []
-            total_cost = 0
-            for ing in r.ingredients.all():
-                cost = float(ing.stock_item.avg_cost_price * ing.quantity)
-                total_cost += cost
-                avail = StockLevel.objects.filter(is_deleted=False, stock_item=ing.stock_item).aggregate(t=Sum("quantity"))["t"] or 0
+            breakdown = RecipeService.ingredient_cost_breakdown(r)
+            total_cost = RecipeService.calculate_recipe_cost(r)
+            for row in breakdown:
+                ing = row['ingredient']
+                available_levels = StockLevel.objects.filter(
+                    is_deleted=False, stock_item=ing.stock_item,
+                )
+                available_levels = scope_location_owned(available_levels, context)
+                avail = available_levels.aggregate(
+                    t=Sum(F("quantity") - F("reserved_quantity")),
+                )["t"] or 0
                 ingredients.append({
                     "item": ing.stock_item.name,
-                    "qty": float(ing.quantity),
+                    "qty": float(row['quantity_with_waste']),
                     "unit": ing.unit.short_name,
-                    "cost_uzs": cost,
+                    "base_qty": float(row['base_quantity']),
+                    "base_unit": ing.stock_item.base_unit.short_name,
+                    "waste_percentage": float(ing.waste_percentage),
+                    "optional": ing.is_optional,
+                    "cost_uzs": float(row['cost']),
                     "available": float(avail),
-                    "enough": float(avail) >= float(ing.quantity)
+                    "enough": avail >= row['base_quantity'],
                 })
+            effective_output = RecipeService.effective_output_quantity(r)
+            portion_cost = RecipeService.calculate_portion_cost(
+                r, quantity=1, unit_id=r.output_unit_id,
+            )
             recipe_data.append({
                 "name": r.name,
                 "output_qty": float(r.output_quantity),
+                "effective_output_qty": float(effective_output),
                 "output_unit": r.output_unit.short_name if r.output_unit else "",
-                "total_cost_uzs": total_cost,
-                "cost_per_unit_uzs": total_cost / float(r.output_quantity) if r.output_quantity else 0,
+                "yield_percentage": float(r.yield_percentage),
+                "total_cost_uzs": float(total_cost),
+                "cost_per_unit_uzs": float(portion_cost),
                 "ingredients": ingredients,
-                "can_produce": all(i["enough"] for i in ingredients)
+                "can_produce": all(
+                    i["optional"] or i["enough"] for i in ingredients
+                )
             })
 
-        locations = list(StockLocation.objects.values("name", "type"))
+        locations = StockLocation.objects.filter(is_deleted=False)
+        locations = scope_branch(locations, context.branch_id)
+        if context.location_id:
+            locations = locations.filter(id=context.location_id)
+        locations = list(locations.values("name", "type"))
 
         return {
             "summary": {
@@ -635,19 +731,24 @@ class AIStockAssistant:
         }
 
     @classmethod
-    def _get_abc_analysis(cls, days: int = 30) -> List[Dict]:
+    def _get_abc_analysis(cls, days: int = 30, location_id=None) -> List[Dict]:
         """ABC Analysis: classify stock items by consumption value.
         A = top items contributing to 80% of total value
         B = next items contributing to 15%
         C = remaining items contributing to 5%
         """
-        cutoff = timezone.now().date() - timedelta(days=days)
+        context, context_error = resolve_ai_context(location_id)
+        if context_error:
+            return {"error": context_error, "items": [], "summary": {}}
+        cutoff = timezone.localdate() - timedelta(days=days)
 
         consumption = StockTransaction.objects.filter(
             is_deleted=False,
             movement_type__in=["SALE_OUT", "PRODUCTION_OUT"],
             created_at__date__gte=cutoff
-        ).values(
+        )
+        consumption = scope_location_owned(consumption, context)
+        consumption = consumption.values(
             "stock_item__id", "stock_item__name", "stock_item__sku",
             "stock_item__base_unit__short_name"
         ).annotate(
@@ -676,16 +777,16 @@ class AIStockAssistant:
 
         cumulative = 0
         for item in items:
-            item["pct_of_total"] = round(item["total_value_uzs"] / grand_total * 100, 2)
-            cumulative += item["pct_of_total"]
-            item["cumulative_pct"] = round(cumulative, 2)
-
-            if cumulative <= 80:
+            pct = item["total_value_uzs"] / grand_total * 100
+            if cumulative < 80:
                 item["abc_class"] = "A"
-            elif cumulative <= 95:
+            elif cumulative < 95:
                 item["abc_class"] = "B"
             else:
                 item["abc_class"] = "C"
+            cumulative += pct
+            item["pct_of_total"] = round(pct, 2)
+            item["cumulative_pct"] = round(cumulative, 2)
 
         a_count = sum(1 for i in items if i["abc_class"] == "A")
         b_count = sum(1 for i in items if i["abc_class"] == "B")
@@ -704,19 +805,24 @@ class AIStockAssistant:
         }
 
     @classmethod
-    def _get_xyz_analysis(cls, days: int = 30) -> Dict:
+    def _get_xyz_analysis(cls, days: int = 30, location_id=None) -> Dict:
         """XYZ Analysis: classify stock items by demand stability.
         Uses coefficient of variation (CV = stddev / mean) of weekly consumption.
         X = stable (CV < 0.5), Y = variable (0.5-1.0), Z = unpredictable (CV > 1.0)
         """
-        cutoff = timezone.now().date() - timedelta(days=days)
+        context, context_error = resolve_ai_context(location_id)
+        if context_error:
+            return {"error": context_error, "items": [], "summary": {}}
+        cutoff = timezone.localdate() - timedelta(days=days)
         num_weeks = max(days // 7, 1)
 
         weekly_consumption = StockTransaction.objects.filter(
             is_deleted=False,
             movement_type__in=["SALE_OUT", "PRODUCTION_OUT"],
             created_at__date__gte=cutoff
-        ).annotate(
+        )
+        weekly_consumption = scope_location_owned(weekly_consumption, context)
+        weekly_consumption = weekly_consumption.annotate(
             week=TruncWeek("created_at")
         ).values(
             "stock_item__id", "stock_item__name", "stock_item__sku",
@@ -794,10 +900,10 @@ class AIStockAssistant:
         }
 
     @classmethod
-    def _get_abc_xyz_matrix(cls, days: int = 30) -> Dict:
+    def _get_abc_xyz_matrix(cls, days: int = 30, location_id=None) -> Dict:
         """Combined ABC-XYZ matrix with strategy recommendations."""
-        abc = cls._get_abc_analysis(days)
-        xyz = cls._get_xyz_analysis(days)
+        abc = cls._get_abc_analysis(days, location_id)
+        xyz = cls._get_xyz_analysis(days, location_id)
 
         if not abc or not abc.get("items"):
             return {"matrix": {}, "items": []}
@@ -854,7 +960,7 @@ class AIStockAssistant:
         }
 
     @classmethod
-    def _get_menu_engineering(cls, days: int = 30) -> Dict:
+    def _get_menu_engineering(cls, days: int = 30, location_id=None) -> Dict:
         """Menu Engineering (BCG-style matrix for menu items):
         Stars: high popularity + high margin
         Plow Horses: high popularity + low margin
@@ -862,71 +968,101 @@ class AIStockAssistant:
         Dogs: low popularity + low margin
         """
         from stock.models import ProductStockLink
-        cutoff = timezone.now().date() - timedelta(days=days)
+        from base.services.business_day import business_date, range_window
+        context, context_error = resolve_ai_context(location_id)
+        if context_error:
+            return {"error": context_error, "items": [], "summary": {}}
+        days = max(int(days or 30), 1)
+        end_date = business_date()
+        start_date = end_date - timedelta(days=days - 1)
+        lo, hi = range_window(start_date, end_date)
 
         product_sales = OrderItem.objects.filter(
-            order__is_deleted=False,
-            order__created_at__date__gte=cutoff
+            is_deleted=False, order__is_deleted=False, order__is_paid=True,
+            order__paid_at__gte=lo, order__paid_at__lt=hi,
+        ).exclude(
+            order__status='CANCELED',
         ).values(
             "product__id", "product__name", "product__price",
             "product__category__name"
         ).annotate(
             qty_sold=Sum("quantity"),
-            revenue=Sum(F("quantity") * F("price"))
+            revenue=Sum(net_line_revenue())
         ).order_by("-qty_sold")
+        product_sales = scope_branch(
+            product_sales, context.branch_id, 'order__branch_id',
+        )
 
         if not product_sales:
             return {"items": [], "summary": {}}
 
+        from stock.services.product_link_service import ProductStockLinkService
         items = []
         for ps in product_sales:
             pid = ps["product__id"]
-            selling_price = float(ps["product__price"] or 0)
             qty = ps["qty_sold"] or 0
             revenue = float(ps["revenue"] or 0)
+            # Realized unit revenue (after order-level discounts), not the menu
+            # list price, is the correct margin basis.
+            selling_price = revenue / qty if qty else 0
 
-            ingredient_cost = 0
-            link = ProductStockLink.objects.filter(
-                product_id=pid, is_active=True
-            ).select_related("recipe", "stock_item").first()
-
-            if link:
-                if link.link_type == "RECIPE" and link.recipe:
-                    for ing in link.recipe.ingredients.select_related("stock_item"):
-                        ingredient_cost += float(ing.stock_item.avg_cost_price * ing.quantity)
-                elif link.link_type == "DIRECT_ITEM" and link.stock_item:
-                    ingredient_cost = float(
-                        link.stock_item.avg_cost_price * link.quantity_per_sale
-                    )
-                elif link.link_type == "COMPONENT_BASED":
-                    for comp in link.components.filter(is_default=True).select_related("stock_item"):
-                        ingredient_cost += float(
-                            comp.stock_item.avg_cost_price * comp.quantity
-                        )
-
-            margin = selling_price - ingredient_cost
-            margin_pct = (margin / selling_price * 100) if selling_price > 0 else 0
+            links = ProductStockLink.objects.filter(
+                product_id=pid, is_active=True, is_deleted=False,
+            ).select_related("recipe", "stock_item")
+            # ProductStockLink.product is OneToOne/global. Its sync branch is
+            # provenance, not ownership; branch-scoping can hide the only link
+            # and turn ingredient cost into zero.
+            link = links.first()
+            cost_known = ProductStockLinkService.has_cost_definition(link)
+            ingredient_cost = (
+                float(ProductStockLinkService.calculate_unit_cost(link))
+                if cost_known else None
+            )
+            margin = (
+                selling_price - ingredient_cost if cost_known else None
+            )
+            margin_pct = (
+                margin / selling_price * 100
+                if cost_known and selling_price > 0 else None
+            )
 
             items.append({
                 "product_id": pid,
                 "name": ps["product__name"],
                 "category": ps["product__category__name"],
                 "selling_price_uzs": selling_price,
-                "ingredient_cost_uzs": round(ingredient_cost, 2),
-                "margin_uzs": round(margin, 2),
-                "margin_pct": round(margin_pct, 1),
+                "ingredient_cost_uzs": (
+                    round(ingredient_cost, 2) if cost_known else None
+                ),
+                "cost_known": cost_known,
+                "margin_uzs": round(margin, 2) if cost_known else None,
+                "margin_pct": round(margin_pct, 1) if cost_known else None,
                 "qty_sold": qty,
                 "revenue_uzs": revenue,
-                "profit_uzs": round(margin * qty, 2),
+                "profit_uzs": (
+                    round(revenue - ingredient_cost * qty, 2)
+                    if cost_known else None
+                ),
             })
 
         if not items:
             return {"items": [], "summary": {}}
 
-        avg_qty = sum(i["qty_sold"] for i in items) / len(items)
-        avg_margin_pct = sum(i["margin_pct"] for i in items) / len(items)
+        costed_items = [item for item in items if item['cost_known']]
+        avg_qty = (
+            sum(i["qty_sold"] for i in costed_items) / len(costed_items)
+            if costed_items else 0
+        )
+        avg_margin_pct = (
+            sum(i["margin_pct"] for i in costed_items) / len(costed_items)
+            if costed_items else 0
+        )
 
         for item in items:
+            if not item['cost_known']:
+                item["category_me"] = "Uncosted"
+                item["action"] = "Configure an active stock link before judging margin."
+                continue
             high_pop = item["qty_sold"] >= avg_qty
             high_margin = item["margin_pct"] >= avg_margin_pct
 
@@ -943,7 +1079,11 @@ class AIStockAssistant:
                 item["category_me"] = "Dog"
                 item["action"] = "Consider removing or redesigning with cheaper ingredients."
 
-        items.sort(key=lambda x: x["profit_uzs"], reverse=True)
+        items.sort(key=lambda item: (
+            not item['cost_known'],
+            -(item['profit_uzs'] or 0),
+            item['name'],
+        ))
 
         stars = [i for i in items if i["category_me"] == "Star"]
         plow_horses = [i for i in items if i["category_me"] == "Plow Horse"]
@@ -954,6 +1094,8 @@ class AIStockAssistant:
             "items": items,
             "summary": {
                 "period_days": days,
+                "business_date_from": start_date.isoformat(),
+                "business_date_to": end_date.isoformat(),
                 "total_products": len(items),
                 "avg_qty_threshold": round(avg_qty, 1),
                 "avg_margin_pct_threshold": round(avg_margin_pct, 1),
@@ -961,26 +1103,32 @@ class AIStockAssistant:
                 "plow_horses": len(plow_horses),
                 "puzzles": len(puzzles),
                 "dogs": len(dogs),
-                "total_profit_uzs": sum(i["profit_uzs"] for i in items),
+                "uncosted": len(items) - len(costed_items),
+                "uncosted_revenue_uzs": sum(
+                    i['revenue_uzs'] for i in items if not i['cost_known']
+                ),
+                "total_profit_uzs": sum(i["profit_uzs"] for i in costed_items),
                 "star_names": [i["name"] for i in stars[:10]],
                 "dog_names": [i["name"] for i in dogs[:10]],
             }
         }
 
     @classmethod
-    def _get_profitability_analysis(cls, days: int = 30) -> Dict:
+    def _get_profitability_analysis(cls, days: int = 30, location_id=None) -> Dict:
         """Per-product profitability: selling price vs COGS via recipes/stock links."""
-        me = cls._get_menu_engineering(days)
+        me = cls._get_menu_engineering(days, location_id)
         if not me or not me.get("items"):
             return {"products": [], "summary": {}}
 
         items = me["items"]
+        costed_items = [i for i in items if i.get('cost_known')]
         total_revenue = sum(i["revenue_uzs"] for i in items)
-        total_cogs = sum(i["ingredient_cost_uzs"] * i["qty_sold"] for i in items)
-        total_profit = sum(i["profit_uzs"] for i in items)
+        costed_revenue = sum(i["revenue_uzs"] for i in costed_items)
+        total_cogs = sum(i["ingredient_cost_uzs"] * i["qty_sold"] for i in costed_items)
+        total_profit = sum(i["profit_uzs"] for i in costed_items)
 
-        top_profit = sorted(items, key=lambda x: x["profit_uzs"], reverse=True)[:10]
-        worst_margin = sorted(items, key=lambda x: x["margin_pct"])[:10]
+        top_profit = sorted(costed_items, key=lambda x: x["profit_uzs"], reverse=True)[:10]
+        worst_margin = sorted(costed_items, key=lambda x: x["margin_pct"])[:10]
 
         return {
             "products": [{
@@ -988,6 +1136,7 @@ class AIStockAssistant:
                 "category": i["category"],
                 "selling_price_uzs": i["selling_price_uzs"],
                 "cost_uzs": i["ingredient_cost_uzs"],
+                "cost_known": i["cost_known"],
                 "margin_uzs": i["margin_uzs"],
                 "margin_pct": i["margin_pct"],
                 "qty_sold": i["qty_sold"],
@@ -997,45 +1146,59 @@ class AIStockAssistant:
             "worst_margins": [{"name": i["name"], "margin_pct": i["margin_pct"], "cost_uzs": i["ingredient_cost_uzs"]} for i in worst_margin],
             "summary": {
                 "total_revenue_uzs": total_revenue,
+                "costed_revenue_uzs": costed_revenue,
+                "uncosted_revenue_uzs": total_revenue - costed_revenue,
                 "total_cogs_uzs": total_cogs,
                 "gross_profit_uzs": total_profit,
-                "gross_margin_pct": round(total_profit / total_revenue * 100, 1) if total_revenue > 0 else 0,
-                "products_with_known_cost": sum(1 for i in items if i["ingredient_cost_uzs"] > 0),
-                "products_without_cost": sum(1 for i in items if i["ingredient_cost_uzs"] == 0),
+                "gross_margin_pct": round(total_profit / costed_revenue * 100, 1) if costed_revenue > 0 else None,
+                "products_with_known_cost": len(costed_items),
+                "products_without_cost": len(items) - len(costed_items),
             }
         }
 
     @classmethod
-    def _get_inventory_health(cls, days: int = 30) -> Dict:
+    def _get_inventory_health(cls, days: int = 30, location_id=None) -> Dict:
         """Inventory health metrics: turnover, dead stock, carrying cost, days of supply."""
-        cutoff = timezone.now().date() - timedelta(days=days)
+        context, context_error = resolve_ai_context(location_id)
+        if context_error:
+            return {"error": context_error, "items": [], "summary": {}}
+        cutoff = timezone.localdate() - timedelta(days=days)
 
         levels = StockLevel.objects.filter(
-            is_deleted=False, stock_item__is_active=True
+            is_deleted=False, stock_item__is_deleted=False,
+            stock_item__is_active=True,
         ).select_related("stock_item", "stock_item__base_unit", "location")
+        levels = scope_location_owned(levels, context)
 
-        consumption = dict(
-            StockTransaction.objects.filter(
+        consumption_qs = StockTransaction.objects.filter(
                 is_deleted=False,
                 movement_type__in=["SALE_OUT", "PRODUCTION_OUT"],
                 created_at__date__gte=cutoff
-            ).values("stock_item_id").annotate(
+            )
+        consumption_qs = scope_location_owned(consumption_qs, context)
+        consumption = dict(
+            consumption_qs.values("stock_item_id").annotate(
                 total=Sum("base_quantity")
             ).values_list("stock_item_id", "total")
         )
 
+        movement_qs = scope_location_owned(
+            StockTransaction.objects.filter(is_deleted=False), context,
+        )
         last_movement = dict(
-            StockTransaction.objects.filter(is_deleted=False).values("stock_item_id").annotate(
+            movement_qs.values("stock_item_id").annotate(
                 last=Max("created_at")
             ).values_list("stock_item_id", "last")
         )
 
-        waste = dict(
-            StockTransaction.objects.filter(
+        waste_qs = StockTransaction.objects.filter(
                 is_deleted=False,
                 movement_type__in=["WASTE", "SPOILAGE"],
                 created_at__date__gte=cutoff
-            ).values("stock_item_id").annotate(
+            )
+        waste_qs = scope_location_owned(waste_qs, context)
+        waste = dict(
+            waste_qs.values("stock_item_id").annotate(
                 total=Sum("base_quantity"),
                 cost=Sum("total_cost")
             ).values_list("stock_item_id", "cost")
@@ -1051,13 +1214,14 @@ class AIStockAssistant:
         for level in levels:
             sid = level.stock_item_id
             qty = float(level.quantity)
+            available = max(qty - float(level.reserved_quantity), 0)
             avg_cost = float(level.stock_item.avg_cost_price)
             value = qty * avg_cost
             total_inventory_value += value
 
             used = abs(float(consumption.get(sid, 0)))
             daily_usage = used / days if days > 0 else 0
-            dos = int(qty / daily_usage) if daily_usage > 0 else 999
+            dos = int(available / daily_usage) if daily_usage > 0 else 999
 
             if used > 0:
                 turnover = used / qty if qty > 0 else float("inf")
@@ -1074,6 +1238,7 @@ class AIStockAssistant:
                 "name": level.stock_item.name,
                 "location": level.location.name,
                 "quantity": qty,
+                "available": available,
                 "unit": level.stock_item.base_unit.short_name,
                 "value_uzs": round(value, 2),
                 "daily_usage": round(daily_usage, 2),
@@ -1109,20 +1274,38 @@ class AIStockAssistant:
         }
 
     @classmethod
-    def _get_sales_velocity(cls, days: int = 30) -> Dict:
+    def _get_sales_velocity(cls, days: int = 30, location_id=None) -> Dict:
         """Sales velocity: per-product revenue trend over time."""
-        cutoff = timezone.now().date() - timedelta(days=days)
+        from django.db.models import DateTimeField, ExpressionWrapper
+        from base.services.business_day import business_date, business_day_start, range_window
+        context, context_error = resolve_ai_context(location_id)
+        if context_error:
+            return {"error": context_error, "products": [], "summary": {}}
+        days = max(int(days or 30), 1)
+        end_date = business_date()
+        start_date = end_date - timedelta(days=days - 1)
+        lo, hi = range_window(start_date, end_date)
 
-        weekly = OrderItem.objects.filter(
-            order__is_deleted=False,
-            order__created_at__date__gte=cutoff
-        ).annotate(
-            week=TruncWeek("order__created_at")
-        ).values(
+        sales = OrderItem.objects.filter(
+            is_deleted=False, order__is_deleted=False, order__is_paid=True,
+            order__paid_at__gte=lo, order__paid_at__lt=hi,
+        ).exclude(order__status='CANCELED')
+        sales = scope_branch(sales, context.branch_id, 'order__branch_id')
+        start = business_day_start()
+        shifted_paid = ExpressionWrapper(
+            F('order__paid_at') - timedelta(
+                hours=start.hour, minutes=start.minute, seconds=start.second,
+            ),
+            output_field=DateTimeField(),
+        )
+        weekly = sales.annotate(
+            week=TruncWeek(shifted_paid, tzinfo=timezone.get_current_timezone())
+        )
+        weekly = weekly.values(
             "product__name", "week"
         ).annotate(
             qty=Sum("quantity"),
-            revenue=Sum(F("quantity") * F("price"))
+            revenue=Sum(net_line_revenue())
         ).order_by("product__name", "week")
 
         products = {}
@@ -1169,6 +1352,9 @@ class AIStockAssistant:
             "growing": [{"name": v["name"], "growth_pct": v["growth_pct"]} for v in growing[:10]],
             "declining": [{"name": v["name"], "growth_pct": v["growth_pct"]} for v in declining[:10]],
             "summary": {
+                "period_days": days,
+                "business_date_from": start_date.isoformat(),
+                "business_date_to": end_date.isoformat(),
                 "total_products_analyzed": len(velocity),
                 "growing_count": len(growing),
                 "stable_count": len([v for v in velocity if v["trend"] == "stable"]),
@@ -1210,7 +1396,7 @@ class AIStockAssistant:
         from django.utils import timezone
 
         quota = getattr(django_settings, 'AI_DAILY_QUOTA_PER_USER', cls.DAILY_QUOTA_PER_USER)
-        today = timezone.now().date().isoformat()
+        today = timezone.localdate().isoformat()
         key = f'ai:quota:{user_id}:{today}'
         try:
             current = cache.get(key, 0)
@@ -1343,24 +1529,26 @@ every number on tool results. Follow all language and formatting rules."""
             else:
                 # Snapshot path (Gemini, or the Claude SDK isn't installed): one big
                 # pre-computed context in a single call, no live drill-down.
-                stock_data = cls._get_all_stock_data()
-                sales_data = cls._get_sales_data()
+                stock_data = (cls._get_all_stock_data(location_id)
+                              if location_id is not None else cls._get_all_stock_data())
+                sales_data = (cls._get_sales_data(location_id)
+                              if location_id is not None else cls._get_sales_data())
 
                 combined_data = {
-                    "date": timezone.now().date().isoformat(),
+                    "date": timezone.localdate().isoformat(),
                     "sales_and_business": sales_data,
                     "stock_and_inventory": stock_data,
                 }
 
                 if cls._needs_analytics(query):
                     combined_data["business_analytics"] = {
-                        "abc_analysis": cls._get_abc_analysis(),
-                        "xyz_analysis": cls._get_xyz_analysis(),
-                        "abc_xyz_matrix": cls._get_abc_xyz_matrix(),
-                        "menu_engineering": cls._get_menu_engineering(),
-                        "profitability": cls._get_profitability_analysis(),
-                        "inventory_health": cls._get_inventory_health(),
-                        "sales_velocity": cls._get_sales_velocity(),
+                        "abc_analysis": cls._get_abc_analysis(location_id=location_id),
+                        "xyz_analysis": cls._get_xyz_analysis(location_id=location_id),
+                        "abc_xyz_matrix": cls._get_abc_xyz_matrix(location_id=location_id),
+                        "menu_engineering": cls._get_menu_engineering(location_id=location_id),
+                        "profitability": cls._get_profitability_analysis(location_id=location_id),
+                        "inventory_health": cls._get_inventory_health(location_id=location_id),
+                        "sales_velocity": cls._get_sales_velocity(location_id=location_id),
                     }
 
                 prompt = f"""{preamble}USER QUERY: {query}

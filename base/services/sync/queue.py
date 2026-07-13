@@ -13,7 +13,7 @@ import logging
 import uuid as uuid_module
 
 from collections import defaultdict
-from django.db import transaction
+from django.db import IntegrityError, transaction
 
 from base.services.sync.encoder import serialize_payload
 
@@ -44,13 +44,55 @@ class SyncQueue:
         from base.models import SyncQueueRecord
         record_uuid = _coerce_uuid(uuid_val)
         payload = _serialize_data_field(data)
-        with transaction.atomic():
-            SyncQueueRecord.objects.update_or_create(
-                model_name=model_name,
-                record_uuid=record_uuid,
-                defaults={'payload': payload, 'last_error': ''},
-            )
+        # A queue row is a mutable slot, but every distinct payload in that slot
+        # has its own immutable generation token.  This is what makes a late ACK
+        # safe: the sender can acknowledge the token it actually transmitted,
+        # without deleting a newer edit that arrived while HTTP was in flight.
+        #
+        # Reset retry state only for genuinely new content.  Re-adding the same
+        # poison payload (the reconcile sweep runs every cycle) must not revive
+        # it forever; editing/correcting it should revive it immediately.
+        for create_attempt in range(2):
+            try:
+                with transaction.atomic():
+                    record = (
+                        SyncQueueRecord.objects.select_for_update()
+                        .filter(model_name=model_name, record_uuid=record_uuid)
+                        .first()
+                    )
+                    if record is None:
+                        record = SyncQueueRecord.objects.create(
+                            model_name=model_name,
+                            record_uuid=record_uuid,
+                            payload=payload,
+                        )
+                    elif (_payload_version(payload) is not None
+                          and _payload_version(record.payload) is not None
+                          and _payload_version(payload)
+                          < _payload_version(record.payload)):
+                        # A reconcile/full-push snapshot can be serialized before
+                        # a concurrent save queues a newer version, then reach
+                        # add() afterwards. Never let that late stale writer
+                        # replace the newer payload merely because content differs.
+                        pass
+                    elif record.payload != payload:
+                        record.payload = payload
+                        record.generation = uuid_module.uuid4()
+                        record.attempts = 0
+                        record.last_error = ''
+                        record.save(update_fields=[
+                            'payload', 'generation', 'attempts', 'last_error',
+                            'updated_at',
+                        ])
+                break
+            except IntegrityError:
+                # Two first-time enqueue attempts can both observe an empty slot.
+                # The unique (model_name, record_uuid) constraint picks a winner;
+                # retry once and update/compare the winner under its row lock.
+                if create_attempt:
+                    raise
         logger.debug(f'Sync queued: {model_name} {uuid_val}')
+        return str(record.generation)
 
     @classmethod
     def get_all(cls):
@@ -119,7 +161,39 @@ class SyncQueue:
         qs.delete()
 
     @classmethod
-    def mark_failed(cls, uuid_val, error, model_name=None):
+    def acknowledge(cls, records, model_name):
+        """Delete only queue rows whose generation was actually delivered.
+
+        ``records`` are snapshots returned by :meth:`get_grouped`.  A save may
+        replace the row between snapshot/send/ACK; in that case its generation
+        no longer matches and the newer row deliberately remains queued.
+        Returns the UUID strings whose exact generations were removed.
+        """
+        from base.models import SyncQueueRecord
+
+        expected = cls._expected_generations(records)
+        if not expected:
+            return set()
+
+        with transaction.atomic():
+            rows = list(
+                SyncQueueRecord.objects.select_for_update().filter(
+                    model_name=model_name,
+                    record_uuid__in=list(expected),
+                )
+            )
+            matched = [
+                row for row in rows
+                if expected.get(row.record_uuid) == row.generation
+            ]
+            if matched:
+                SyncQueueRecord.objects.filter(
+                    pk__in=[row.pk for row in matched],
+                ).delete()
+        return {str(row.record_uuid) for row in matched}
+
+    @classmethod
+    def mark_failed(cls, uuid_val, error, model_name=None, generation=None):
         from base.models import SyncQueueRecord
         try:
             record_uuid = _coerce_uuid(uuid_val)
@@ -128,13 +202,18 @@ class SyncQueue:
         qs = SyncQueueRecord.objects.filter(record_uuid=record_uuid)
         if model_name is not None:
             qs = qs.filter(model_name=model_name)
+        if generation is not None:
+            try:
+                qs = qs.filter(generation=_coerce_uuid(generation))
+            except (ValueError, TypeError):
+                return
         qs.update(
             attempts=models_F_plus_one(),
             last_error=str(error)[:500],
         )
 
     @classmethod
-    def mark_batch_failed(cls, uuids, error, model_name=None):
+    def mark_batch_failed(cls, uuids, error, model_name=None, generations=None):
         # Scope by model_name (the unique key's other half) when known so a
         # failure on one model doesn't bump attempts on a different model's row
         # sharing the same record_uuid.
@@ -150,10 +229,33 @@ class SyncQueue:
         qs = SyncQueueRecord.objects.filter(record_uuid__in=coerced)
         if model_name is not None:
             qs = qs.filter(model_name=model_name)
+        if generations is not None:
+            expected = cls._expected_generations(
+                ({'uuid': str(u), 'generation': generations.get(str(u))}
+                 for u in coerced)
+            )
+            # Lock+compare each row: filtering UUIDs and generation tokens as
+            # independent __in lists would allow cross-pair matches.
+            with transaction.atomic():
+                rows = list(qs.select_for_update())
+                matched_pks = [
+                    row.pk for row in rows
+                    if expected.get(row.record_uuid) == row.generation
+                ]
+                if not matched_pks:
+                    return set()
+                SyncQueueRecord.objects.filter(pk__in=matched_pks).update(
+                    attempts=models_F_plus_one(),
+                    last_error=str(error)[:500],
+                )
+            return {
+                str(row.record_uuid) for row in rows if row.pk in matched_pks
+            }
         qs.update(
             attempts=models_F_plus_one(),
             last_error=str(error)[:500],
         )
+        return {str(u) for u in coerced}
 
     @classmethod
     def clear(cls):
@@ -172,14 +274,35 @@ class SyncQueue:
         return {
             'model_name': record.model_name,
             'uuid': str(record.record_uuid),
+            'generation': str(record.generation),
             'data': record.payload,
             'created_at': record.created_at.isoformat() if record.created_at else None,
             'attempts': record.attempts,
             'last_error': record.last_error or None,
         }
 
+    @staticmethod
+    def _expected_generations(records):
+        expected = {}
+        for record in records:
+            try:
+                record_uuid = _coerce_uuid(record.get('uuid'))
+                generation = _coerce_uuid(record.get('generation'))
+            except (AttributeError, ValueError, TypeError):
+                continue
+            expected[record_uuid] = generation
+        return expected
+
 
 def models_F_plus_one():
     # Local helper to keep the import small at module top.
     from django.db.models import F
     return F('attempts') + 1
+
+
+def _payload_version(payload):
+    try:
+        value = payload.get('sync_version')
+        return int(value) if value is not None else None
+    except (AttributeError, TypeError, ValueError):
+        return None

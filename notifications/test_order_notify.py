@@ -144,3 +144,36 @@ def test_worker_stores_new_message_ids_then_replies(server_edition, monkeypatch)
     worker._dispatch({'text': 'READY', 'notification_type': 'order.ready',
                       'order_id': 7, 'thread_role': 'reply'}, 0)
     assert captured['reply_to'] == {'111': 555}
+
+
+@pytest.mark.django_db
+def test_delivery_log_failure_never_requeues_a_successful_send(
+    server_edition, monkeypatch,
+):
+    from django.db.models import TextField
+    from notifications.models import NotificationLog
+    from notifications.services.queue_service import QueueService
+
+    chat_ids = ['1111111111', '2222222222', '3333333333', '4444444444', '5555555555']
+    NotificationSettings.objects.update_or_create(
+        pk=1,
+        defaults={'bot_token': 'x', 'chat_ids': chat_ids, 'is_enabled': True},
+    )
+    monkeypatch.setattr(
+        TelegramService, 'send_to_chats',
+        classmethod(lambda cls, text, chats, reply_to=None: ([], '', {})),
+    )
+    monkeypatch.setattr(
+        NotificationLog.objects, 'create',
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError('log DB unavailable')),
+    )
+    requeued = []
+    monkeypatch.setattr(
+        QueueService, 'add',
+        classmethod(lambda cls, *args, **kwargs: requeued.append((args, kwargs))),
+    )
+
+    worker._dispatch({'text': 'ok', 'notification_type': 'test'}, 0)
+
+    assert requeued == []
+    assert isinstance(NotificationLog._meta.get_field('recipient'), TextField)

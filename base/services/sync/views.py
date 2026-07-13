@@ -305,6 +305,17 @@ def changes(request):
     except (TypeError, ValueError):
         per_page = 1000
 
+    # Freeze the high-water mark *before* reading any model.  Capturing it after
+    # the per-model queries creates a lost-update window: a row committed after
+    # its model was read but before the response timestamp would be absent from
+    # this response yet older than (or equal to) the cursor the client stores.
+    # The next pull would then skip it forever.  The terminal cursor is kept
+    # one database-precision unit behind the cutoff below: an on_commit
+    # publisher can receive the exact same microsecond as ``snapshot_cutoff``,
+    # and a strict ``> since`` cursor must replay that boundary to remain safe.
+    from django.utils import timezone
+    snapshot_cutoff = timezone.now()
+
     models = get_all_models()
     data = {}
     total_records = 0
@@ -320,51 +331,69 @@ def changes(request):
         if not model_class:
             continue
 
-        qs = model_class.objects.all()
-        if since_dt:
-            qs = qs.filter(synced_at__gt=since_dt)
+        base_qs = model_class.objects.all()
         # Exclude the requester's own records in SQL, *before* the page cap.
         # Filtering after slicing would shrink a page below per_page and make
         # has_more / the frontier inconsistent with what was actually sent.
         if requesting_branch:
-            qs = qs.exclude(branch_id=requesting_branch)
-        # Order by synced_at so the page boundary is a well-defined frontier
-        # the client can resume from. Cap at per_page+1 so a long-disconnected
-        # branch cannot OOM the server in a single response.
-        qs = qs.order_by('synced_at')
+            base_qs = base_qs.exclude(branch_id=requesting_branch)
 
-        window = list(qs[:per_page + 1])
-        if len(window) > per_page:
+        # NULL is the crash-safe, not-yet-published state. Serve every NULL row
+        # on *every* pull, including cursored pulls, outside timestamp paging.
+        # This guarantees completeness when a process dies after committing
+        # content but before its on_commit publisher runs. Re-delivery is
+        # idempotent. It also drains legacy NULL populations larger than
+        # per_page in one bootstrap instead of returning the same first page
+        # forever with has_more=True and next_since=None.
+        null_window = list(
+            base_qs.filter(synced_at__isnull=True).order_by('pk')
+        )
+
+        # Only timestamped rows participate in the cursor frontier. Their
+        # publication timestamp is assigned after commit. Anything published
+        # beyond the cutoff belongs to the next pull; an equal-timestamp race is
+        # covered by the one-microsecond terminal-cursor overlap below.
+        timed_qs = base_qs.filter(
+            synced_at__isnull=False,
+            synced_at__lte=snapshot_cutoff,
+        )
+        if since_dt:
+            timed_qs = timed_qs.filter(synced_at__gt=since_dt)
+        timed_qs = timed_qs.order_by('synced_at', 'pk')
+
+        timed_window = list(timed_qs[:per_page + 1])
+        if len(timed_window) > per_page:
             has_more = True
-            frontier = window[per_page - 1].synced_at
-            if frontier is not None:
-                # Re-fetch the whole page up to AND INCLUDING the full frontier
-                # timestamp group. The naive `window[:per_page]` can split a set
-                # of rows that share one exact `synced_at` across the page
-                # boundary; the client then resumes with the strict
-                # `synced_at__gt=frontier` filter and the siblings left past the
-                # cap are skipped forever (silent permanent loss). Bounded:
-                # rows strictly before the frontier are < per_page, and a single
-                # timestamp group is tiny in practice.
-                window = list(qs.filter(synced_at__lte=frontier))
-                if next_since is None or frontier < next_since:
-                    next_since = frontier
-            else:
-                window = window[:per_page]
+            frontier = timed_window[per_page - 1].synced_at
+            # Re-fetch the whole page up to AND INCLUDING the full frontier
+            # timestamp group. The naive `window[:per_page]` can split a set of
+            # rows that share one exact timestamp; a subsequent strict `>`
+            # cursor would then skip its siblings forever.
+            timed_window = list(timed_qs.filter(synced_at__lte=frontier))
+            if next_since is None or frontier < next_since:
+                next_since = frontier
+
+        window = null_window + timed_window
 
         records = [obj.to_sync_dict() for obj in window]
         if records:
             data[name] = records
             total_records += len(records)
 
-    from django.utils import timezone
+    # PostgreSQL and Django datetimes have microsecond precision. Returning the
+    # cutoff itself would assume a later publication is strictly newer, which
+    # wall-clock precision cannot guarantee. Replay the boundary microsecond;
+    # receiving an idempotent duplicate is safe, losing a change is not.
+    from datetime import timedelta
+    resume_cutoff = snapshot_cutoff - timedelta(microseconds=1)
+
     return JsonResponse({
         'success': True,
         'data': data,
         'total_records': total_records,
         'has_more': has_more,
         'next_since': next_since.isoformat() if next_since else None,
-        'server_timestamp': timezone.now().isoformat(),
+        'server_timestamp': resume_cutoff.isoformat(),
     })
 
 

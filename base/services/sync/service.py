@@ -73,6 +73,9 @@ class SyncService:
             total_failed = 0
             errors = []
             synced_uuids = []
+            # Exact queue snapshots confirmed by the receiver. Keep their
+            # generation + payload version, not only UUID: a save may replace a
+            # queue slot while its older HTTP request is in flight.
             confirmed_by_model = {}
             batch_size = get_sync_batch_size()
 
@@ -91,6 +94,9 @@ class SyncService:
                     batch = records[i:i + batch_size]
                     batch_data = [r['data'] for r in batch]
                     batch_uuids = [r['uuid'] for r in batch]
+                    batch_generations = {
+                        r['uuid']: r.get('generation') for r in batch
+                    }
 
                     result = send_batch(model_name, batch_data)
 
@@ -99,11 +105,18 @@ class SyncService:
                         # batch). Remove ONLY the records the receiver confirmed
                         # and keep the rest queued — purging the whole batch on
                         # the HTTP-200 silently lost the failed rows.
-                        failed = set(result.get('failed_uuids') or [])
-                        confirmed = [u for u in batch_uuids if u not in failed]
+                        failed = {
+                            str(u) for u in (result.get('failed_uuids') or [])
+                        }
+                        confirmed_records = [
+                            r for r in batch if r['uuid'] not in failed
+                        ]
+                        confirmed = [r['uuid'] for r in confirmed_records]
                         synced_uuids.extend(confirmed)
-                        confirmed_by_model.setdefault(model_name, []).extend(confirmed)
-                        total_synced += len(confirmed)
+                        confirmed_by_model.setdefault(model_name, []).extend(
+                            confirmed_records
+                        )
+                        total_synced += len(confirmed_records)
                         if failed:
                             failed_in_batch = [u for u in batch_uuids if u in failed]
                             total_failed += len(failed_in_batch)
@@ -111,6 +124,7 @@ class SyncService:
                                 failed_in_batch,
                                 'receiver rejected record(s) in a partial batch',
                                 model_name=model_name,
+                                generations=batch_generations,
                             )
                             msg = (f'{model_name}: {len(failed_in_batch)} of '
                                    f'{len(batch_uuids)} record(s) rejected by receiver')
@@ -124,32 +138,60 @@ class SyncService:
                         SyncQueue.mark_batch_failed(
                             batch_uuids, result.get('error', 'Unknown'),
                             model_name=model_name,
+                            generations=batch_generations,
                         )
                         logger.warning(f'Sync failed for {model_name}: {result.get("error")}')
                         stop_push = True
                         break
 
+            acknowledged_by_model = {}
             if synced_uuids:
-                # Remove per-model so a confirmed uuid only deletes that model's
-                # queue row (the unique key is (model_name, record_uuid); two
-                # models can share a record_uuid). confirmed_by_model already
-                # carries the model→uuids breakdown the receiver confirmed.
-                for mname, uuids in confirmed_by_model.items():
-                    if uuids:
-                        SyncQueue.remove(uuids, model_name=mname)
+                # Remove per model and exact generation. A confirmed UUID may
+                # already have a newer payload in the same queue slot; that row
+                # must survive this older response.
+                for mname, snapshots in confirmed_by_model.items():
+                    if not snapshots:
+                        continue
+                    acknowledged = SyncQueue.acknowledge(snapshots, mname)
+                    acknowledged_by_model[mname] = [
+                        r for r in snapshots if r['uuid'] in acknowledged
+                    ]
 
-            # Stamp synced_at on the local rows the cloud confirmed so
-            # objects.unsynced() is a meaningful "not yet pushed" signal — both
-            # for status_report and the orphan-reconcile sweep. .update() bypasses
-            # save(), so it won't bump sync_version or re-null synced_at; a later
-            # edit to the row sets synced_at=None again and re-queues it normally.
-            if confirmed_by_model:
+            # Stamp only a live row whose version is exactly what the cloud
+            # confirmed and whose queue slot has no replacement. An edit during
+            # HTTP leaves synced_at NULL and is rebuilt/sent next cycle.
+            if acknowledged_by_model:
                 models_map = get_all_models()
                 now = timezone.now()
-                for mname, uuids in confirmed_by_model.items():
+                from django.db import transaction
+                from base.models import SyncQueueRecord
+                for mname, snapshots in acknowledged_by_model.items():
                     mclass = models_map.get(mname)
-                    if mclass and uuids:
-                        mclass.objects.filter(uuid__in=uuids).update(synced_at=now)
+                    if not mclass:
+                        continue
+                    for snapshot in snapshots:
+                        sent_version = snapshot.get('data', {}).get('sync_version')
+                        if sent_version is None:
+                            continue
+                        with transaction.atomic():
+                            instance = (
+                                mclass.objects.select_for_update()
+                                .filter(
+                                    uuid=snapshot['uuid'],
+                                    sync_version=sent_version,
+                                )
+                                .first()
+                            )
+                            if instance is None:
+                                continue
+                            if SyncQueueRecord.objects.filter(
+                                model_name=mname,
+                                record_uuid=instance.uuid,
+                            ).exists():
+                                continue
+                            mclass.objects.filter(pk=instance.pk).update(
+                                synced_at=now,
+                            )
 
             SyncStatus.set_last_sync(total_synced, total_failed, errors)
 
@@ -191,6 +233,7 @@ class SyncService:
             SyncStatus.set_online(True)
 
             cursor = SyncStatus.get_cursor()
+            persisted_cursor = cursor
 
             models = get_all_models()
             total_created = 0
@@ -200,6 +243,8 @@ class SyncService:
             # yet, keyed by model class. Retried after paging completes so a
             # child fetched on an earlier page than its parent isn't lost.
             deferred_by_model = {}
+            fully_drained = False
+            final_server_ts = None
             # Page through the change set. The server caps each response at
             # per_page and returns has_more + next_since (the frontier that is
             # safe to resume from). We must follow that frontier instead of
@@ -239,10 +284,11 @@ class SyncService:
                 server_ts = result.get('server_timestamp')
 
                 if not has_more:
-                    # Fully drained — advance the persisted cursor to the
-                    # server's snapshot time.
-                    if server_ts:
-                        SyncStatus.set_cursor(server_ts)
+                    # Do not publish the terminal cursor until FK-deferred
+                    # records have been retried below. Advancing now makes an
+                    # unresolved child disappear forever on the next pull.
+                    fully_drained = True
+                    final_server_ts = server_ts
                     break
 
                 if not next_since or next_since == cursor:
@@ -256,11 +302,10 @@ class SyncService:
                     )
                     break
 
-                # The frontier is "complete up to next_since"; persisting it now
-                # makes the paging crash-safe (a mid-loop failure resumes here
-                # instead of re-pulling from the start). Re-applies are
-                # idempotent upserts.
-                SyncStatus.set_cursor(next_since)
+                # Advance in memory only. A child from an earlier page may be
+                # waiting for a parent on a later page. Persisting this frontier
+                # before deferred records resolve would make a crash permanently
+                # skip that child. Re-applying after a crash is idempotent.
                 cursor = next_since
             else:
                 logger.warning('Pull: hit MAX_PAGES (%s); will resume next cycle', MAX_PAGES)
@@ -295,6 +340,14 @@ class SyncService:
                     stuck,
                 )
                 errors.append(f'{stuck} record(s) unresolved (missing parent)')
+
+            # A cursor proves every record at or below it was durably applied.
+            # If anything remains unresolved, retain the cursor from the start
+            # of this run so the server redelivers that evidence next cycle.
+            if not deferred_by_model:
+                cursor_to_persist = final_server_ts if fully_drained else cursor
+                if cursor_to_persist and cursor_to_persist != persisted_cursor:
+                    SyncStatus.set_cursor(cursor_to_persist)
 
             SyncStatus.set_last_pull(total_created, total_updated, [str(e) for e in errors[:1]])
 
@@ -411,13 +464,14 @@ class SyncService:
 
     @classmethod
     def _reconcile_unsynced(cls):
-        """Re-queue any unsynced row that isn't already in the sync queue.
+        """Make every unsynced row's latest payload present in the queue.
 
         Backstop for the on_commit enqueue path: if _queue_for_sync ever fails
         (and it swallows the exception), the row is saved with synced_at=NULL
-        but never enqueued. This sweep, run at the top of push(), makes the
-        queue self-healing without a separate cron. Bounded work after the first
-        run because push() now stamps synced_at on confirmed records.
+        but never enqueued. It also refreshes a pre-existing slot whose payload
+        became stale while SYNC_ON_SAVE was disabled. SyncQueue.add preserves an
+        identical slot's retry state, so this cannot accidentally revive poison
+        content every cycle. Bounded work after confirmed rows are stamped.
         """
         branch = get_branch_id()
         models = get_all_models()
@@ -430,16 +484,16 @@ class SyncService:
                 qs = model_class.objects.unsynced()
                 if branch:
                     qs = qs.filter(branch_id=branch)
-                queued = SyncQueue.queued_uuids_for_model(name)
                 for obj in qs.iterator():
-                    if str(obj.uuid) in queued:
-                        continue
+                    # add() compares content with any existing slot. Identical
+                    # payloads retain their generation/retry count; newer edits
+                    # rotate generation and revive a corrected dead letter.
                     SyncQueue.add(name, str(obj.uuid), obj.to_sync_dict())
                     requeued += 1
             except Exception as e:
                 logger.warning('reconcile unsynced failed for %s: %s', name, e)
         if requeued:
-            logger.info('Sync reconcile: re-queued %d orphaned record(s)', requeued)
+            logger.info('Sync reconcile: refreshed %d unsynced record(s)', requeued)
         return requeued
 
     @classmethod

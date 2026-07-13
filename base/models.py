@@ -49,6 +49,8 @@ class SyncMixin(models.Model):
 
     def save(self, *args, **kwargs):
         syncing = kwargs.pop('_syncing', False)
+        mode = None
+        publish_cloud_change = False
         if not syncing:
             if not self.branch_id and hasattr(settings, 'BRANCH_ID'):
                 self.branch_id = settings.BRANCH_ID
@@ -64,11 +66,17 @@ class SyncMixin(models.Model):
                     # Branch: mark pending so the push worker sends it to the hub.
                     self.synced_at = None
                 elif mode == 'cloud':
-                    # Hub: publish records it originates with a timestamp so the
-                    # /changes cursor hands them to branches on pull. (Records
-                    # RECEIVED from a branch run with _syncing=True and skip this.)
-                    from django.utils import timezone
-                    self.synced_at = timezone.now()
+                    # Commit-boundary publication: the content write itself is
+                    # deliberately invisible to the timestamp cursor.  If we
+                    # stamped ``synced_at`` before the surrounding transaction
+                    # committed, /changes could take a later high-water mark
+                    # while still seeing the old row, then skip this change
+                    # forever after commit.  NULL is also crash-safe: if the
+                    # process dies before the on_commit callback, /changes keeps
+                    # serving NULL rows outside timestamp pagination (duplicate
+                    # delivery is harmless; permanent loss is not).
+                    self.synced_at = None
+                    publish_cloud_change = True
             # When a caller restricts the write with update_fields, the in-memory
             # sync_version bump and synced_at change above must be added to that
             # list or Django silently drops them: the persisted version would
@@ -81,13 +89,53 @@ class SyncMixin(models.Model):
                     forced.add('synced_at')
                 kwargs['update_fields'] = list(set(update_fields) | forced)
         super().save(*args, **kwargs)
+        if publish_cloud_change:
+            self._publish_synced_at_after_commit(using=self._state.db)
         if (not syncing and not self._sync_local_only
-                and self.synced_at is None and self._is_sync_on_save()):
+                and mode == 'local' and self.synced_at is None
+                and self._is_sync_on_save()):
             # Defer queueing until the surrounding transaction commits so a
             # rollback doesn't leave an orphan UUID in the sync queue that
             # the cloud cannot resolve. on_commit fires immediately when no
             # transaction is open.
             transaction.on_commit(self._queue_for_sync)
+
+    def _publish_synced_at_after_commit(self, *, using=None):
+        """Publish this exact committed version to the cloud change feed.
+
+        The caller must already have persisted the content with ``synced_at``
+        set to NULL.  The conditional update prevents an older transaction's
+        late callback from stamping (and thereby acknowledging) a newer save of
+        the same row.  ``synced_at__isnull=True`` also prevents an equal-version
+        callback from overwriting a publication that already won the race.
+        """
+        from django.utils import timezone
+
+        model = type(self)
+        pk = self.pk
+        sync_version = self.sync_version
+
+        def publish():
+            published_at = timezone.now()
+            manager = model._base_manager
+            if using:
+                manager = manager.using(using)
+            updated = manager.filter(
+                pk=pk,
+                sync_version=sync_version,
+                synced_at__isnull=True,
+            ).update(synced_at=published_at)
+            if (updated and self.pk == pk
+                    and self.sync_version == sync_version
+                    and self.synced_at is None):
+                self.synced_at = published_at
+
+        # Content is already durable when this runs. A transient database error
+        # in the publisher must not turn a successful API/save/receive operation
+        # into a reported failure that callers may retry as if content rolled
+        # back. Robust callbacks are logged by Django and leave synced_at=NULL;
+        # the change feed's NULL safety lane will keep serving that version.
+        transaction.on_commit(publish, using=using, robust=True)
 
     @staticmethod
     def _is_sync_on_save():
@@ -1079,14 +1127,13 @@ class Order(SyncMixin, models.Model):
     # Pay-time percent discount (0..100) applied to total_amount at checkout.
     # The amount due the cashier collects is total_amount * (1 - pct/100).
     discount_percent = models.DecimalField(max_digits=5, decimal_places=2, default=0)
-    # Indexed: dashboard/today, forecast/tomorrow, menu-engineering,
-    # shift_performance, 1C export, and the Telegram /status command all
-    # filter by created_at range; without the index every analytics call
-    # is a heap scan on a constantly-growing table.
+    # Operational volume/preparation reports filter by creation time.
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
     updated_at = models.DateTimeField(auto_now=True)
     ready_at = models.DateTimeField(null=True, blank=True)
-    paid_at = models.DateTimeField(null=True, blank=True)
+    # Revenue, tender, product-sales, shift, and anomaly reporting uses the
+    # settlement event. This index keeps those range queries off a growing heap.
+    paid_at = models.DateTimeField(null=True, blank=True, db_index=True)
     # Waiter "send to cashier" signal: stamped when a waiter asks the cashier to
     # collect payment for their (unpaid) order. Advisory only — the cashier
     # screen highlights orders with this set and is_paid=False; it is implicitly
@@ -1747,6 +1794,11 @@ class SyncQueueRecord(models.Model):
 
     model_name = models.CharField(max_length=100, db_index=True)
     record_uuid = models.UUIDField(db_index=True)
+    # Opaque identity for the exact payload currently stored in this queue row.
+    # Every payload replacement rotates the token.  Push acknowledgements carry
+    # the token they sent and may only delete/fail that same generation, so a
+    # late response can never consume a newer edit that reused (model, uuid).
+    generation = models.UUIDField(default=uuid.uuid4, editable=False, db_index=True)
     payload = models.JSONField()
     attempts = models.PositiveIntegerField(default=0)
     last_error = models.TextField(blank=True, default='')
