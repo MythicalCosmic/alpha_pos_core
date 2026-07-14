@@ -231,3 +231,18 @@ def test_active_shift_branch_ownership_is_fail_closed():
 
     with pytest.raises(SettlementInvariantError, match='no branch ownership'):
         lock_active_cashier_shift(cashier.id, branch_id='branch-a')
+
+
+@override_settings(DEPLOYMENT_MODE='cloud', BRANCH_ID='cloud')
+def test_global_cashier_provenance_does_not_override_shift_branch():
+    from base.models import User
+    from base.services.order_refund import lock_active_cashier_shift
+
+    cashier, shift = _cashier_and_shift(branch='branch-a')
+    # User is global sync identity.  Older cloud rows can retain the creating
+    # node's provenance, but operational ownership always comes from Shift.
+    User.objects.filter(pk=cashier.pk).update(branch_id='legacy-cloud-node')
+
+    assert lock_active_cashier_shift(
+        cashier.id, branch_id='branch-a',
+    ).pk == shift.pk

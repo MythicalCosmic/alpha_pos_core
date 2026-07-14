@@ -64,7 +64,9 @@ def lock_active_cashier_shift(cashier_id, *, branch_id=''):
     expected_branch = str(branch_id or '').strip()
     explicit_shift_branch = str(shift.branch_id or '').strip()
     cashier_branch = str(cashier.branch_id or '').strip()
-    cashier_is_global = cashier_branch.lower() == 'cloud'
+    cashier_is_global = (
+        getattr(type(cashier), 'SYNC_PULL_SCOPE', 'branch') == 'global'
+    )
     if (explicit_shift_branch and cashier_branch and not cashier_is_global
             and explicit_shift_branch != cashier_branch):
         raise SettlementInvariantError(
