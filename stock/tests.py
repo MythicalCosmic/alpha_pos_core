@@ -365,7 +365,7 @@ class TestDocumentNumberAllocation:
         from stock.models import StockTransaction
         from stock.services.base_service import generate_number
 
-        date_part = timezone.now().strftime('%Y%m%d')
+        date_part = timezone.localdate().strftime('%Y%m%d')
         StockTransaction.objects.create(
             transaction_number=f'TRX-{date_part}-0007',
             stock_item=stock_item, location=location, unit=base_unit,
