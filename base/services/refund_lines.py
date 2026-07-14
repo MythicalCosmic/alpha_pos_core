@@ -3,8 +3,9 @@ from decimal import Decimal
 
 from django.db.models import (
     Case, DecimalField, ExpressionWrapper, F, FilteredRelation, IntegerField,
-    Q, Value, When,
+    Q, Subquery, Value, When,
 )
+from django.db.models.query import QuerySet
 from django.db.models.functions import NullIf
 
 from base.services.revenue import net_line_revenue
@@ -30,6 +31,12 @@ def refund_item_events(item_queryset=None, **refund_filters):
 
     condition = Q(order__refund__is_deleted=False)
     for lookup, value in refund_filters.items():
+        # FilteredRelation intentionally rejects a QuerySet RHS because its
+        # OuterRef prefixes cannot be safely rewritten.  An explicit PK
+        # subquery preserves the caller's filtered event set without creating
+        # another reverse refund JOIN (and therefore without cartesian sums).
+        if isinstance(value, QuerySet):
+            value = Subquery(value.values('pk'))
         condition &= Q(**{f'order__refund__{lookup}': value})
 
     return (

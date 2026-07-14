@@ -88,6 +88,36 @@ def test_multiple_provider_refunds_are_idempotent_append_only_events():
         first.save(update_fields=['reason'])
 
 
+def test_refund_event_helper_accepts_a_filtered_refund_queryset():
+    from base.models import Category, OrderItem, OrderRefund, Product
+    from base.services.order_refund import record_external_provider_refund
+    from base.services.refund_lines import refund_item_events
+
+    order, _payment = _paid_order()
+    category = Category.objects.create(name='Refund query category')
+    product = Product.objects.create(
+        name='Refund query product', category=category, price='100.00',
+        branch_id=order.branch_id,
+    )
+    OrderItem.objects.create(
+        order=order, product=product, quantity=1, price='100.00',
+        branch_id=order.branch_id,
+    )
+    record_external_provider_refund(
+        order, method='PAYME', amount='40.00', source_id='query-event-1',
+    )
+    record_external_provider_refund(
+        order, method='PAYME', amount='60.00', source_id='query-event-2',
+    )
+    events = OrderRefund.objects.filter(order=order)
+
+    rows = refund_item_events(pk__in=events)
+
+    assert set(rows.values_list('refund_event__pk', flat=True)) == set(
+        events.values_list('pk', flat=True)
+    )
+
+
 def test_product_reporting_allocates_partial_money_without_inventing_returned_units():
     from base.models import Category, OrderItem, Product
     from base.repositories.order_item import OrderItemRepository
