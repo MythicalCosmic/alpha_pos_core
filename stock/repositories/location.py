@@ -1,4 +1,4 @@
-from django.db.models import Q, Sum
+from django.db.models import Q, Sum, F, DecimalField
 from base.repositories.base import BaseSyncRepository
 from stock.models import StockLocation
 
@@ -52,11 +52,13 @@ class StockLocationRepository(BaseSyncRepository):
         qs = cls.model.objects.filter(is_default=True)
         if exclude_id:
             qs = qs.exclude(id=exclude_id)
-        return qs.update(is_default=False)
+        return cls.sync_update_queryset(qs, is_default=False)
 
     @classmethod
     def deactivate_children(cls, location):
-        return location.children.filter(is_active=True).update(is_active=False)
+        return cls.sync_update_queryset(
+            location.children.filter(is_active=True), is_active=False,
+        )
 
     @classmethod
     def has_stock(cls, location):
@@ -68,7 +70,9 @@ class StockLocationRepository(BaseSyncRepository):
     @classmethod
     def reorder(cls, ordered_ids):
         for index, loc_id in enumerate(ordered_ids):
-            cls.model.objects.filter(id=loc_id).update(sort_order=index)
+            cls.sync_update_queryset(
+                cls.model.objects.filter(id=loc_id), sort_order=index,
+            )
 
     @classmethod
     def get_stock_stats(cls, location):
@@ -77,5 +81,11 @@ class StockLocationRepository(BaseSyncRepository):
             location=location, is_deleted=False
         ).aggregate(
             total_qty=Sum('quantity'),
-            total_value=Sum('quantity'),
+            # Inventory value is quantity × moving-average unit cost. The old
+            # implementation returned quantity twice under two different keys,
+            # making a location with 10kg @ 50,000 UZS appear worth 10 UZS.
+            total_value=Sum(
+                F('quantity') * F('stock_item__avg_cost_price'),
+                output_field=DecimalField(max_digits=24, decimal_places=4),
+            ),
         )

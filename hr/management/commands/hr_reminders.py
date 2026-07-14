@@ -12,7 +12,7 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         dry_run = options['dry_run']
-        today = timezone.now().date()
+        today = timezone.localdate()
         from hr.models import EmployeeContract, EmployeeDocument
         from notifications.handlers.hr import HRNotification
 

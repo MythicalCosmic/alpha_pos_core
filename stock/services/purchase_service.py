@@ -297,7 +297,7 @@ class PurchaseOrderService:
         return cls.create(
             supplier_id=supplier_id,
             delivery_location_id=delivery_location_id,
-            order_date=timezone.now().date(),
+            order_date=timezone.localdate(),
             created_by_id=created_by_id,
             items=items_to_order,
             notes="Auto-generated from low stock"
@@ -470,10 +470,18 @@ class PurchaseOrderService:
                 f"Payment {amount} exceeds the remaining balance {remaining}"
             )
 
-        from .supplier_service import SupplierService
-        result, status = SupplierService.update_balance(po.supplier_id, amount, "subtract")
-        if status >= 400:
-            return result, status
+        # The supplier balance is an audited ledger, not a derived PO field.
+        # Posting through the row-locked ledger prevents two payments on
+        # different POs for the same supplier from overwriting one another.
+        # This legacy API has no funding-account argument, so it deliberately
+        # records no guessed SAFE/BANK/DRAWER treasury movement.
+        from .supplier_ledger_service import SupplierLedgerService
+        supplier_txn = SupplierLedgerService.record_purchase_order_payment(
+            po.supplier_id, amount, po.id, note=notes,
+        )
+        if supplier_txn is None:
+            transaction.set_rollback(True)
+            return ServiceResponse.not_found("Supplier not found")
 
         po.amount_paid = po.amount_paid + amount
         if po.amount_paid >= po.total:
@@ -484,7 +492,7 @@ class PurchaseOrderService:
             po.payment_status = PurchaseOrder.PaymentStatus.UNPAID
 
         if notes:
-            po.notes = f"{po.notes}\nPayment recorded: {amount} on {payment_date or timezone.now().date()}".strip()
+            po.notes = f"{po.notes}\nPayment recorded: {amount} on {payment_date or timezone.localdate()}".strip()
 
         po.save(update_fields=["amount_paid", "payment_status", "notes", "updated_at"])
 
@@ -725,7 +733,7 @@ class PurchaseReceivingService:
             receiving_number=receiving_number,
             purchase_order=po,
             location=location,
-            received_date=received_date or timezone.now().date(),
+            received_date=received_date or timezone.localdate(),
             received_by_id=received_by_id,
             status=PurchaseReceiving.Status.DRAFT,
             notes=notes,
@@ -799,6 +807,12 @@ class PurchaseReceivingService:
                     quality_status=item.quality_status,
                 )
                 if batch_status >= 400:
+                    # Returning from an @atomic method commits unless rollback
+                    # is explicitly requested. Earlier receiving items may
+                    # already have changed batches/levels, so an error here
+                    # must unwind the whole receiving, not leave a retryable
+                    # DRAFT with partially received stock.
+                    transaction.set_rollback(True)
                     return batch_result, batch_status
                 batch = StockBatch.objects.get(id=batch_result["data"]["id"])
                 item.batch_created = batch
@@ -819,17 +833,22 @@ class PurchaseReceivingService:
                 notes=f"PO: {po.order_number}",
             )
             if level_status >= 400:
+                transaction.set_rollback(True)
                 return level_result, level_status
 
-            # Apply the increment in SQL so concurrent receipts against the
-            # same PO line don't lose updates. The previous read-modify-write
-            # on `item.po_item.quantity_received` lost increments when two
-            # receivings completed in parallel.
-            from django.db.models import F
+            # Serialize receipts that target the same PO line. A prior
+            # F-expression followed by an unlocked reload/save made the sync
+            # bookkeeping visible, but reintroduced a lost-update window: a
+            # second F increment could land between that reload and save and be
+            # overwritten. Lock the row first, increment the current value, and
+            # use one SyncMixin.save() so both the quantity and sync version are
+            # published atomically.
             PurchaseOrderItem = item.po_item.__class__
-            PurchaseOrderItem.objects.filter(pk=item.po_item_id).update(
-                quantity_received=F('quantity_received') + item.quantity_received,
+            po_item = PurchaseOrderItem.objects.select_for_update().get(
+                pk=item.po_item_id,
             )
+            po_item.quantity_received += item.quantity_received
+            po_item.save(update_fields=['quantity_received'])
 
             from .item_service import StockItemService
             cost_result, cost_status = StockItemService.update_cost(
@@ -837,6 +856,7 @@ class PurchaseReceivingService:
                 received_qty=item.quantity_received,
             )
             if cost_status >= 400:
+                transaction.set_rollback(True)
                 return cost_result, cost_status
 
         rcv.status = PurchaseReceiving.Status.COMPLETED
@@ -931,7 +951,7 @@ class PurchaseReceivingService:
 
         if fully_received:
             po.status = PurchaseOrder.Status.RECEIVED
-            po.received_date = timezone.now().date()
+            po.received_date = timezone.localdate()
         elif partially_received:
             po.status = PurchaseOrder.Status.PARTIAL
 

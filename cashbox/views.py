@@ -14,7 +14,9 @@ from cashbox.services.expense_service import CashboxExpenseService, CashboxCateg
 @pos_staff_required
 def cashbox_expenses(request, shift_id):
     if request.method == "GET":
-        result, status_code = CashboxExpenseService.list_for_shift(shift_id)
+        result, status_code = CashboxExpenseService.list_for_shift(
+            shift_id, actor=request.user,
+        )
         return JsonResponse(result, status=status_code)
 
     data, error = parse_json_body(request)
@@ -27,7 +29,7 @@ def cashbox_expenses(request, shift_id):
         comment=data.get("comment", ""),
         recipient_user_id=data.get("recipient_user_id"),
         recipient_supplier_id=data.get("recipient_supplier_id"),
-        created_by=request.user,
+        actor=request.user,
     )
     return JsonResponse(result, status=status_code)
 
@@ -54,9 +56,19 @@ def recipient_search(request):
     expense recipient field. Returns two grouped lists."""
     from base.models import User
     from stock.models import Supplier
+    branch = str(request.user.branch_id or '').strip()
+    if not branch:
+        return JsonResponse(
+            {'success': False, 'message': 'User has no branch ownership'},
+            status=403,
+        )
     q = (request.GET.get("q") or "").strip()
-    users_qs = User.objects.filter(is_deleted=False, status='ACTIVE')
-    suppliers_qs = Supplier.objects.filter(is_deleted=False, is_active=True)
+    users_qs = User.objects.filter(
+        is_deleted=False, status='ACTIVE', branch_id=branch,
+    )
+    suppliers_qs = Supplier.objects.filter(
+        is_deleted=False, is_active=True, branch_id=branch,
+    )
     if q:
         users_qs = users_qs.filter(
             Q(first_name__icontains=q) | Q(last_name__icontains=q))

@@ -1,5 +1,5 @@
 from typing import Dict, Any, Tuple
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from django.db import transaction
 
 from base.helpers.response import ServiceResponse
@@ -21,6 +21,60 @@ def _pagination_data(page_obj, paginator):
 
 
 class CashTransactionService:
+
+    @staticmethod
+    def _amount(value) -> Tuple[Decimal | None, Tuple[Dict[str, Any], int] | None]:
+        try:
+            amount = Decimal(str(value).strip())
+            rounded = amount.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        except (InvalidOperation, TypeError, ValueError):
+            return None, ServiceResponse.validation_error(
+                errors={'amount': 'Amount must be a valid number'},
+            )
+        if not amount.is_finite() or amount <= 0:
+            return None, ServiceResponse.validation_error(
+                errors={'amount': 'Amount must be greater than zero'},
+            )
+        if amount != rounded:
+            return None, ServiceResponse.validation_error(
+                errors={'amount': 'Amount cannot have more than two decimal places'},
+            )
+        # DecimalField(max_digits=12, decimal_places=2).
+        if rounded > Decimal('9999999999.99'):
+            return None, ServiceResponse.validation_error(
+                errors={'amount': 'Amount is too large'},
+            )
+        return rounded, None
+
+    @staticmethod
+    def _payment_method(value: str) -> Tuple[str, Tuple[Dict[str, Any], int] | None]:
+        """Normalize and validate before deciding whether drawer cash moves.
+
+        Model ``choices`` are not enforced by ``save()``.  Testing the caller's
+        raw string directly against ``"CASH"`` would therefore let values such
+        as ``"cash"`` or an unknown method record a cash transaction without
+        changing the physical drawer.
+        """
+        method = str(value or "").strip().upper()
+        if method not in CashTransaction.PaymentMethod.values:
+            return method, ServiceResponse.validation_error(
+                errors={
+                    "payment_method": (
+                        f"Must be one of {list(CashTransaction.PaymentMethod.values)}"
+                    ),
+                },
+            )
+        return method, None
+
+    @staticmethod
+    def _locked_branch_register() -> CashRegister:
+        """Lock only the configured branch's drawer for a balance snapshot.
+
+        Every ledger row carries the physical cash balance before/after the
+        event, including non-cash events.  Taking the branch-scoped row lock
+        keeps that snapshot coherent while still mutating it only for CASH.
+        """
+        return CashRegisterRepository.get_or_create_current(for_update=True)
 
     @classmethod
     def _serialize(cls, txn: CashTransaction) -> Dict[str, Any]:
@@ -112,21 +166,25 @@ class CashTransactionService:
                 payment_method: str = "CASH",
                 performed_by_id: int = None,
                 notes: str = "") -> Tuple[Dict[str, Any], int]:
-        amount = Decimal(str(amount))
-        if amount <= 0:
-            return ServiceResponse.validation_error(
-                errors={"amount": "Amount must be greater than zero"},
-            )
+        amount, amount_error = cls._amount(amount)
+        if amount_error:
+            return amount_error
 
-        register = CashRegisterRepository.get_current()
-        if not register:
-            return ServiceResponse.error("Cash register not found")
+        payment_method, method_error = cls._payment_method(payment_method)
+        if method_error:
+            return method_error
 
-        register = CashRegister.objects.select_for_update().get(pk=register.pk)
+        register = cls._locked_branch_register()
 
         balance_before = register.current_balance
-        register.current_balance += amount
-        register.save(update_fields=["current_balance", "last_updated"])
+        if payment_method == CashTransaction.PaymentMethod.CASH:
+            new_balance = register.current_balance + amount
+            if new_balance > Decimal('9999999999.99'):
+                return ServiceResponse.validation_error(
+                    errors={'amount': 'Deposit would exceed the register limit'},
+                )
+            register.current_balance = new_balance
+            register.save(update_fields=["current_balance", "last_updated"])
 
         txn = CashTransactionRepository.create(
             type=CashTransaction.TransactionType.DEPOSIT,
@@ -135,6 +193,7 @@ class CashTransactionService:
             payment_method=payment_method,
             balance_before=balance_before,
             balance_after=register.current_balance,
+            branch_id=register.branch_id,
             performed_by_id=performed_by_id,
             notes=notes,
         )
@@ -152,26 +211,25 @@ class CashTransactionService:
                  payment_method: str = "CASH",
                  performed_by_id: int = None,
                  notes: str = "") -> Tuple[Dict[str, Any], int]:
-        amount = Decimal(str(amount))
-        if amount <= 0:
-            return ServiceResponse.validation_error(
-                errors={"amount": "Amount must be greater than zero"},
-            )
+        amount, amount_error = cls._amount(amount)
+        if amount_error:
+            return amount_error
 
-        register = CashRegisterRepository.get_current()
-        if not register:
-            return ServiceResponse.error("Cash register not found")
+        payment_method, method_error = cls._payment_method(payment_method)
+        if method_error:
+            return method_error
 
-        register = CashRegister.objects.select_for_update().get(pk=register.pk)
-
-        if payment_method == "CASH" and register.current_balance < amount:
+        register = cls._locked_branch_register()
+        if (payment_method == CashTransaction.PaymentMethod.CASH
+                and register.current_balance < amount):
             return ServiceResponse.error(
                 f"Insufficient cash balance. Available: {register.current_balance}"
             )
 
         balance_before = register.current_balance
-        register.current_balance -= amount
-        register.save(update_fields=["current_balance", "last_updated"])
+        if payment_method == CashTransaction.PaymentMethod.CASH:
+            register.current_balance -= amount
+            register.save(update_fields=["current_balance", "last_updated"])
 
         txn = CashTransactionRepository.create(
             type=CashTransaction.TransactionType.WITHDRAWAL,
@@ -180,6 +238,7 @@ class CashTransactionService:
             payment_method=payment_method,
             balance_before=balance_before,
             balance_after=register.current_balance,
+            branch_id=register.branch_id,
             performed_by_id=performed_by_id,
             notes=notes,
         )
@@ -200,23 +259,27 @@ class CashTransactionService:
                              reference_id: int = None,
                              performed_by_id: int = None,
                              notes: str = "") -> Tuple[Dict[str, Any], int]:
-        amount = Decimal(str(amount))
-        if amount <= 0:
+        amount, amount_error = cls._amount(amount)
+        if amount_error:
+            return amount_error
+
+        type = str(type or '').strip().upper()
+        if type not in CashTransaction.TransactionType.values:
             return ServiceResponse.validation_error(
-                errors={"amount": "Amount must be greater than zero"},
+                errors={
+                    'type': f'Must be one of {list(CashTransaction.TransactionType.values)}',
+                },
             )
 
-        register = CashRegisterRepository.get_current()
-        if not register:
-            return ServiceResponse.error("Cash register not found")
+        payment_method, method_error = cls._payment_method(payment_method)
+        if method_error:
+            return method_error
 
+        register = cls._locked_branch_register()
         balance_before = register.current_balance
         balance_after = balance_before
 
-        if payment_method == "CASH":
-            register = CashRegister.objects.select_for_update().get(pk=register.pk)
-            balance_before = register.current_balance
-
+        if payment_method == CashTransaction.PaymentMethod.CASH:
             if register.current_balance < amount:
                 return ServiceResponse.error(
                     f"Insufficient cash balance. Available: {register.current_balance}"
@@ -235,6 +298,7 @@ class CashTransactionService:
             reference_id=reference_id,
             balance_before=balance_before,
             balance_after=balance_after,
+            branch_id=register.branch_id,
             performed_by_id=performed_by_id,
             notes=notes,
         )

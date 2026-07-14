@@ -8,8 +8,8 @@ from django.test import override_settings
 from django.utils import timezone
 
 from base.models import (
-    CashRegister, Category, Customer, Order, OrderItem, OrderPayment, Product,
-    Shift, User,
+    CashRegister, Category, Customer, Order, OrderItem, OrderPayment,
+    OrderRefund, Product, Shift, User,
 )
 from base.services.business_day import business_date
 from stock.models import (
@@ -279,6 +279,7 @@ def test_sales_report_buckets_pre_cutover_sale_and_allocates_net_revenue():
     assert report['totals']['total_discount_uzs'] == 10.0
     assert report['by_day'] == [{
         'date': day.isoformat(), 'orders': 1, 'revenue_uzs': 90.0,
+        'refunds_uzs': 0.0, 'refunded_orders': 0,
     }]
     assert report['top_products'][0]['revenue_uzs'] == 90.0
     assert report['by_category'][0]['revenue_uzs'] == 90.0
@@ -324,6 +325,7 @@ def test_created_day_gets_volume_while_paid_day_gets_money_and_product_sales():
     assert creation_report['top_products'] == []
     assert creation_report['by_day'] == [{
         'date': created_day.isoformat(), 'orders': 1, 'revenue_uzs': 0.0,
+        'refunds_uzs': 0.0, 'refunded_orders': 0,
     }]
     assert payment_report['totals']['orders'] == 0
     assert payment_report['totals']['paid_orders'] == 1
@@ -331,6 +333,7 @@ def test_created_day_gets_volume_while_paid_day_gets_money_and_product_sales():
     assert payment_report['top_products'][0]['name'] == 'Late-paid burger'
     assert payment_report['by_day'] == [{
         'date': paid_day.isoformat(), 'orders': 0, 'revenue_uzs': 100.0,
+        'refunds_uzs': 0.0, 'refunded_orders': 0,
     }]
     assert snapshot['today']['count'] == 0
     assert snapshot['today']['paid'] == 1
@@ -393,6 +396,24 @@ def test_menu_and_velocity_only_use_live_paid_branch_sales_at_net_value():
             order=order, product=other, quantity=1, price=order.total_amount,
             branch_id=order.branch_id,
         )
+    # A paid cancellation remains a gross sale at paid_at plus a separate
+    # negative event at refunded_at. The data migration creates this ledger row
+    # for legacy cancellations; model the valid invariant here instead of
+    # expecting analytics to erase a paid sale merely from its current status.
+    cancelled = excluded[1]
+    OrderRefund.objects.create(
+        order=cancelled,
+        amount=cancelled.total_amount,
+        cash_amount=cancelled.total_amount,
+        drawer_cash_amount=cancelled.total_amount,
+        card_amount=0,
+        payme_amount=0,
+        unknown_amount=0,
+        refunded_at=timezone.now(),
+        source=OrderRefund.Source.ORDER_CANCEL,
+        source_id=f'order-cancel:{cancelled.uuid}',
+        branch_id=cancelled.branch_id,
+    )
     deleted_order = _order(user, total='500', paid_at=timezone.now())
     deleted_product = Product.objects.create(
         name='Deleted line', category=category, price='500', branch_id='branch-a',
@@ -412,7 +433,10 @@ def test_menu_and_velocity_only_use_live_paid_branch_sales_at_net_value():
             for row in velocity['products']] == [('Valid burger', 1, 90.0)]
 
 
-@override_settings(DEPLOYMENT_MODE='cloud', BRANCH_ID='cloud')
+@override_settings(
+    DEPLOYMENT_MODE='cloud', BRANCH_ID='cloud',
+    CLOUD_DEFAULT_TARGET_BRANCH_ID='branch-a',
+)
 def test_recipe_snapshot_and_menu_share_canonical_units_yield_waste_and_scope():
     user = _user()
     location = StockLocation.objects.create(
@@ -553,7 +577,10 @@ def test_recipe_snapshot_and_menu_share_canonical_units_yield_waste_and_scope():
     }]
 
 
-@override_settings(DEPLOYMENT_MODE='cloud', BRANCH_ID='cloud')
+@override_settings(
+    DEPLOYMENT_MODE='cloud', BRANCH_ID='cloud',
+    CLOUD_DEFAULT_TARGET_BRANCH_ID='branch-a',
+)
 def test_direct_and_component_cogs_convert_units_and_ignore_deleted_components():
     gram, kilogram, _piece = _stock_units()
     ingredient = StockItem.objects.create(
@@ -617,7 +644,10 @@ def test_uncosted_menu_item_is_not_reported_as_zero_cost_profit():
     assert profitability['summary']['uncosted_revenue_uzs'] == 100.0
 
 
-@override_settings(DEPLOYMENT_MODE='cloud', BRANCH_ID='cloud')
+@override_settings(
+    DEPLOYMENT_MODE='cloud', BRANCH_ID='cloud',
+    CLOUD_DEFAULT_TARGET_BRANCH_ID='branch-a',
+)
 def test_consumption_is_descending_abc_keeps_dominant_item_in_a_and_forecast_uses_available():
     user = _user()
     location = StockLocation.objects.create(

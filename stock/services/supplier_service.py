@@ -394,10 +394,7 @@ class SupplierStockItemService:
             )
 
         if is_preferred:
-            SupplierStockItemRepository.filter(
-                stock_item_id=stock_item_id,
-                is_preferred=True
-            ).update(is_preferred=False)
+            SupplierStockItemRepository.clear_preferred(stock_item_id)
 
         si = SupplierStockItemRepository.create(
             supplier_id=supplier_id,
@@ -446,10 +443,9 @@ class SupplierStockItemService:
             update_fields.append("last_price_update")
 
         if "is_preferred" in kwargs and kwargs["is_preferred"]:
-            SupplierStockItemRepository.filter(
-                stock_item_id=si.stock_item_id,
-                is_preferred=True
-            ).exclude(id=si.id).update(is_preferred=False)
+            SupplierStockItemRepository.clear_preferred(
+                si.stock_item_id, exclude_id=si.id,
+            )
             si.is_preferred = True
             update_fields.append("is_preferred")
 

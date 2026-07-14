@@ -3,6 +3,7 @@ from base.models import SyncMixin, SyncManager
 
 
 class DiscountType(SyncMixin, models.Model):
+    SYNC_PULL_SCOPE = 'global'
     class Method(models.TextChoices):
         PERCENTAGE = 'PERCENTAGE', 'Percentage'
         FIXED_AMOUNT = 'FIXED_AMOUNT', 'Fixed Amount'
@@ -31,6 +32,7 @@ class DiscountType(SyncMixin, models.Model):
 
 
 class Discount(SyncMixin, models.Model):
+    SYNC_PULL_SCOPE = 'global'
     class AppliesTo(models.TextChoices):
         ENTIRE_ORDER = 'ENTIRE_ORDER', 'Entire Order'
         SPECIFIC_PRODUCTS = 'SPECIFIC_PRODUCTS', 'Specific Products'

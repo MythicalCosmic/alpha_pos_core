@@ -64,6 +64,22 @@ class SupplierLedgerService:
         )
 
     @classmethod
+    def record_purchase_order_payment(cls, supplier_id, amount,
+                                      purchase_order_id, note=''):
+        """Record a legacy PO payment whose funding account is unspecified.
+
+        PurchaseOrderService historically only received an amount, not a SAFE,
+        BANK, or DRAWER source.  We must not invent a treasury movement, but the
+        supplier balance still belongs in the locked append-only ledger rather
+        than a read/modify/save shortcut.
+        """
+        return cls._post(
+            supplier_id, SupplierTransaction.Type.PAYMENT, amount,
+            reference_type='PurchaseOrder', reference_id=purchase_order_id,
+            note=note,
+        )
+
+    @classmethod
     def record_drawer_payment(cls, supplier_id, amount, reference_id=None,
                               performed_by=None, note=''):
         """Cash paid to a supplier out of a shift drawer (a CashboxExpense, P4).

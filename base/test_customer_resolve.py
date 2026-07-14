@@ -1,6 +1,7 @@
 """Unified client identity: Customer.resolve() phone/telegram reconciliation +
 the customer-bot contact-share capture that feeds it."""
 import pytest
+from django.test import override_settings
 
 from base.models import Customer
 
@@ -41,6 +42,54 @@ def test_resolve_backfills_name_without_clobbering():
     again, _ = Customer.resolve(phone='998905556677', name='Should Not Overwrite')
     again.refresh_from_db()
     assert again.id == c.id and again.name == 'Existing'   # existing name kept
+
+
+@override_settings(DEPLOYMENT_MODE='cloud', BRANCH_ID='cloud')
+def test_branch_agnostic_link_does_not_create_cloud_owned_customer():
+    customer, created = Customer.resolve(
+        phone='998901010101', telegram_id=101, create=False,
+    )
+
+    assert customer is None
+    assert created is False
+    assert not Customer.objects.filter(phone_number='998901010101').exists()
+
+
+@override_settings(DEPLOYMENT_MODE='cloud', BRANCH_ID='cloud')
+def test_dispatch_scope_adopts_old_cloud_placeholder_into_target_branch():
+    placeholder = Customer.objects.create(
+        name='Bot Customer', phone_number='998902020202', branch_id='cloud',
+    )
+
+    customer, created = Customer.resolve(
+        phone='+998 90 202 02 02', telegram_id=202,
+        branch_id='branch-a', adopt_node_owned=True,
+    )
+
+    assert created is False
+    assert customer.id == placeholder.id
+    customer.refresh_from_db()
+    assert customer.branch_id == 'branch-a'
+    assert customer.telegram_id == 202
+
+
+@override_settings(DEPLOYMENT_MODE='cloud', BRANCH_ID='cloud')
+def test_dispatch_scope_never_steals_customer_from_another_branch():
+    foreign = Customer.objects.create(
+        phone_number='998903030303', branch_id='branch-b',
+    )
+
+    customer, created = Customer.resolve(
+        phone='998903030303', telegram_id=303,
+        branch_id='branch-a', adopt_node_owned=True,
+    )
+
+    assert created is True
+    assert customer.id != foreign.id
+    assert customer.branch_id == 'branch-a'
+    foreign.refresh_from_db()
+    assert foreign.branch_id == 'branch-b'
+    assert foreign.telegram_id is None
 
 
 def test_bot_contact_capture_resolves_customer():

@@ -106,14 +106,19 @@ class RevenueDip(Detector):
     DIP = Decimal('0.70')   # fire when the day is below 70% of its same-weekday average
 
     def _rev(self, d):
-        from base.models import Order
+        from base.models import Order, OrderRefund
         from base.services.business_day import range_window
         lo, hi = range_window(d, d)
-        agg = (Order.objects.filter(is_deleted=False, is_paid=True,
-                                    paid_at__gte=lo, paid_at__lt=hi)
-               .exclude(status='CANCELED'))
+        agg = Order.objects.filter(
+            is_deleted=False, is_paid=True,
+            paid_at__gte=lo, paid_at__lt=hi,
+        )
         from django.db.models import Sum
-        return agg.aggregate(t=Sum('total_amount'))['t'] or Decimal('0')
+        sales = agg.aggregate(t=Sum('total_amount'))['t'] or Decimal('0')
+        refunds = OrderRefund.objects.filter(
+            is_deleted=False, refunded_at__gte=lo, refunded_at__lt=hi,
+        ).aggregate(t=Sum('amount'))['t'] or Decimal('0')
+        return sales - refunds
 
     def scan(self, now):
         from base.services.business_day import business_date

@@ -18,7 +18,7 @@ class EmployeeDocumentRepository(BaseSyncRepository):
 
     @classmethod
     def get_expiring(cls, days):
-        today = timezone.now().date()
+        today = timezone.localdate()
         end = today + timedelta(days=days)
         return cls.model.objects.filter(
             expiry_date__range=(today, end),

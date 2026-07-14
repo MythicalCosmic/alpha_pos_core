@@ -262,6 +262,13 @@ FILE_UPLOAD_MAX_MEMORY_SIZE = int(
 DATA_UPLOAD_MAX_NUMBER_FIELDS = 1000
 
 BRANCH_ID = os.environ.get('BRANCH_ID', 'main')
+# Optional compatibility target for a genuinely single-branch cloud. A cloud
+# process must never stamp branch-scoped creates with its own node id (usually
+# ``cloud``), because no terminal can receive those rows. Leave empty in a
+# multi-branch deployment and require every cloud CRUD call to pass branch_id.
+CLOUD_DEFAULT_TARGET_BRANCH_ID = os.environ.get(
+    'CLOUD_DEFAULT_TARGET_BRANCH_ID', '',
+).strip()
 # Per-install till identity (minted by the desktop at first run). Lets the cloud
 # distinguish multiple tills even when they share one branch token — drives the
 # POS presence registry (base/services/presence.py) that smartfood auto-dispatch

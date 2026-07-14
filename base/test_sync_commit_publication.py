@@ -15,8 +15,8 @@ pytestmark = pytest.mark.django_db
 def _changes(settings, *, branch_id, since=None, per_page=None):
     from base.services.sync import views
 
-    settings.ALLOWED_BRANCH_TOKENS = ['commit-feed-token']
-    settings.BRANCH_TOKEN_MAP = {}
+    settings.ALLOWED_BRANCH_TOKENS = []
+    settings.BRANCH_TOKEN_MAP = {'commit-feed-token': branch_id}
     params = {}
     if since is not None:
         params['since'] = since.isoformat()
@@ -126,16 +126,15 @@ def test_publisher_failure_does_not_fail_committed_cloud_save(
 def test_cloud_receiver_publishes_after_commit_and_preserves_feed_scope_order(
     settings, monkeypatch, django_capture_on_commit_callbacks,
 ):
-    from base.models import Category
+    from base.models import Customer
     from base.services.sync.receiver import CloudReceiver
 
     settings.DEPLOYMENT_MODE = 'cloud'
     base_time = timezone.now().replace(microsecond=0)
-    older = Category.objects.bulk_create([
-        Category(
+    older = Customer.objects.bulk_create([
+        Customer(
             name='Older cloud row',
-            slug='older-cloud-row',
-            branch_id='cloud',
+            branch_id='branch-a',
             synced_at=base_time,
         ),
     ])[0]
@@ -143,17 +142,16 @@ def test_cloud_receiver_publishes_after_commit_and_preserves_feed_scope_order(
 
     with django_capture_on_commit_callbacks(execute=False) as callbacks:
         received, action = CloudReceiver._create_or_update(
-            Category,
+            Customer,
             {
                 'uuid': str(received_uuid),
                 'sync_version': 7,
                 'name': 'Received branch row',
-                'slug': 'received-branch-row',
             },
             'branch-a',
         )
         assert action == 'created'
-        assert Category.objects.get(pk=received.pk).synced_at is None
+        assert Customer.objects.get(pk=received.pk).synced_at is None
 
     assert len(callbacks) == 1
     published_at = base_time + timedelta(seconds=1)
@@ -166,15 +164,17 @@ def test_cloud_receiver_publishes_after_commit_and_preserves_feed_scope_order(
     snapshot = base_time + timedelta(seconds=2)
     monkeypatch.setattr(timezone, 'now', lambda: snapshot)
     other_feed = _changes(settings, branch_id='branch-b')
-    category_uuids = [row['uuid'] for row in other_feed['data']['category']]
-    assert category_uuids == [str(older.uuid), str(received_uuid)]
+    customer_uuids = [
+        row['uuid'] for row in other_feed['data'].get('customer', [])
+    ]
+    assert str(older.uuid) not in customer_uuids
+    assert str(received_uuid) not in customer_uuids
 
     source_feed = _changes(settings, branch_id='branch-a')
-    source_category_uuids = [
-        row['uuid'] for row in source_feed['data']['category']
+    source_customer_uuids = [
+        row['uuid'] for row in source_feed['data']['customer']
     ]
-    assert str(older.uuid) in source_category_uuids
-    assert str(received_uuid) not in source_category_uuids
+    assert source_customer_uuids == [str(older.uuid), str(received_uuid)]
 
 
 def test_null_rows_bypass_timed_page_cap_on_bootstrap_and_cursored_pulls(

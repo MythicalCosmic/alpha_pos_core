@@ -78,10 +78,11 @@ class StockBatchRepository(BaseSyncRepository):
 
     @classmethod
     def get_expiring(cls, days=7):
-        threshold = timezone.now().date() + timedelta(days=days)
+        today = timezone.localdate()
+        threshold = today + timedelta(days=days)
         return cls.model.objects.filter(
             expiry_date__lte=threshold,
-            expiry_date__gt=timezone.now().date(),
+            expiry_date__gt=today,
             current_quantity__gt=0,
             status='AVAILABLE',
             is_deleted=False,
@@ -90,7 +91,7 @@ class StockBatchRepository(BaseSyncRepository):
     @classmethod
     def get_expired(cls):
         return cls.model.objects.filter(
-            expiry_date__lt=timezone.now().date(),
+            expiry_date__lt=timezone.localdate(),
             current_quantity__gt=0,
             is_deleted=False,
         ).select_related('stock_item', 'location').order_by('expiry_date')

@@ -366,7 +366,8 @@ class ProductStockLinkService:
         return Decimal('0')
 
     @classmethod
-    def get_deduction_items(cls, product_id: int, quantity: int = 1) -> List[Dict]:
+    def get_deduction_items(cls, product_id: int, quantity: int = 1,
+                            modifiers: List[Dict] = None) -> List[Dict]:
         link = ProductStockLinkRepository.get_active_for_product(product_id)
 
         if not cls.has_cost_definition(link):
@@ -401,14 +402,55 @@ class ProductStockLinkService:
                     })
 
         elif link.link_type == "COMPONENT_BASED":
+            # Resolve modifier IDs only inside this product link. The old
+            # order path loaded arbitrary component IDs globally, so malformed
+            # input could affect stock belonging to another product. A set
+            # also makes duplicate UI entries idempotent.
+            components = {
+                str(comp.id): comp
+                for comp in ProductComponentStockRepository.get_for_link(link.id)
+                if not comp.stock_item.is_deleted and comp.stock_item.is_active
+            }
+            removed_ids = set()
+            added = []
+            seen_actions = set()
+            for modifier in modifiers or []:
+                if not isinstance(modifier, dict):
+                    continue
+                component_id = str(modifier.get('component_id') or '').strip()
+                action = str(modifier.get('action') or '').strip().upper()
+                comp = components.get(component_id)
+                marker = (component_id, action)
+                if not comp or marker in seen_actions:
+                    continue
+                seen_actions.add(marker)
+                if action == 'REMOVE' and comp.is_default and comp.is_removable:
+                    removed_ids.add(component_id)
+                elif action == 'ADD' and comp.is_addable:
+                    added.append(comp)
+
             defaults = ProductComponentStockRepository.get_defaults(link.id).filter(
                 stock_item__is_deleted=False, stock_item__is_active=True,
             )
             for comp in defaults:
+                # A removed default should never be deducted. Previously it
+                # was deducted first and the REMOVE branch was a literal pass,
+                # leaking stock on every "no onion/cheese/etc." order.
+                if str(comp.id) in removed_ids:
+                    continue
                 deductions.append({
                     "stock_item_id": comp.stock_item_id,
                     "quantity": comp.quantity * sale_qty,
                     "unit_id": comp.unit_id,
+                    "component_id": comp.id,
+                })
+            for comp in added:
+                deductions.append({
+                    "stock_item_id": comp.stock_item_id,
+                    "quantity": comp.quantity * sale_qty,
+                    "unit_id": comp.unit_id,
+                    "component_id": comp.id,
+                    "modifier": "ADD",
                 })
 
         return deductions

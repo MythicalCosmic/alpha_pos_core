@@ -1,6 +1,6 @@
 from decimal import Decimal, InvalidOperation
 from django.db import transaction
-from django.db.models import Sum, Count, F
+from django.db.models import Sum, Count
 from django.utils import timezone
 from discounts.repositories import (
     DiscountRepository, DiscountTypeRepository,
@@ -479,7 +479,9 @@ class DiscountService:
         # Calculate the discount amount. Pass the discount already applied to
         # this order so calculate_discount clamps this rule to the remaining
         # subtotal — stacked discounts can't sum past the order subtotal.
-        order_items = order.items.select_related('product__category').all()
+        order_items = order.items.filter(is_deleted=False).select_related(
+            'product__category',
+        )
         already_applied = OrderDiscountRepository.get_for_order(order_id).aggregate(
             total=Sum('discount_amount'),
         )['total'] or Decimal('0')
@@ -497,6 +499,7 @@ class DiscountService:
             discount_code=discount.code,
             discount_amount=discount_amount,
             applied_by_id=user_id,
+            branch_id=order.branch_id,
         )
 
         # Create DiscountUsage
@@ -505,10 +508,14 @@ class DiscountService:
                 discount=discount,
                 user_id=user_id,
                 order=order,
+                branch_id=order.branch_id,
             )
 
-        # Increment usage count atomically
-        Discount.objects.filter(id=discount.id).update(usage_count=F('usage_count') + 1)
+        # The discount row is already locked above, so an instance save is both
+        # concurrency-safe and sync-visible. QuerySet.update() left the peer's
+        # usage limit stale, allowing overuse on another surface.
+        discount.usage_count += 1
+        discount.save(update_fields=['usage_count'])
 
         # Recalculate order totals
         total_discount = OrderDiscountRepository.get_for_order(order_id).aggregate(
@@ -555,7 +562,11 @@ class DiscountService:
         if not order_discount or order_discount.order_id != order_id:
             return ServiceResponse.not_found("Order discount not found")
 
-        discount = order_discount.discount
+        # Serialize usage counter changes across different orders and reload
+        # the current value rather than decrementing a stale related instance.
+        discount = Discount.objects.select_for_update().get(
+            pk=order_discount.discount_id,
+        )
 
         # Delete the DiscountUsage tied to THIS order + discount, regardless of
         # which user removes it. Filtering by the caller-supplied user_id (e.g.
@@ -567,21 +578,18 @@ class DiscountService:
         usages = DiscountUsageRepository.get_for_order(order_id).filter(
             discount_id=discount.id,
         )
-        usages.delete()
+        # QuerySet.delete() bypasses SyncMixin tombstones. Keep synced soft
+        # deletes so the peer also releases the per-user allowance.
+        for usage in usages.select_for_update():
+            usage.delete()
 
         # Delete the OrderDiscount
-        order_discount.delete(hard_delete=True)
+        order_discount.delete()
 
-        # Decrement usage count atomically; clamp at zero to avoid double-removes
-        # driving the counter negative under concurrent calls.
-        from django.db.models import Case, When, Value, IntegerField
-        Discount.objects.filter(id=discount.id).update(
-            usage_count=Case(
-                When(usage_count__gt=0, then=F('usage_count') - 1),
-                default=Value(0),
-                output_field=IntegerField(),
-            )
-        )
+        # The row lock makes this read-modify-write atomic; save() also marks
+        # the SyncMixin dirty so every node sees the restored allowance.
+        discount.usage_count = max(discount.usage_count - 1, 0)
+        discount.save(update_fields=['usage_count'])
 
         # Recalculate order totals
         total_discount = OrderDiscountRepository.get_for_order(order_id).aggregate(

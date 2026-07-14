@@ -2,6 +2,7 @@ from decimal import Decimal
 
 import pytest
 from django.db.models import Sum
+from django.utils import timezone
 
 
 pytestmark = pytest.mark.django_db
@@ -18,6 +19,7 @@ def test_order_discount_is_allocated_proportionally_to_product_lines(
     second = Product.objects.create(name='Second', category=category, price=40)
     order = Order.objects.create(
         user=regular_user, cashier=cashier_user, is_paid=True,
+        paid_at=timezone.now(),
         subtotal=Decimal('100'), discount_amount=Decimal('10'),
         total_amount=Decimal('90'),
     )

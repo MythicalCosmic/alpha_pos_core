@@ -17,7 +17,12 @@ def _user(email='cashier@t.local'):
 
 def _shift(user):
     from base.models import Shift
-    return Shift.objects.create(user=user, start_time=timezone.now(), status='ACTIVE')
+    return Shift.objects.create(
+        user=user,
+        start_time=timezone.now(),
+        status='ACTIVE',
+        branch_id=user.branch_id,
+    )
 
 
 def _paid_cash_order(user, amount, method='CASH'):
@@ -26,6 +31,9 @@ def _paid_cash_order(user, amount, method='CASH'):
         user=user, cashier=user, status='COMPLETED', is_paid=True,
         paid_at=timezone.now(), total_amount=amount, payment_method=method)
     OrderPayment.objects.create(order=o, method=method, amount=amount)
+    if method == 'CASH':
+        from base.services.inkassa_service import InkassaService
+        InkassaService.add_to_register(Decimal(amount), o.branch_id)
     return o
 
 
@@ -56,6 +64,7 @@ class TestCashboxExpenseRecipients:
         from stock.models import Supplier
         from cashbox.services.expense_service import CashboxExpenseService
         u = _user(); s = _shift(u)
+        _paid_cash_order(u, Decimal('20000'), 'CASH')
         sup = Supplier.objects.create(name='Veg Co', current_balance=Decimal('50000'))
         res, st = CashboxExpenseService.create(
             s.id, Decimal('20000'), recipient_supplier_id=sup.id, created_by=u)
@@ -78,8 +87,8 @@ class TestCashboxExpenseRecipients:
 
 
 class TestShiftSettlement:
-    def test_close_and_confirm_posts_to_treasury(self):
-        from base.models import TreasuryAccount
+    def test_close_and_confirm_freezes_without_double_posting_treasury(self):
+        from base.models import TreasuryTransaction
         from core.shifts.service import ShiftService
         from cashbox.models import ShiftPaymentTotal
         u = _user(); s = _shift(u)
@@ -102,8 +111,9 @@ class TestShiftSettlement:
         assert st == 201, res
         s.refresh_from_db()
         assert s.status == 'COMPLETED'
-        assert TreasuryAccount.objects.get(kind='SAFE').balance == Decimal('100000.00')
-        assert TreasuryAccount.objects.get(kind='BANK').balance == Decimal('40000.00')
+        # Reconcile is an audit boundary. Inkassa remains the one and only
+        # drawer/bank -> treasury movement, so these sales are not pre-booked.
+        assert TreasuryTransaction.objects.count() == 0
 
 
 class TestShiftPaymentTotalSync:
@@ -118,7 +128,12 @@ class TestShiftPaymentTotalSync:
         from base.services.sync.receiver import CloudReceiver
         u = _user(); s = _shift(u)
         ShiftPaymentTotal.objects.create(
-            shift=s, method='CASH', expected_amount=Decimal('100'), sync_version=1)
+            shift=s,
+            method='CASH',
+            expected_amount=Decimal('100'),
+            sync_version=1,
+            branch_id=s.branch_id,
+        )
         incoming = str(_uuid.uuid4())
         result = CloudReceiver.receive_batch('shiftpaymenttotal', 'branch1', [{
             'uuid': incoming, 'sync_version': 5, 'is_deleted': False,

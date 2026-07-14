@@ -13,6 +13,7 @@ read-only (no writes, no deletes) and excludes soft-deleted rows. Sensitive fiel
 (password hashes, raw session payloads) are never serialized.
 """
 from datetime import date, timedelta
+from decimal import Decimal
 import json
 import logging
 from uuid import UUID
@@ -22,12 +23,16 @@ from django.db.models.functions import TruncHour
 from django.utils import timezone
 
 from base.models import (
-    User, Order, OrderItem, Product, Category, Customer,
+    User, Order, OrderItem, OrderRefund, Product, Category, Customer,
     CashRegister, Inkassa, Shift, CashReconciliation,
 )
 from stock.models import StockLevel, StockBatch, StockLocation
 from base.services.business_day import business_day_date_expr
 from base.services.revenue import net_line_revenue
+from base.services.refund_lines import (
+    REFUND_EVENT_ALIAS, refund_item_events, refund_line_quantity,
+    refund_line_revenue,
+)
 from stock.services.ai_context import (
     AIDataContext, current_cash_register, resolve_ai_context, scope_branch,
     scope_location_owned,
@@ -98,8 +103,46 @@ def _paid_orders_in(lo, hi, args):
     qs = Order.objects.filter(
         is_deleted=False, is_paid=True,
         paid_at__gte=lo, paid_at__lt=hi,
-    ).exclude(status=Order.Status.CANCELED)
+    )
     return _scope_orders(qs, args)
+
+
+def _refunds_in(lo, hi, args):
+    """Canonical reversal events in a half-open refund-at window."""
+    qs = OrderRefund.objects.filter(
+        is_deleted=False, refunded_at__gte=lo, refunded_at__lt=hi,
+    )
+    return _scope_orders(qs, args)
+
+
+def _net_grouped_items(sale_items, refund_items, fields):
+    """Return grouped product rows with refund-date quantities/revenue netted."""
+    sales = sale_items.values(*fields).annotate(
+        q=Sum('quantity'), rev=Sum(net_line_revenue()),
+    )
+    refunds = refund_items.values(*fields).annotate(
+        q=Sum(refund_line_quantity(REFUND_EVENT_ALIAS)),
+        rev=Sum(refund_line_revenue(REFUND_EVENT_ALIAS)),
+    )
+
+    def key(row):
+        return tuple(row.get(field) for field in fields)
+
+    merged = {key(row): dict(row) for row in sales}
+    for row in refunds:
+        target = merged.setdefault(key(row), {field: row.get(field) for field in fields})
+        target['refund_q'] = row['q'] or 0
+        target['refund_rev'] = row['rev'] or Decimal('0.00')
+    for row in merged.values():
+        gross_q = row.get('q') or 0
+        gross_rev = row.get('rev') or Decimal('0.00')
+        row['gross_q'] = gross_q
+        row['gross_rev'] = gross_rev
+        row.setdefault('refund_q', 0)
+        row.setdefault('refund_rev', Decimal('0.00'))
+        row['q'] = gross_q - row['refund_q']
+        row['rev'] = gross_rev - row['refund_rev']
+    return list(merged.values())
 
 
 def _parse_uuid(value):
@@ -294,7 +337,13 @@ def _shift_paid_orders_qs(shift):
     qs = Order.objects.filter(
         is_deleted=False, cashier=shift.user, is_paid=True,
         paid_at__gte=shift.start_time, paid_at__lt=end,
-    ).exclude(status=Order.Status.CANCELED)
+    )
+    return scope_branch(qs, shift.branch_id or None)
+
+
+def _shift_refunds_qs(shift):
+    # Refund carries the exact locked Shift FK; no time/cashier inference needed.
+    qs = OrderRefund.objects.filter(is_deleted=False, shift=shift)
     return scope_branch(qs, shift.branch_id or None)
 
 
@@ -304,6 +353,9 @@ def _shift_dict(s, with_orders=False):
     money = _shift_paid_orders_qs(s).aggregate(
         total=Sum("total_amount"), gross=Sum("subtotal"),
     )
+    refund_money = _shift_refunds_qs(s).aggregate(total=Sum('amount'))
+    gross_sales = money['total'] or Decimal('0.00')
+    refund_total = refund_money['total'] or Decimal('0.00')
     # Reverse one-to-one: accessing a missing .reconciliation raises DoesNotExist
     # (not AttributeError), so getattr(..., None) would not catch it.
     try:
@@ -323,7 +375,9 @@ def _shift_dict(s, with_orders=False):
         # Live figures computed from orders in the window (the stored counters on
         # the Shift row are only frozen at close, so they can lag for open shifts).
         "live_orders": volume["cnt"] or 0,
-        "live_paid_revenue_uzs": _f(money["total"]),
+        "live_paid_revenue_uzs": _f(gross_sales - refund_total),
+        "live_gross_sales_uzs": _f(gross_sales),
+        "live_refunds_uzs": _f(refund_total),
         "live_gross_uzs": _f(money["gross"]),
         # Stored counters (authoritative once the shift is ENDED/COMPLETED).
         "stored_total_orders": s.total_orders,
@@ -406,7 +460,7 @@ def _cashier_dict(u, with_today=True, branch_id=None):
     }
     if with_today:
         # "Today" = the current BUSINESS day (03:00 cutover), matching the admin
-        # dashboard, not a plain calendar date. Revenue = paid, non-cancelled.
+        # dashboard, not a plain calendar date. Revenue = paid sales - refunds.
         _lo, _hi = _bd_today_window()
         orders = Order.objects.filter(
             is_deleted=False, cashier=u, created_at__gte=_lo, created_at__lt=_hi,
@@ -415,12 +469,21 @@ def _cashier_dict(u, with_today=True, branch_id=None):
         sales = Order.objects.filter(
             is_deleted=False, cashier=u, is_paid=True,
             paid_at__gte=_lo, paid_at__lt=_hi,
-        ).exclude(status=Order.Status.CANCELED)
-        revenue = scope_branch(sales, branch_id).aggregate(
+        )
+        gross_revenue = scope_branch(sales, branch_id).aggregate(
             rev=Sum("total_amount"),
-        )["rev"]
+        )["rev"] or Decimal('0.00')
+        refunds = OrderRefund.objects.filter(
+            is_deleted=False, cashier=u,
+            refunded_at__gte=_lo, refunded_at__lt=_hi,
+        )
+        refund_total = scope_branch(refunds, branch_id).aggregate(
+            rev=Sum('amount'),
+        )['rev'] or Decimal('0.00')
         data["today_orders"] = volume
-        data["today_revenue_uzs"] = _f(revenue)
+        data["today_revenue_uzs"] = _f(gross_revenue - refund_total)
+        data["today_gross_sales_uzs"] = _f(gross_revenue)
+        data["today_refunds_uzs"] = _f(refund_total)
     return data
 
 
@@ -814,7 +877,7 @@ class AIToolbox:
         context = _context(args)
         today_local = timezone.localdate()  # calendar date — used for stock expiry below
         # Sales "today" = the current BUSINESS day (03:00 cutover) so it matches the
-        # admin dashboard, not a plain calendar day. Revenue = paid, non-cancelled.
+        # admin dashboard, not a plain calendar day. Revenue = sales - refunds.
         _lo, _hi = _bd_today_window()
         today = _scope_orders(Order.objects.filter(
             is_deleted=False, created_at__gte=_lo, created_at__lt=_hi,
@@ -829,17 +892,26 @@ class AIToolbox:
         sales_agg = _paid_orders_in(_lo, _hi, args).aggregate(
             revenue=Sum("total_amount"), paid=Count("id"),
         )
+        refund_agg = _refunds_in(_lo, _hi, args).aggregate(
+            revenue=Sum('amount'), refunded=Count('id'),
+        )
+        gross_revenue = sales_agg['revenue'] or Decimal('0.00')
+        refund_total = refund_agg['revenue'] or Decimal('0.00')
         open_shifts = (Shift.objects.filter(is_deleted=False, status=Shift.Status.ACTIVE)
                        .select_related("user").order_by("-start_time"))
         open_shifts = scope_branch(open_shifts, context.branch_id)
         open_list = []
         for s in open_shifts[:50]:
             count = _shift_orders_qs(s).count()
-            revenue = _shift_paid_orders_qs(s).aggregate(r=Sum("total_amount"))["r"]
+            gross = _shift_paid_orders_qs(s).aggregate(r=Sum("total_amount"))["r"] or Decimal('0.00')
+            refunded = _shift_refunds_qs(s).aggregate(r=Sum('amount'))['r'] or Decimal('0.00')
             open_list.append({
                 "cashier": _name(s.user), "cashier_id": s.user_id,
                 "since": _iso(s.start_time), "shift_id": s.id,
-                "live_orders": count, "live_revenue_uzs": _f(revenue),
+                "live_orders": count,
+                "live_revenue_uzs": _f(gross - refunded),
+                "live_gross_sales_uzs": _f(gross),
+                "live_refunds_uzs": _f(refunded),
             })
 
         levels = StockLevel.objects.filter(
@@ -866,7 +938,10 @@ class AIToolbox:
             "today": today_local.isoformat(),
             "today_sales": {
                 "orders": volume_agg["cnt"] or 0,
-                "paid_revenue_uzs": _f(sales_agg["revenue"]),
+                "paid_revenue_uzs": _f(gross_revenue - refund_total),
+                "gross_sales_uzs": _f(gross_revenue),
+                "refunds_uzs": _f(refund_total),
+                "refunded_orders": refund_agg['refunded'] or 0,
                 "paid_orders": sales_agg["paid"] or 0,
                 "unpaid_orders": volume_agg["unpaid"] or 0,
             },
@@ -1081,13 +1156,23 @@ class AIToolbox:
         sales = Order.objects.filter(
             is_deleted=False, cashier=u, is_paid=True,
             paid_at__gte=_lo, paid_at__lt=_hi,
-        ).exclude(status=Order.Status.CANCELED)
+        )
         sales = scope_branch(sales, context.branch_id).aggregate(
             revenue=Sum("total_amount"), avg=Avg("total_amount"),
         )
+        refunds = OrderRefund.objects.filter(
+            is_deleted=False, cashier=u,
+            refunded_at__gte=_lo, refunded_at__lt=_hi,
+        )
+        refund_total = scope_branch(refunds, context.branch_id).aggregate(
+            revenue=Sum('amount'),
+        )['revenue'] or Decimal('0.00')
+        gross_revenue = sales['revenue'] or Decimal('0.00')
         data["performance_30d"] = {
             "orders": perf["orders"] or 0,
-            "paid_revenue_uzs": _f(sales["revenue"]),
+            "paid_revenue_uzs": _f(gross_revenue - refund_total),
+            "gross_sales_uzs": _f(gross_revenue),
+            "refunds_uzs": _f(refund_total),
             "avg_order_uzs": _f(sales["avg"]),
             "completed": perf["completed"] or 0,
             "canceled": perf["canceled"] or 0,
@@ -1171,11 +1256,19 @@ class AIToolbox:
             is_deleted=False, created_at__gte=_lo, created_at__lt=_hi,
         ), args)
         sales_orders = _paid_orders_in(_lo, _hi, args)
+        refund_events = _refunds_in(_lo, _hi, args)
         items = OrderItem.objects.filter(
             is_deleted=False, order__is_deleted=False, order__is_paid=True,
             order__paid_at__gte=_lo, order__paid_at__lt=_hi,
-        ).exclude(order__status='CANCELED')
+        )
         items = scope_branch(items, context.branch_id, 'order__branch_id')
+        refund_items = refund_item_events(
+            refunded_at__gte=_lo,
+            refunded_at__lt=_hi,
+        )
+        refund_items = scope_branch(
+            refund_items, context.branch_id, 'order__branch_id',
+        )
 
         volume_totals = volume_orders.aggregate(
             orders=Count("id"),
@@ -1191,6 +1284,11 @@ class AIToolbox:
             paid=Count("id"),
             discount=Sum("discount_amount"),
         )
+        refund_totals = refund_events.aggregate(
+            revenue=Sum('amount'), refunded=Count('id'),
+        )
+        gross_revenue = money_totals['revenue'] or Decimal('0.00')
+        refund_revenue = refund_totals['revenue'] or Decimal('0.00')
 
         day_rows = {}
         for row in volume_orders.annotate(
@@ -1203,10 +1301,21 @@ class AIToolbox:
             day_rows.setdefault(
                 row['day'], {'orders': 0, 'revenue': 0},
             )['revenue'] = row['rev'] or 0
+        for row in refund_events.annotate(
+            day=business_day_date_expr('refunded_at'),
+        ).values('day').annotate(rev=Sum('amount'), c=Count('id')):
+            target = day_rows.setdefault(
+                row['day'], {'orders': 0, 'revenue': 0},
+            )
+            target['refunds'] = row['rev'] or 0
+            target['refunded_orders'] = row['c'] or 0
+            target['revenue'] = (target.get('revenue') or 0) - (row['rev'] or 0)
         by_day = [{
             "date": day.isoformat() if day else None,
             "orders": day_rows[day]['orders'],
             "revenue_uzs": _f(day_rows[day]['revenue']),
+            "refunds_uzs": _f(day_rows[day].get('refunds')),
+            "refunded_orders": day_rows[day].get('refunded_orders', 0),
         } for day in sorted(day_rows, key=lambda value: value or df)]
 
         cashier_rows = {}
@@ -1225,21 +1334,46 @@ class AIToolbox:
                 'cashier_id': row['cashier__id'], 'orders': 0, 'revenue_uzs': 0.0,
             })
             merged['revenue_uzs'] = _f(row['rev'])
+            merged['gross_sales_uzs'] = _f(row['rev'])
+        for row in refund_events.filter(cashier__isnull=False).values(
+            'cashier__id', 'cashier__first_name', 'cashier__last_name',
+        ).annotate(rev=Sum('amount'), c=Count('id')):
+            merged = cashier_rows.setdefault(row['cashier__id'], {
+                'cashier': f"{row['cashier__first_name']} {row['cashier__last_name']}".strip(),
+                'cashier_id': row['cashier__id'], 'orders': 0,
+                'revenue_uzs': 0.0, 'gross_sales_uzs': 0.0,
+            })
+            refund_value = _f(row['rev'])
+            merged['refunds_uzs'] = refund_value
+            merged['refunded_orders'] = row['c'] or 0
+            merged['revenue_uzs'] -= refund_value
+        for row in cashier_rows.values():
+            row.setdefault('gross_sales_uzs', row.get('revenue_uzs', 0.0))
+            row.setdefault('refunds_uzs', 0.0)
+            row.setdefault('refunded_orders', 0)
         by_cashier = sorted(
             cashier_rows.values(),
             key=lambda row: (-row['revenue_uzs'], row['cashier']),
         )
+        category_rows = _net_grouped_items(
+            items, refund_items, ('product__category__name',),
+        )
+        category_rows.sort(key=lambda row: (-(row['rev'] or 0), row['product__category__name'] or ''))
         by_category = [{
             "category": r["product__category__name"], "qty": r["q"], "revenue_uzs": _f(r["rev"]),
-        } for r in items.values("product__category__name").annotate(
-            q=Sum("quantity"), rev=Sum(net_line_revenue())).order_by("-rev")[:25]]
+            "gross_sales_uzs": _f(r['gross_rev']), "refunds_uzs": _f(r['refund_rev']),
+        } for r in category_rows[:25]]
+        product_rows = _net_grouped_items(
+            items, refund_items, ('product__name',),
+        )
+        product_rows.sort(key=lambda row: (-(row['rev'] or 0), row['product__name'] or ''))
         top_products = [{
             "name": r["product__name"], "qty": r["q"], "revenue_uzs": _f(r["rev"]),
-        } for r in items.values("product__name").annotate(
-            q=Sum("quantity"), rev=Sum(net_line_revenue())).order_by("-rev")[:25]]
-        from base.services.tender import breakdown_for_orders
+            "gross_sales_uzs": _f(r['gross_rev']), "refunds_uzs": _f(r['refund_rev']),
+        } for r in product_rows[:25]]
+        from base.services.tender import net_breakdown
 
-        tender_split, card_detail = breakdown_for_orders(sales_orders)
+        tender_split, card_detail = net_breakdown(sales_orders, refund_events)
         by_method = {
             method: {"revenue_uzs": _f(amount)}
             for method, amount in tender_split.items()
@@ -1254,13 +1388,21 @@ class AIToolbox:
             "date_to": dt.isoformat(),
             "totals": {
                 "orders": volume_totals["orders"] or 0,
-                "paid_revenue_uzs": _f(money_totals["revenue"]),
+                "paid_revenue_uzs": _f(gross_revenue - refund_revenue),
+                "gross_sales_uzs": _f(gross_revenue),
+                "refunds_uzs": _f(refund_revenue),
+                "refunded_orders": refund_totals['refunded'] or 0,
                 "gross_uzs": _f(money_totals["gross"]),
                 "avg_order_uzs": _f(money_totals["avg"]),
                 "paid_orders": money_totals["paid"] or 0,
                 "unpaid_orders": volume_totals["unpaid"] or 0,
                 "total_discount_uzs": _f(money_totals["discount"]),
-                "items_sold": items.aggregate(q=Sum("quantity"))["q"] or 0,
+                "items_sold": (
+                    (items.aggregate(q=Sum("quantity"))["q"] or 0)
+                    - (refund_items.aggregate(
+                        q=Sum(refund_line_quantity(REFUND_EVENT_ALIAS)),
+                    )['q'] or 0)
+                ),
             },
             "by_day": by_day,
             "by_cashier": by_cashier,
@@ -1284,10 +1426,21 @@ class AIToolbox:
                 hour_rows.setdefault(
                     row['h'], {'orders': 0, 'revenue': 0},
                 )['revenue'] = row['rev'] or 0
+            for row in refund_events.annotate(
+                h=TruncHour('refunded_at'),
+            ).values('h').annotate(rev=Sum('amount'), c=Count('id')):
+                target = hour_rows.setdefault(
+                    row['h'], {'orders': 0, 'revenue': 0},
+                )
+                target['refunds'] = row['rev'] or 0
+                target['refunded_orders'] = row['c'] or 0
+                target['revenue'] = (target.get('revenue') or 0) - (row['rev'] or 0)
             result["by_hour"] = [{
                 "hour": hour.strftime("%H:%M") if hour else None,
                 "orders": hour_rows[hour]['orders'],
                 "revenue_uzs": _f(hour_rows[hour]['revenue']),
+                "refunds_uzs": _f(hour_rows[hour].get('refunds')),
+                "refunded_orders": hour_rows[hour].get('refunded_orders', 0),
             } for hour in sorted(hour_rows, key=lambda value: value or _lo)]
         return result
 

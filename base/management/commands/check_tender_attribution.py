@@ -1,8 +1,7 @@
 """Canary for the tender-attribution invariant.
 
-Reports paid, non-cancelled orders whose tender cannot be determined from payment
-lines: a non-cash rolled-up method with ZERO OrderPayment rows. On a healthy system
-this is 0.
+Reports paid orders whose tender cannot be determined from complete till/courier
+payment evidence. On a healthy system this is 0.
 
 It is the ONLY detector for the sync dead-letter hole: `base/services/sync/config.py`
 pushes `order` before `orderpayment`, and `queue.py` drops a record permanently once
@@ -29,15 +28,17 @@ class Command(BaseCommand):
         from datetime import timedelta
         from django.utils import timezone
         from base.models import Order
-        from base.services.tender import unattributed_orders, breakdown_for_orders
+        from base.services.tender import tender_integrity_issues, breakdown_for_orders
 
-        qs = Order.objects.filter(is_deleted=False, is_paid=True).exclude(status='CANCELED')
+        # A refunded/cancelled paid order remains an immutable sale event; its
+        # separate OrderRefund cannot make missing original tender evidence OK.
+        qs = Order.objects.filter(is_deleted=False, is_paid=True)
         if opts['days']:
             qs = qs.filter(paid_at__gte=timezone.now() - timedelta(days=opts['days']))
 
-        flagged = unattributed_orders(qs)
-        n = flagged.count()
-        amount = flagged.aggregate(s=Sum('total_amount'))['s'] or 0
+        issues = tender_integrity_issues(qs)
+        n = len(issues)
+        amount = sum((issue['amount'] for issue in issues), 0)
 
         split, _ = breakdown_for_orders(qs)
         revenue = qs.aggregate(s=Sum('total_amount'))['s'] or 0
@@ -54,10 +55,13 @@ class Command(BaseCommand):
 
         if n:
             self.stdout.write(self.style.ERROR(
-                f'\nUNATTRIBUTABLE: {n} paid order(s) worth {amount} have a non-cash '
-                f'payment_method and NO OrderPayment rows.'))
-            for o in flagged.order_by('-paid_at')[:20]:
-                self.stdout.write(f'  order {o.id}  {o.payment_method}  {o.total_amount}  paid_at={o.paid_at}')
+                f'\nUNATTRIBUTABLE: {n} paid order(s) worth {amount} have '
+                f'missing or incomplete payment evidence.'))
+            for issue in issues[:20]:
+                self.stdout.write(
+                    f"  order {issue['order_id']}  {issue['payment_method']}  "
+                    f"{issue['amount']}  {issue['reason']}"
+                )
         else:
             self.stdout.write(self.style.SUCCESS('\nOK: every paid order has attributable tender.'))
 

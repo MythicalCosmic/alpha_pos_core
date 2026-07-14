@@ -30,6 +30,7 @@ def test_changes_cursor_never_advances_past_an_unread_row(settings, monkeypatch)
     )
 
     settings.ALLOWED_BRANCH_TOKENS = ['test-branch-token']
+    settings.ALLOWED_BRANCH_IDS = ['branch1']
     settings.BRANCH_TOKEN_MAP = {}
     monkeypatch.setattr(timezone, 'now', lambda: cutoff)
 
@@ -68,6 +69,7 @@ def test_changes_terminal_cursor_replays_equal_cutoff_publication(
     )
 
     settings.ALLOWED_BRANCH_TOKENS = ['test-branch-token']
+    settings.ALLOWED_BRANCH_IDS = ['branch1']
     settings.BRANCH_TOKEN_MAP = {}
     monkeypatch.setattr(timezone, 'now', lambda: cutoff)
 

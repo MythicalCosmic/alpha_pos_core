@@ -33,7 +33,7 @@ class ContractRepository(BaseSyncRepository):
 
     @classmethod
     def get_expiring(cls, days):
-        today = timezone.now().date()
+        today = timezone.localdate()
         end = today + timedelta(days=days)
         return cls.model.objects.filter(
             status=EmployeeContract.Status.ACTIVE,
@@ -43,7 +43,7 @@ class ContractRepository(BaseSyncRepository):
 
     @classmethod
     def get_expired(cls):
-        today = timezone.now().date()
+        today = timezone.localdate()
         return cls.model.objects.filter(
             status=EmployeeContract.Status.ACTIVE,
             end_date__lt=today,

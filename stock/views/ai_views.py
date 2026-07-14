@@ -98,9 +98,10 @@ def ai_suggestions(request):
             'priority': 'high',
         })
 
+    today = timezone.localdate()
     expiring_count = StockBatch.objects.filter(
-        expiry_date__lte=timezone.now().date() + timedelta(days=7),
-        expiry_date__gt=timezone.now().date(),
+        expiry_date__lte=today + timedelta(days=7),
+        expiry_date__gt=today,
         current_quantity__gt=0,
         is_deleted=False,
     ).count()

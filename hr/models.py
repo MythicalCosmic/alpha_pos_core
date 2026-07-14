@@ -3,6 +3,7 @@ from base.models import SyncMixin, SyncManager
 
 
 class Department(SyncMixin, models.Model):
+    SYNC_PULL_SCOPE = 'global'
     name = models.CharField(max_length=100)
     description = models.TextField(blank=True, default='')
     manager = models.ForeignKey(
@@ -99,6 +100,7 @@ class Employee(SyncMixin, models.Model):
 
 
 class ExpenseCategory(SyncMixin, models.Model):
+    SYNC_PULL_SCOPE = 'global'
     name = models.CharField(max_length=100)
     description = models.TextField(blank=True, default='')
     budget_limit = models.DecimalField(
@@ -465,6 +467,7 @@ class ContractDocument(SyncMixin, models.Model):
 
 
 class LeaveType(SyncMixin, models.Model):
+    SYNC_PULL_SCOPE = 'global'
     name = models.CharField(max_length=100)
     short_name = models.CharField(max_length=20, blank=True, default='')
     is_paid = models.BooleanField(default=True)

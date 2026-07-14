@@ -5,7 +5,9 @@ from django.db.models.functions import Coalesce, TruncDate, TruncMonth, TruncYea
 from django.core.paginator import Paginator
 from decimal import Decimal
 from base.repositories.base import BaseSyncRepository
-from base.models import Order, DisplayIdCounter, ChefQueueCounter, SequenceCounter
+from base.models import (
+    Order, OrderRefund, DisplayIdCounter, ChefQueueCounter, SequenceCounter,
+)
 
 
 # Wrap kitchen-handoff numbers at this point so the line never has to read
@@ -33,6 +35,14 @@ def _window_queryset(qs, field, date_from=None, date_to=None,
 
 def _rows_by_key(rows, key):
     return {row[key]: row for row in rows}
+
+
+def _refund_queryset(date_from=None, date_to=None, tod_from=None, tod_to=None):
+    """Refund money windowed by the reversal event, never the sale date."""
+    return _window_queryset(
+        OrderRefund.objects.filter(is_deleted=False), 'refunded_at',
+        date_from, date_to, tod_from, tod_to,
+    )
 
 
 class OrderRepository(BaseSyncRepository):
@@ -215,11 +225,17 @@ class OrderRepository(BaseSyncRepository):
                 qs = qs.filter(status__in=filtered)
 
         if category_ids:
-            qs = qs.filter(items__product__category_id__in=category_ids).distinct()
+            qs = qs.filter(
+                items__is_deleted=False,
+                items__product__category_id__in=category_ids,
+            ).distinct()
 
         if product_ids:
             # Orders that CONTAIN any of these products (mirrors category_ids).
-            qs = qs.filter(items__product_id__in=product_ids).distinct()
+            qs = qs.filter(
+                items__is_deleted=False,
+                items__product_id__in=product_ids,
+            ).distinct()
 
         if user_id:
             qs = qs.filter(user_id=user_id)
@@ -253,13 +269,16 @@ class OrderRepository(BaseSyncRepository):
         paid_qs = _window_queryset(
             cls.model.objects.filter(
                 is_deleted=False, is_paid=True, paid_at__isnull=False,
-            )
-            .exclude(status=Order.Status.CANCELED),
+            ),
             'paid_at', date_from, date_to, tod_from, tod_to,
+        )
+        refund_qs = _refund_queryset(
+            date_from, date_to, tod_from, tod_to,
         )
         if cashier_id:
             qs = qs.filter(cashier_id=cashier_id)
             paid_qs = paid_qs.filter(cashier_id=cashier_id)
+            refund_qs = refund_qs.filter(cashier_id=cashier_id)
         if product_ids:
             # Orders CONTAINING any of these products — via a SUBQUERY, not a join,
             # so the Count/Sum aggregates below don't fan out (an order with two
@@ -270,6 +289,7 @@ class OrderRepository(BaseSyncRepository):
             ).values('order_id')
             qs = qs.filter(id__in=product_orders)
             paid_qs = paid_qs.filter(id__in=product_orders)
+            refund_qs = refund_qs.filter(order_id__in=product_orders)
 
         stats = qs.aggregate(
             total=Count('id'),
@@ -280,7 +300,7 @@ class OrderRepository(BaseSyncRepository):
             cancelled=Count('id', filter=Q(status='CANCELED')),
             unpaid=Count('id', filter=Q(is_paid=False, status__in=['PREPARING', 'READY', 'COMPLETED'])),
         )
-        stats.update(paid_qs.aggregate(
+        money = paid_qs.aggregate(
             total_revenue=Coalesce(
                 Sum('total_amount'), Decimal('0.00'), output_field=DecimalField(),
             ),
@@ -288,7 +308,17 @@ class OrderRepository(BaseSyncRepository):
                 Avg('total_amount'), Decimal('0.00'), output_field=DecimalField(),
             ),
             paid=Count('id'),
-        ))
+        )
+        refunds = refund_qs.aggregate(
+            refunded=Count('id'),
+            refund_amount=Coalesce(
+                Sum('amount'), Decimal('0.00'), output_field=DecimalField(),
+            ),
+        )
+        money['gross_revenue'] = money['total_revenue']
+        money['total_revenue'] -= refunds['refund_amount']
+        stats.update(money)
+        stats.update(refunds)
         return stats
 
     @classmethod
@@ -302,13 +332,16 @@ class OrderRepository(BaseSyncRepository):
         paid_qs = _window_queryset(
             cls.model.objects.filter(
                 is_deleted=False, is_paid=True, paid_at__isnull=False,
-            )
-            .exclude(status=Order.Status.CANCELED),
+            ),
             'paid_at', date_from, date_to, tod_from, tod_to,
+        )
+        refund_qs = _refund_queryset(
+            date_from, date_to, tod_from, tod_to,
         )
         if cashier_id:
             qs = qs.filter(cashier_id=cashier_id)
             paid_qs = paid_qs.filter(cashier_id=cashier_id)
+            refund_qs = refund_qs.filter(cashier_id=cashier_id)
 
         # Bucket by BUSINESS date (03:00 cutover), not calendar midnight, so the
         # daily series matches the business-day windowing used everywhere else.
@@ -326,13 +359,34 @@ class OrderRepository(BaseSyncRepository):
             ),
             paid=Count('id'),
         ))
+        refunds = list(refund_qs.annotate(
+            date=business_day_date_expr('refunded_at'),
+        ).values('date').annotate(
+            refund_amount=Coalesce(
+                Sum('amount'), Decimal('0.00'), output_field=DecimalField(),
+            ),
+            refunded=Count('id'),
+        ))
         by_date = _rows_by_key(activity, 'date')
         for row in revenue:
-            by_date.setdefault(row['date'], {
+            target = by_date.setdefault(row['date'], {
                 'date': row['date'], 'orders': 0, 'cancelled': 0,
-            }).update(revenue=row['revenue'], paid=row['paid'])
+            })
+            target.update(
+                gross_revenue=row['revenue'], revenue=row['revenue'], paid=row['paid'],
+            )
+        for row in refunds:
+            target = by_date.setdefault(row['date'], {
+                'date': row['date'], 'orders': 0, 'cancelled': 0,
+            })
+            target['refund_amount'] = row['refund_amount']
+            target['refunded'] = row['refunded']
+            target['revenue'] = target.get('revenue', Decimal('0.00')) - row['refund_amount']
         for row in by_date.values():
             row.setdefault('revenue', Decimal('0.00'))
+            row.setdefault('gross_revenue', Decimal('0.00'))
+            row.setdefault('refund_amount', Decimal('0.00'))
+            row.setdefault('refunded', 0)
             row.setdefault('paid', 0)
         return [
             by_date[key]
@@ -350,9 +404,10 @@ class OrderRepository(BaseSyncRepository):
         paid_qs = _window_queryset(
             cls.model.objects.filter(
                 is_deleted=False, is_paid=True, paid_at__isnull=False,
-            ).exclude(status=Order.Status.CANCELED),
+            ),
             'paid_at', date_from, date_to,
         )
+        refund_qs = _refund_queryset(date_from, date_to)
         activity = list(qs.annotate(
             month=TruncMonth(business_day_date_expr('created_at')),
         ).values('month').annotate(
@@ -370,17 +425,36 @@ class OrderRepository(BaseSyncRepository):
             ),
             paid=Count('id'),
         ))
+        refunds = list(refund_qs.annotate(
+            month=TruncMonth(business_day_date_expr('refunded_at')),
+        ).values('month').annotate(
+            refund_amount=Coalesce(
+                Sum('amount'), Decimal('0.00'), output_field=DecimalField(),
+            ),
+            refunded=Count('id'),
+        ))
         by_month = _rows_by_key(activity, 'month')
         for row in money:
             target = by_month.setdefault(row['month'], {
                 'month': row['month'], 'orders': 0, 'cancelled': 0,
             })
             target.update(
-                revenue=row['revenue'], avg_order_value=row['avg_order_value'],
+                gross_revenue=row['revenue'], revenue=row['revenue'],
+                avg_order_value=row['avg_order_value'],
                 paid=row['paid'],
             )
+        for row in refunds:
+            target = by_month.setdefault(row['month'], {
+                'month': row['month'], 'orders': 0, 'cancelled': 0,
+            })
+            target['refund_amount'] = row['refund_amount']
+            target['refunded'] = row['refunded']
+            target['revenue'] = target.get('revenue', Decimal('0.00')) - row['refund_amount']
         for row in by_month.values():
             row.setdefault('revenue', Decimal('0.00'))
+            row.setdefault('gross_revenue', Decimal('0.00'))
+            row.setdefault('refund_amount', Decimal('0.00'))
+            row.setdefault('refunded', 0)
             row.setdefault('avg_order_value', Decimal('0.00'))
             row.setdefault('paid', 0)
         return [
@@ -400,7 +474,7 @@ class OrderRepository(BaseSyncRepository):
         ))
         money = list(cls.model.objects.filter(
             is_deleted=False, is_paid=True, paid_at__isnull=False,
-        ).exclude(status=Order.Status.CANCELED).annotate(
+        ).annotate(
             year=TruncYear(business_day_date_expr('paid_at')),
         ).values('year').annotate(
             revenue=Coalesce(
@@ -408,13 +482,33 @@ class OrderRepository(BaseSyncRepository):
             ),
             paid=Count('id'),
         ))
+        refunds = list(OrderRefund.objects.filter(is_deleted=False).annotate(
+            year=TruncYear(business_day_date_expr('refunded_at')),
+        ).values('year').annotate(
+            refund_amount=Coalesce(
+                Sum('amount'), Decimal('0.00'), output_field=DecimalField(),
+            ),
+            refunded=Count('id'),
+        ))
         by_year = _rows_by_key(activity, 'year')
         for row in money:
             by_year.setdefault(row['year'], {
                 'year': row['year'], 'orders': 0, 'cancelled': 0,
-            }).update(revenue=row['revenue'], paid=row['paid'])
+            }).update(
+                gross_revenue=row['revenue'], revenue=row['revenue'], paid=row['paid'],
+            )
+        for row in refunds:
+            target = by_year.setdefault(row['year'], {
+                'year': row['year'], 'orders': 0, 'cancelled': 0,
+            })
+            target['refund_amount'] = row['refund_amount']
+            target['refunded'] = row['refunded']
+            target['revenue'] = target.get('revenue', Decimal('0.00')) - row['refund_amount']
         for row in by_year.values():
             row.setdefault('revenue', Decimal('0.00'))
+            row.setdefault('gross_revenue', Decimal('0.00'))
+            row.setdefault('refund_amount', Decimal('0.00'))
+            row.setdefault('refunded', 0)
             row.setdefault('paid', 0)
         return [
             by_year[key]
@@ -431,8 +525,11 @@ class OrderRepository(BaseSyncRepository):
             cls.model.objects.filter(
                 is_deleted=False, is_paid=True, paid_at__isnull=False,
                 cashier__isnull=False,
-            ).exclude(status=Order.Status.CANCELED),
+            ),
             'paid_at', date_from, date_to,
+        )
+        refund_qs = _refund_queryset(date_from, date_to).filter(
+            cashier__isnull=False,
         )
         activity = list(qs.values(
             'cashier_id', 'cashier__first_name', 'cashier__last_name'
@@ -448,6 +545,14 @@ class OrderRepository(BaseSyncRepository):
             ),
             paid=Count('id'),
         ))
+        refunds = list(refund_qs.values(
+            'cashier_id', 'cashier__first_name', 'cashier__last_name',
+        ).annotate(
+            refund_amount=Coalesce(
+                Sum('amount'), Decimal('0.00'), output_field=DecimalField(),
+            ),
+            refunded=Count('id'),
+        ))
         by_cashier = _rows_by_key(activity, 'cashier_id')
         for row in money:
             target = by_cashier.setdefault(row['cashier_id'], {
@@ -456,10 +561,24 @@ class OrderRepository(BaseSyncRepository):
                 'cashier__last_name': row['cashier__last_name'],
                 'orders': 0, 'cancelled': 0,
             })
+            target['gross_revenue'] = row['revenue']
             target['revenue'] = row['revenue']
             target['paid'] = row['paid']
+        for row in refunds:
+            target = by_cashier.setdefault(row['cashier_id'], {
+                'cashier_id': row['cashier_id'],
+                'cashier__first_name': row['cashier__first_name'],
+                'cashier__last_name': row['cashier__last_name'],
+                'orders': 0, 'cancelled': 0,
+            })
+            target['refund_amount'] = row['refund_amount']
+            target['refunded'] = row['refunded']
+            target['revenue'] = target.get('revenue', Decimal('0.00')) - row['refund_amount']
         for row in by_cashier.values():
             row.setdefault('revenue', Decimal('0.00'))
+            row.setdefault('gross_revenue', Decimal('0.00'))
+            row.setdefault('refund_amount', Decimal('0.00'))
+            row.setdefault('refunded', 0)
             row.setdefault('paid', 0)
         return sorted(
             by_cashier.values(), key=lambda row: row['orders'], reverse=True,
@@ -474,23 +593,40 @@ class OrderRepository(BaseSyncRepository):
         paid_qs = _window_queryset(
             cls.model.objects.filter(
                 is_deleted=False, is_paid=True, paid_at__isnull=False,
-            )
-            .exclude(status=Order.Status.CANCELED),
+            ),
             'paid_at', date_from, date_to,
         )
+        refund_qs = _refund_queryset(date_from, date_to)
         activity = list(qs.values('status').annotate(count=Count('id')))
         money = list(paid_qs.values('status').annotate(
             revenue=Coalesce(
                 Sum('total_amount'), Decimal('0.00'), output_field=DecimalField(),
             ),
         ))
+        refunds = list(refund_qs.values('order__status').annotate(
+            refund_amount=Coalesce(
+                Sum('amount'), Decimal('0.00'), output_field=DecimalField(),
+            ),
+            refunded=Count('id'),
+        ))
         by_status = _rows_by_key(activity, 'status')
         for row in money:
-            by_status.setdefault(row['status'], {
+            target = by_status.setdefault(row['status'], {
                 'status': row['status'], 'count': 0,
-            })['revenue'] = row['revenue']
+            })
+            target['gross_revenue'] = row['revenue']
+            target['revenue'] = row['revenue']
+        for row in refunds:
+            status = row['order__status']
+            target = by_status.setdefault(status, {'status': status, 'count': 0})
+            target['refund_amount'] = row['refund_amount']
+            target['refunded'] = row['refunded']
+            target['revenue'] = target.get('revenue', Decimal('0.00')) - row['refund_amount']
         for row in by_status.values():
             row.setdefault('revenue', Decimal('0.00'))
+            row.setdefault('gross_revenue', Decimal('0.00'))
+            row.setdefault('refund_amount', Decimal('0.00'))
+            row.setdefault('refunded', 0)
         return [by_status[key] for key in sorted(by_status)]
 
     @classmethod
@@ -502,23 +638,42 @@ class OrderRepository(BaseSyncRepository):
         paid_qs = _window_queryset(
             cls.model.objects.filter(
                 is_deleted=False, is_paid=True, paid_at__isnull=False,
-            )
-            .exclude(status=Order.Status.CANCELED),
+            ),
             'paid_at', date_from, date_to,
         )
+        refund_qs = _refund_queryset(date_from, date_to)
         activity = list(qs.values('order_type').annotate(count=Count('id')))
         money = list(paid_qs.values('order_type').annotate(
             revenue=Coalesce(
                 Sum('total_amount'), Decimal('0.00'), output_field=DecimalField(),
             ),
         ))
+        refunds = list(refund_qs.values('order__order_type').annotate(
+            refund_amount=Coalesce(
+                Sum('amount'), Decimal('0.00'), output_field=DecimalField(),
+            ),
+            refunded=Count('id'),
+        ))
         by_type = _rows_by_key(activity, 'order_type')
         for row in money:
-            by_type.setdefault(row['order_type'], {
+            target = by_type.setdefault(row['order_type'], {
                 'order_type': row['order_type'], 'count': 0,
-            })['revenue'] = row['revenue']
+            })
+            target['gross_revenue'] = row['revenue']
+            target['revenue'] = row['revenue']
+        for row in refunds:
+            order_type = row['order__order_type']
+            target = by_type.setdefault(order_type, {
+                'order_type': order_type, 'count': 0,
+            })
+            target['refund_amount'] = row['refund_amount']
+            target['refunded'] = row['refunded']
+            target['revenue'] = target.get('revenue', Decimal('0.00')) - row['refund_amount']
         for row in by_type.values():
             row.setdefault('revenue', Decimal('0.00'))
+            row.setdefault('gross_revenue', Decimal('0.00'))
+            row.setdefault('refund_amount', Decimal('0.00'))
+            row.setdefault('refunded', 0)
         return [by_type[key] for key in sorted(by_type)]
 
     @classmethod
@@ -561,9 +716,11 @@ class OrderRepository(BaseSyncRepository):
         paid_qs = _window_queryset(
             cls.model.objects.filter(
                 is_deleted=False, is_paid=True, paid_at__isnull=False,
-            )
-            .exclude(status=Order.Status.CANCELED),
+            ),
             'paid_at', date_from, date_to, tod_from, tod_to,
+        )
+        refund_qs = _refund_queryset(
+            date_from, date_to, tod_from, tod_to,
         )
 
         # Local hour (Asia/Tashkent) — ExtractHour without tzinfo bucketed on UTC,
@@ -578,13 +735,33 @@ class OrderRepository(BaseSyncRepository):
                 Sum('total_amount'), Decimal('0.00'), output_field=DecimalField(),
             ),
         ))
+        refunds = list(refund_qs.annotate(
+            hour=ExtractHour('refunded_at', tzinfo=_tz.get_current_timezone()),
+        ).values('hour').annotate(
+            refund_amount=Coalesce(
+                Sum('amount'), Decimal('0.00'), output_field=DecimalField(),
+            ),
+            refunded=Count('id'),
+        ))
         by_hour = _rows_by_key(activity, 'hour')
         for row in money:
-            by_hour.setdefault(row['hour'], {
+            target = by_hour.setdefault(row['hour'], {
                 'hour': row['hour'], 'count': 0,
-            })['revenue'] = row['revenue']
+            })
+            target['gross_revenue'] = row['revenue']
+            target['revenue'] = row['revenue']
+        for row in refunds:
+            target = by_hour.setdefault(row['hour'], {
+                'hour': row['hour'], 'count': 0,
+            })
+            target['refund_amount'] = row['refund_amount']
+            target['refunded'] = row['refunded']
+            target['revenue'] = target.get('revenue', Decimal('0.00')) - row['refund_amount']
         for row in by_hour.values():
             row.setdefault('revenue', Decimal('0.00'))
+            row.setdefault('gross_revenue', Decimal('0.00'))
+            row.setdefault('refund_amount', Decimal('0.00'))
+            row.setdefault('refunded', 0)
         return [
             by_hour[key]
             for key in sorted(key for key in by_hour if key is not None)

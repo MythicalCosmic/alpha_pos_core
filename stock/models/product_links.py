@@ -80,7 +80,6 @@ class ProductStockLink(SyncMixin, models.Model):
 
 
 class ProductComponentStock(SyncMixin, models.Model):
-
     product_stock_link = models.ForeignKey(
         ProductStockLink, on_delete=models.CASCADE, related_name="components"
     )

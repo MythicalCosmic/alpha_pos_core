@@ -106,7 +106,7 @@ class ShiftNotification:
 
     @classmethod
     def _get_shift_stats(cls, start_time, end_time=None, cashier_id=None):
-        from base.models import Order, OrderItem
+        from base.models import Order, OrderItem, OrderRefund
         from datetime import datetime
 
         if end_time is None:
@@ -128,9 +128,16 @@ class ShiftNotification:
             is_paid=True,
             paid_at__gte=start_time,
             paid_at__lte=end_time,
-        ).exclude(status='CANCELED')
+        )
         if cashier_id:
             paid_orders = paid_orders.filter(cashier_id=cashier_id)
+        refunds = OrderRefund.objects.filter(
+            is_deleted=False,
+            refunded_at__gte=start_time,
+            refunded_at__lte=end_time,
+        )
+        if cashier_id:
+            refunds = refunds.filter(cashier_id=cashier_id)
 
         agg = orders.aggregate(
             total=Count('id'),
@@ -143,7 +150,9 @@ class ShiftNotification:
             revenue=Sum('total_amount'), avg_value=Avg('total_amount'),
             paid=Count('id'),
         )
-        revenue = money['revenue'] or Decimal('0')
+        gross_revenue = money['revenue'] or Decimal('0')
+        refund_total = refunds.aggregate(total=Sum('amount'))['total'] or Decimal('0')
+        revenue = gross_revenue - refund_total
         avg_value = money['avg_value'] or Decimal('0')
 
         ready_orders = orders.filter(
@@ -163,6 +172,14 @@ class ShiftNotification:
                 rev=Sum('total_amount'),
             )
         }
+        for row in refunds.values('order__order_type').annotate(
+            rev=Sum('amount'),
+        ):
+            order_type = row['order__order_type']
+            type_revenue[order_type] = (
+                type_revenue.get(order_type, Decimal('0'))
+                - (row['rev'] or Decimal('0'))
+            )
         order_types = {
             'HALL': {'count': 0, 'revenue': Decimal('0')},
             'DELIVERY': {'count': 0, 'revenue': Decimal('0')},
@@ -192,13 +209,30 @@ class ShiftNotification:
         if cashier_id:
             item_q &= Q(order__cashier_id=cashier_id)
 
-        from base.services.revenue import net_line_revenue
-        top = list(OrderItem.objects.filter(
+        sale_items = OrderItem.objects.filter(
             item_q, is_deleted=False, order__is_deleted=False,
-        ).exclude(order__status='CANCELED').values('product__name').annotate(
-            qty=Sum('quantity'),
-            rev=Sum(net_line_revenue()),
-        ).order_by('-qty')[:5])
+        )
+        from base.services.refund_lines import refund_item_events
+        refund_filters = {
+            'refunded_at__gte': start_time,
+            'refunded_at__lte': end_time,
+        }
+        if cashier_id:
+            refund_filters['cashier_id'] = cashier_id
+        refund_items = refund_item_events(**refund_filters)
+        from base.services.revenue import net_grouped_items
+        top = net_grouped_items(
+            sale_items, refund_items, ('product__name',),
+        )
+        top.sort(key=lambda row: (-(row['q'] or 0), row['product__name'] or ''))
+        top = [
+            {
+                'product__name': row['product__name'],
+                'qty': row['q'],
+                'rev': row['rev'],
+            }
+            for row in top[:5]
+        ]
 
         duration_min = int((end_time - start_time).total_seconds() / 60)
 
@@ -209,6 +243,9 @@ class ShiftNotification:
             'cancelled_orders': agg['cancelled'],
             'completed_orders': agg['completed'],
             'total_revenue': revenue,
+            'gross_revenue': gross_revenue,
+            'refunds': refund_total,
+            'refunded_orders': refunds.count(),
             'avg_order_value': avg_value,
             'avg_prep_seconds': avg_prep,
             'order_types': order_types,

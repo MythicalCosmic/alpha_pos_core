@@ -48,7 +48,9 @@ class StockCategoryRepository(BaseSyncRepository):
     @classmethod
     def clear_items_category(cls, category):
         from stock.models import StockItem
-        return StockItem.objects.filter(category=category).update(category=None)
+        return cls.sync_update_queryset(
+            StockItem.objects.filter(category=category), category=None,
+        )
 
     @classmethod
     def search(cls, queryset, query):
@@ -57,4 +59,6 @@ class StockCategoryRepository(BaseSyncRepository):
     @classmethod
     def reorder(cls, ordered_ids):
         for index, cat_id in enumerate(ordered_ids):
-            cls.model.objects.filter(id=cat_id).update(sort_order=index)
+            cls.sync_update_queryset(
+                cls.model.objects.filter(id=cat_id), sort_order=index,
+            )

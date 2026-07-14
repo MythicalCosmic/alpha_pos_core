@@ -100,10 +100,10 @@ class SupplierStockItemRepository(BaseSyncRepository):
         ).exists()
 
     @classmethod
-    def clear_preferred(cls, supplier_id, exclude_id=None):
+    def clear_preferred(cls, stock_item_id, exclude_id=None):
         qs = cls.model.objects.filter(
-            supplier_id=supplier_id, is_preferred=True
+            stock_item_id=stock_item_id, is_preferred=True
         )
         if exclude_id:
             qs = qs.exclude(id=exclude_id)
-        return qs.update(is_preferred=False)
+        return cls.sync_update_queryset(qs, is_preferred=False)

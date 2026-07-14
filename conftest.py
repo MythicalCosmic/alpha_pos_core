@@ -6,6 +6,12 @@ import pytest
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'alpha_pos.settings')
 os.environ.setdefault('DEBUG', 'True')
 os.environ.setdefault('SECRET_KEY', 'pytest-secret-key')
+# The shared core test suite models the current single-branch cloud deployment.
+# Production receives the same explicit value from docker-compose; tests that
+# exercise multi-branch fail-closed behavior override this setting to blank.
+os.environ['CLOUD_DEFAULT_TARGET_BRANCH_ID'] = (
+    os.environ.get('CLOUD_DEFAULT_TARGET_BRANCH_ID') or 'branch1'
+)
 # Django forces settings.DEBUG=False during the test run regardless of the
 # env var, which trips the production fail-closed path in
 # licensing.services.crypto. Pin a stable Fernet key so the at-rest encryption
@@ -19,6 +25,13 @@ os.environ.setdefault(
 )
 
 django.setup()
+
+
+@pytest.fixture(autouse=True)
+def _single_branch_cloud_target(settings):
+    """Match the explicit single-branch target used by production tests."""
+    if not getattr(settings, 'CLOUD_DEFAULT_TARGET_BRANCH_ID', ''):
+        settings.CLOUD_DEFAULT_TARGET_BRANCH_ID = 'branch1'
 
 
 @pytest.fixture(autouse=True)

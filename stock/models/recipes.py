@@ -104,7 +104,6 @@ class Recipe(SyncMixin, models.Model):
 
 
 class RecipeIngredient(SyncMixin, models.Model):
-
     recipe = models.ForeignKey(
         Recipe, on_delete=models.CASCADE, related_name="ingredients"
     )
@@ -140,7 +139,6 @@ class RecipeIngredient(SyncMixin, models.Model):
 
 
 class RecipeIngredientSubstitute(SyncMixin, models.Model):
-
     recipe_ingredient = models.ForeignKey(
         RecipeIngredient, on_delete=models.CASCADE, related_name="substitutes"
     )
@@ -170,7 +168,6 @@ class RecipeIngredientSubstitute(SyncMixin, models.Model):
 
 
 class RecipeByProduct(SyncMixin, models.Model):
-
     recipe = models.ForeignKey(
         Recipe, on_delete=models.CASCADE, related_name="by_products"
     )
@@ -199,7 +196,6 @@ class RecipeByProduct(SyncMixin, models.Model):
 
 
 class RecipeStep(SyncMixin, models.Model):
-
     recipe = models.ForeignKey(
         Recipe, on_delete=models.CASCADE, related_name="steps"
     )

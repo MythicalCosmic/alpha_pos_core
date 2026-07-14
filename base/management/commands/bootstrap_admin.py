@@ -95,16 +95,21 @@ class Command(BaseCommand):
             status=User.UserStatus.ACTIVE,
         )
 
-        # Print credentials prominently — banner with stderr so it survives
-        # in service logs even when stdout is piped to a log rotator.
+        # A generated one-time password has no other delivery channel, so print
+        # it prominently.  A caller-supplied password usually came from an env
+        # file or secret manager and must never be copied into deployment logs.
         banner = '=' * 64
+        password_line = (
+            f'  Password: {password}  (auto-generated — record it NOW)'
+            if generated
+            else '  Password: supplied securely (not printed)'
+        )
         msg = (
             f'\n{banner}\n'
             f'  ALPHA POS — first admin created\n'
             f'{banner}\n'
             f'  Email:    {email}\n'
-            f'  Password: {password}'
-            f'{"  (auto-generated — record it NOW)" if generated else ""}\n'
+            f'{password_line}\n'
             f'  Role:     ADMIN\n'
             f'  User ID:  {user.id}\n'
             f'{banner}\n'

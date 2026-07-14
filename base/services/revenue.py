@@ -12,7 +12,7 @@ subtotal falls back to gross line value rather than dividing by zero.
 """
 from decimal import Decimal
 
-from django.db.models import Case, DecimalField, ExpressionWrapper, F, Value, When
+from django.db.models import Case, DecimalField, ExpressionWrapper, F, Sum, Value, When
 from django.db.models.functions import Greatest
 
 
@@ -43,3 +43,45 @@ def net_line_revenue():
         default=gross,
         output_field=REVENUE_FIELD,
     )
+
+
+def net_grouped_items(sale_items, refund_items, fields):
+    """Group product events and subtract refund-date quantities/revenue.
+
+    ``sale_items`` is bounded by ``order.paid_at``; ``refund_items`` is bounded
+    independently by ``order.refunds.refunded_at``. Keeping both clocks avoids
+    erasing a prior-day sale merely because its order was canceled today.
+    """
+    sales = sale_items.values(*fields).annotate(
+        q=Sum('quantity'), rev=Sum(net_line_revenue()),
+    )
+    from base.services.refund_lines import (
+        REFUND_EVENT_ALIAS, refund_line_quantity, refund_line_revenue,
+    )
+    refunds = refund_items.values(*fields).annotate(
+        # Provider/tender refunds reverse proportional money only. Physical
+        # units reverse once, on the terminal ORDER_CANCEL event.
+        q=Sum(refund_line_quantity(REFUND_EVENT_ALIAS)),
+        rev=Sum(refund_line_revenue(REFUND_EVENT_ALIAS)),
+    )
+
+    def key(row):
+        return tuple(row.get(field) for field in fields)
+
+    merged = {key(row): dict(row) for row in sales}
+    for row in refunds:
+        target = merged.setdefault(
+            key(row), {field: row.get(field) for field in fields},
+        )
+        target['refund_q'] = row['q'] or 0
+        target['refund_rev'] = row['rev'] or Decimal('0.00')
+    for row in merged.values():
+        gross_q = row.get('q') or 0
+        gross_rev = row.get('rev') or Decimal('0.00')
+        row['gross_q'] = gross_q
+        row['gross_rev'] = gross_rev
+        row.setdefault('refund_q', 0)
+        row.setdefault('refund_rev', Decimal('0.00'))
+        row['q'] = gross_q - row['refund_q']
+        row['rev'] = gross_rev - row['refund_rev']
+    return list(merged.values())

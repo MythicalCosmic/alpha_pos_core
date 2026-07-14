@@ -1,14 +1,34 @@
 import logging
 from decimal import Decimal, InvalidOperation
-from django.db import transaction
+from django.conf import settings
+from django.db import IntegrityError, transaction
 from django.db.models import Q, Sum, Count, DecimalField
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 from base.repositories.shift import ShiftTemplateRepository, ShiftRepository, CashReconciliationRepository
 from base.helpers.response import ServiceResponse
-from base.models import Order, Shift
+from base.models import CashReconciliation, Order, Shift, User
 
 logger = logging.getLogger(__name__)
+
+_MONEY_QUANTUM = Decimal('0.01')
+_MAX_MONEY = Decimal('9999999999.99')
+
+
+def _money(value):
+    """Return a finite, 2dp Decimal accepted by signed 12,2 columns."""
+    try:
+        amount = Decimal(str(value)).quantize(_MONEY_QUANTUM)
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not amount.is_finite() or abs(amount) > _MAX_MONEY:
+        return None
+    return amount
+
+
+def _nonnegative_money(value):
+    amount = _money(value)
+    return amount if amount is not None and amount >= 0 else None
 
 
 class ShiftTemplateService:
@@ -90,14 +110,14 @@ class ShiftService:
     @staticmethod
     def list(page=1, per_page=20, user_id=None, status=None, date_from=None,
              date_to=None, live_only=False):
-        # _serialize_shift reads reconciliation(+reconciled_by) per row. select_related
-        # on a reverse one-to-one does NOT cache ABSENCE (Django re-queries per shift
-        # that has no reconciliation -> O(rows)), so prefetch it instead: one extra
-        # query for the whole page that DOES cache the empty result. (The rich metrics
-        # are likewise batched into O(1) by _batch_list_extras.)
+        # Join the optional one-to-one and its actor in the page query. Django
+        # caches both presence and absence from this outer join, so normal
+        # unreconciled shifts neither query per-row nor emit exception logs.
         qs = (ShiftRepository.get_all()
-              .select_related('user', 'shift_template')
-              .prefetch_related('reconciliation', 'reconciliation__reconciled_by'))
+              .select_related(
+                  'user', 'shift_template',
+                  'reconciliation', 'reconciliation__reconciled_by',
+              ))
 
         if user_id:
             qs = qs.filter(user_id=user_id)
@@ -162,8 +182,73 @@ class ShiftService:
         return ServiceResponse.success(data=data)
 
     @staticmethod
-    def start_shift(user_id, shift_template_id=None):
-        active = ShiftRepository.get_active_for_user(user_id)
+    @transaction.atomic
+    def start_shift(user_id, shift_template_id=None, actor=None, branch_id=None):
+        # The user row is the serialization point for concurrent starts. The
+        # partial unique constraint remains the definitive cross-process guard
+        # (and protects writers that bypass this service).
+        user = (
+            User.objects.select_for_update()
+            .filter(pk=user_id, is_deleted=False)
+            .first()
+        )
+        if user is None:
+            return ServiceResponse.not_found('User not found')
+        if user.status != User.UserStatus.ACTIVE:
+            return ServiceResponse.error('Suspended user cannot start a shift')
+        if user.role not in {
+            User.RoleChoices.ADMIN,
+            User.RoleChoices.MANAGER,
+            User.RoleChoices.CASHIER,
+            User.RoleChoices.WAITER,
+        }:
+            return ServiceResponse.forbidden('Only POS staff can start a shift')
+
+        if (
+            actor is not None
+            and actor.id != user.id
+            and getattr(actor, 'role', None) not in ('ADMIN', 'MANAGER')
+        ):
+            return ServiceResponse.forbidden(
+                'You can only start your own shift',
+            )
+
+        user_branch = str(user.branch_id or '').strip()
+        user_is_global = user_branch.lower() == 'cloud'
+        mode = getattr(settings, 'DEPLOYMENT_MODE', 'local')
+        requested_branch = str(branch_id or '').strip()
+        if mode != 'cloud':
+            node_branch = str(getattr(settings, 'BRANCH_ID', '') or '').strip()
+            if not node_branch:
+                return ServiceResponse.error(
+                    'This terminal has no branch identity',
+                )
+            if requested_branch and requested_branch != node_branch:
+                return ServiceResponse.forbidden(
+                    'Requested branch differs from this terminal',
+                )
+            operational_branch = node_branch
+        else:
+            operational_branch = requested_branch or (
+                '' if user_is_global else user_branch
+            )
+        if not operational_branch:
+            return ServiceResponse.error(
+                'An operational branch is required to start this shift',
+            )
+        if not user_branch or (
+            not user_is_global and user_branch != operational_branch
+        ):
+            return ServiceResponse.forbidden(
+                'User belongs to a different branch',
+            )
+
+        active = Shift.objects.filter(
+            is_deleted=False,
+            user=user,
+            status=Shift.Status.ACTIVE,
+            end_time__isnull=True,
+        ).first()
         if active:
             return ServiceResponse.error("User already has an active shift")
 
@@ -171,6 +256,7 @@ class ShiftService:
             'user_id': user_id,
             'start_time': timezone.now(),
             'status': 'ACTIVE',
+            'branch_id': operational_branch,
         }
         if shift_template_id:
             template = ShiftTemplateRepository.get_by_id(shift_template_id)
@@ -178,7 +264,13 @@ class ShiftService:
                 return ServiceResponse.not_found("Shift template not found")
             kwargs['shift_template'] = template
 
-        shift = ShiftRepository.create(**kwargs)
+        try:
+            # Inner savepoint keeps the outer transaction usable when the
+            # database constraint wins a concurrent create race.
+            with transaction.atomic():
+                shift = ShiftRepository.create(**kwargs)
+        except IntegrityError:
+            return ServiceResponse.error('User already has an active shift')
         shift = ShiftRepository.get_with_relations(shift.id)
         return ServiceResponse.created(data=ShiftService._serialize_shift(shift))
 
@@ -251,21 +343,30 @@ class ShiftService:
             is_paid=True,
             paid_at__gte=shift.start_time,
             paid_at__lte=now,
-        ).exclude(status='CANCELED')
+        )
         # cash_collected is DERIVED from the tender split, not from
         # Sum(total_amount, filter=payment_method='CASH'): that booked a MIXED
         # order's cash leg as ZERO (the whole sale vanished from cash), and it
         # ignored the customer's change on split payments. base.services.tender is
         # the single implementation shared with the drawer and the dashboards.
-        from base.services.tender import breakdown_for_orders
-        _split, _ = breakdown_for_orders(paid_orders)
+        from base.services.tender import breakdown_sources_for_orders
+        _split, _, _drawer_sales = breakdown_sources_for_orders(paid_orders)
+        from base.models import OrderRefund
+        from base.services.order_refund import refund_totals
+        _refunded = refund_totals(OrderRefund.objects.filter(
+            is_deleted=False, shift=shift,
+        ))
         money = {
             'total_revenue': paid_orders.aggregate(
                 s=Coalesce(Sum('total_amount'), Decimal('0.00'),
-                           output_field=DecimalField()))['s'],
+                           output_field=DecimalField()))['s']
+                - _refunded['amount'],
             # Gross cash taken this shift (before cashbox pay-outs; the drawer's
-            # expected figure nets those separately).
-            'cash_collected': _split['cash'],
+            # expected figure nets those separately). Refund cash reverses only
+            # in the shift that returned it, never by erasing the original sale.
+            'cash_collected': (
+                _drawer_sales - _refunded['drawer_cash_amount']
+            ),
         }
 
         shift = ShiftRepository.update(
@@ -307,7 +408,8 @@ class ShiftService:
                     ShiftPaymentTotal.objects.update_or_create(
                         shift=shift, method=method,
                         defaults={'expected_amount': exp, 'counted_amount': cnt,
-                                  'difference': cnt - exp},
+                                  'difference': cnt - exp,
+                                  'branch_id': shift.branch_id},
                     )
         except Exception:
             logger.exception(
@@ -362,8 +464,14 @@ class ShiftService:
         # 4.52M in the drawer, not 6.1M). Prefer the frozen CASH settlement row;
         # fall back to the live net drawer figure, then to gross as a last resort.
         from cashbox.models import ShiftPaymentTotal
-        _spt_cash = ShiftPaymentTotal.objects.filter(
-            shift=shift, method='CASH', is_deleted=False).first()
+        settlement_rows = list(
+            ShiftPaymentTotal.objects.select_for_update().filter(
+                shift=shift, is_deleted=False,
+            ).order_by('method')
+        )
+        _spt_cash = next(
+            (row for row in settlement_rows if row.method == 'CASH'), None,
+        )
         if _spt_cash is not None:
             expected_cash = _spt_cash.expected_amount
         else:
@@ -373,7 +481,104 @@ class ShiftService:
                     'CASH', shift.cash_collected)
             except Exception:  # noqa: BLE001 — never block reconcile on a recompute
                 expected_cash = shift.cash_collected
-        actual = Decimal(str(actual_cash))
+
+        # Expected cash is signed shift movement, not an opening-float-aware
+        # physical balance. A refund of an earlier-shift sale can legitimately
+        # make it negative; the manager's actual count remains non-negative.
+        expected_cash = _money(expected_cash)
+        if expected_cash is None:
+            return ServiceResponse.validation_error(
+                errors={'expected_cash': 'Expected drawer cash is invalid'},
+                message='Cannot reconcile an invalid drawer balance',
+            )
+
+        actual = _nonnegative_money(actual_cash)
+        if actual is None:
+            return ServiceResponse.validation_error(
+                errors={'actual_cash': 'Must be a non-negative money amount'},
+                message='Invalid actual cash',
+            )
+
+        # If end_shift's best-effort settlement write could not create CASH,
+        # rebuild that missing identity here. A CashReconciliation must always
+        # agree with a per-method CASH confirmation.
+        if _spt_cash is None:
+            # Keep it unsaved until every input below has passed validation;
+            # returning a 422 from an @atomic function does not roll back by
+            # itself, so creating it here would commit a partial reconciliation.
+            _spt_cash = ShiftPaymentTotal(
+                shift=shift,
+                method='CASH',
+                expected_amount=expected_cash,
+                counted_amount=Decimal('0.00'),
+                difference=-expected_cash,
+                branch_id=shift.branch_id,
+            )
+            settlement_rows.append(_spt_cash)
+
+        if confirmed is None:
+            confirmed = {}
+        if not isinstance(confirmed, dict):
+            return ServiceResponse.validation_error(
+                errors={'confirmed': 'Must be an object keyed by payment method'},
+                message='Invalid confirmation totals',
+            )
+
+        normalized_confirmed = {}
+        for key, raw in confirmed.items():
+            method = str(key or '').strip().upper()
+            if not method:
+                return ServiceResponse.validation_error(
+                    errors={'confirmed': 'Payment method cannot be blank'},
+                    message='Invalid confirmation totals',
+                )
+            if method in normalized_confirmed and normalized_confirmed[method] != raw:
+                return ServiceResponse.validation_error(
+                    errors={'confirmed': f'Conflicting values supplied for {method}'},
+                    message='Contradictory confirmation totals',
+                )
+            normalized_confirmed[method] = raw
+
+        known_methods = {row.method for row in settlement_rows}
+        unknown = sorted(set(normalized_confirmed) - known_methods)
+        if unknown:
+            return ServiceResponse.validation_error(
+                errors={
+                    'confirmed': f'Unknown payment method(s): {", ".join(unknown)}',
+                },
+                message='Invalid confirmation totals',
+            )
+
+        confirmation_amounts = {}
+        for row in settlement_rows:
+            # actual_cash is the manager's physical CASH count and therefore is
+            # canonical for CASH. Other tenders keep the copy-cashier-count
+            # default for backwards-compatible calls that omit `confirmed`.
+            raw = (
+                normalized_confirmed.get(row.method, actual)
+                if row.method == 'CASH'
+                else normalized_confirmed.get(row.method, row.counted_amount)
+            )
+            amount = _nonnegative_money(raw)
+            if amount is None:
+                return ServiceResponse.validation_error(
+                    errors={
+                        f'confirmed.{row.method}':
+                            'Must be a non-negative money amount',
+                    },
+                    message='Invalid confirmation totals',
+                )
+            confirmation_amounts[row.method] = amount
+
+        if confirmation_amounts['CASH'] != actual:
+            return ServiceResponse.validation_error(
+                errors={
+                    'confirmed.CASH':
+                        'Must equal actual_cash (the manager cash count)',
+                },
+                message='Contradictory cash confirmation',
+            )
+
         difference = actual - expected_cash
 
         reconciliation = CashReconciliationRepository.create(
@@ -383,37 +588,27 @@ class ShiftService:
             difference=difference,
             notes=notes or '',
             reconciled_by_id=reconciled_by_id,
+            branch_id=shift.branch_id,
         )
 
-        # Post the manager-confirmed money to the branch SAFE (cash) / BANK
-        # (cards) and freeze the per-type confirmed figures. confirmed defaults
-        # to the cashier's counted amount per method (the "copy" UX).
-        # (ShiftPaymentTotal already imported above for the expected-cash figure.)
-        confirmed = confirmed or {}
-        confirmed_cash = Decimal('0')
-        confirmed_card = Decimal('0')
-        for spt in ShiftPaymentTotal.objects.filter(shift=shift):
-            raw = confirmed.get(spt.method)
-            if raw is not None:
-                try:
-                    amt = Decimal(str(raw))
-                except (InvalidOperation, TypeError, ValueError):
-                    amt = spt.counted_amount or Decimal('0')
+        # Freeze the manager's per-tender confirmations. Reconciliation is an
+        # audit/finalisation boundary, not a money movement: cash still lives in
+        # the branch-owned CashRegister until inkassa removes it, and inkassa is
+        # the sole path that credits treasury. Posting here as well booked every
+        # sale twice (SHIFT_DEPOSIT followed by INKASSA).
+        for spt in settlement_rows:
+            spt.confirmed_amount = confirmation_amounts[spt.method]
+            # The shift is the authoritative ownership boundary. Repair legacy
+            # rows that inherited the cloud node's default branch while they
+            # are already locked for reconciliation.
+            spt.branch_id = shift.branch_id
+            if spt.pk:
+                spt.save(update_fields=[
+                    'confirmed_amount', 'branch_id', 'synced_at',
+                    'sync_version',
+                ])
             else:
-                amt = spt.counted_amount or Decimal('0')
-            spt.confirmed_amount = amt
-            spt.save(update_fields=['confirmed_amount', 'synced_at', 'sync_version'])
-            if amt and amt > 0:
-                if spt.method == 'CASH':
-                    confirmed_cash += amt
-                else:
-                    confirmed_card += amt
-        if confirmed_cash > 0 or confirmed_card > 0:
-            from base.services.treasury_service import TreasuryService
-            TreasuryService.deposit_shift(
-                confirmed_cash, confirmed_card,
-                performed_by=reconciliation.reconciled_by, reference_id=shift.id,
-            )
+                spt.save()
 
         # Manager confirmed the cash: ENDED -> COMPLETED.
         ShiftRepository.update(shift, status='COMPLETED')
@@ -427,7 +622,7 @@ class ShiftService:
             'notes': reconciliation.notes,
             'reconciled_by_id': reconciled_by_id,
             'created_at': reconciliation.created_at.isoformat() if reconciliation.created_at else None,
-            # Per-tender cashier-vs-manager comparison (what posted to the SAFE).
+            # Per-tender cashier-vs-manager audit comparison.
             'settlement': ShiftService._shift_settlement(shift),
         })
 
@@ -455,8 +650,10 @@ class ShiftService:
     @staticmethod
     def get_active_shifts():
         shifts = list(ShiftRepository.filter_by_status('ACTIVE')
-                      .select_related('user', 'shift_template')
-                      .prefetch_related('reconciliation', 'reconciliation__reconciled_by'))
+                      .select_related(
+                          'user', 'shift_template',
+                          'reconciliation', 'reconciliation__reconciled_by',
+                      ))
         # Same batched extras as list() so active rows carry the full field set
         # (payment_mix, items_sold, prep, peak hour, expenses, cancelled, net...).
         now = timezone.now()
@@ -479,26 +676,31 @@ class ShiftService:
         paid_orders = Order.objects.filter(
             is_deleted=False, cashier_id=shift.user_id, is_paid=True,
             paid_at__gte=start, paid_at__lte=end,
-        ).exclude(status='CANCELED')
+        )
         money = paid_orders.aggregate(
             total_revenue=Coalesce(Sum('total_amount'), Decimal('0.00'), output_field=DecimalField()),
         )
         # Use the same canonical tender engine as end_shift and the drawer.
         # The old live-only shortcut counted a MIXED cash+card sale as zero cash,
         # so the counter was wrong until the shift closed and totals were frozen.
-        from base.services.tender import breakdown_for_orders
-        split, _ = breakdown_for_orders(paid_orders)
+        from base.services.tender import breakdown_sources_for_orders
+        split, _, drawer_sales = breakdown_sources_for_orders(paid_orders)
+        from base.models import OrderRefund
+        from base.services.order_refund import refund_totals
+        refunded = refund_totals(OrderRefund.objects.filter(
+            is_deleted=False, shift=shift,
+        ))
         return (
             orders_taken['total_orders'] or 0,
-            money['total_revenue'],
-            split['cash'],
+            money['total_revenue'] - refunded['amount'],
+            drawer_sales - refunded['drawer_cash_amount'],
         )
 
     @staticmethod
     def _shift_settlement(shift):
         """Per-tender cashier-vs-manager comparison (the 'expenses comparing
         cashier and manager' view): expected (system), counted (cashier's blind
-        count), confirmed (manager's accepted figure that posted to the SAFE),
+        count), confirmed (manager's accepted audit figure),
         and the frozen difference. Drawn from the ShiftPaymentTotal rows."""
         from cashbox.models import ShiftPaymentTotal
         rows = ShiftPaymentTotal.objects.filter(
@@ -520,7 +722,7 @@ class ShiftService:
             Avg, ExpressionWrapper, DurationField, F as _F,
         )
         from django.db.models.functions import ExtractHour
-        from base.models import Order, OrderItem
+        from base.models import Order, OrderItem, OrderRefund
         start = shift.start_time
         try:
             sold = Order.objects.filter(
@@ -528,14 +730,36 @@ class ShiftService:
                 created_at__gte=start, created_at__lte=end,
             ).exclude(status='CANCELED')
 
-            paid = sold.filter(is_paid=True)
+            # Money belongs to the shift in which it was PAID, even when the
+            # cart was created during another shift. This matches end_shift,
+            # the drawer and the frozen settlement rows.
+            paid = Order.objects.filter(
+                is_deleted=False,
+                cashier_id=shift.user_id,
+                is_paid=True,
+                paid_at__gte=start,
+                paid_at__lte=end,
+            )
             # Canonical tenders. MIXED is never a bucket: a split sale is attributed
             # to its real tenders (cash is the bill portion, not the tendered cash).
             from base.services.tender import breakdown_for_orders
             _split, _detail = breakdown_for_orders(paid)
-            payment_mix = {k: str(_split[k]) for k in ('cash', 'card', 'payme')}
-            if _split['unknown']:
-                payment_mix['unknown'] = str(_split['unknown'])
+            from base.services.order_refund import refund_totals
+            refunds = OrderRefund.objects.filter(
+                is_deleted=False, shift=shift,
+            )
+            refunded = refund_totals(refunds)
+            net_split = {
+                'cash': _split['cash'] - refunded['cash_amount'],
+                'card': _split['card'] - refunded['card_amount'],
+                'payme': _split['payme'] - refunded['payme_amount'],
+                'unknown': _split['unknown'] - refunded['unknown_amount'],
+            }
+            payment_mix = {
+                k: str(net_split[k]) for k in ('cash', 'card', 'payme')
+            }
+            if net_split['unknown']:
+                payment_mix['unknown'] = str(net_split['unknown'])
 
             prep = sold.filter(ready_at__isnull=False).aggregate(
                 avg=Avg(ExpressionWrapper(_F('ready_at') - _F('created_at'),
@@ -546,21 +770,73 @@ class ShiftService:
                          .values('hour').annotate(c=Count('id')).order_by('-c', 'hour'))
             peak_hour = hours[0]['hour'] if hours else None
 
-            items = OrderItem.objects.filter(is_deleted=False, order__in=sold)
-            units_sold = items.aggregate(q=Coalesce(Sum('quantity'), 0))['q']
-            category_stats = list(items.values(
-                'product__category_id', 'product__category__name'
-            ).annotate(
-                quantity=Coalesce(Sum('quantity'), 0),
-                revenue=Coalesce(Sum(_F('price') * _F('quantity'), output_field=DecimalField()),
-                                 Decimal('0.00')),
-            ).order_by('-revenue'))
+            # Product/category money follows settlement events. The paid sale
+            # remains at paid_at even after operational cancellation; the full
+            # refund money is allocated over the original discounted lines.
+            # Units reverse only for the terminal ORDER_CANCEL event; partial
+            # provider refunds do not prove any menu item was returned.
+            items = OrderItem.objects.filter(
+                is_deleted=False,
+                order__is_deleted=False,
+                order__in=paid,
+            )
+            refunded_items = OrderItem.objects.filter(
+                is_deleted=False,
+                order__is_deleted=False,
+                order__refund__in=refunds,
+            )
+            sold_units = items.aggregate(q=Coalesce(Sum('quantity'), 0))['q']
+            from base.services.refund_lines import (
+                refund_line_quantity,
+                refund_line_revenue,
+            )
+            refunded_units = refunded_items.aggregate(
+                q=Coalesce(Sum(refund_line_quantity()), 0),
+            )['q']
+            units_sold = (sold_units or 0) - (refunded_units or 0)
+            from base.services.revenue import net_line_revenue
+            def category_rows(qs, *, refund=False):
+                quantity_expr = (
+                    refund_line_quantity() if refund else 'quantity'
+                )
+                revenue_expr = (
+                    refund_line_revenue() if refund else net_line_revenue()
+                )
+                return qs.values(
+                    'product__category_id', 'product__category__name'
+                ).annotate(
+                    # Avoid shadowing F('quantity') inside net_line_revenue().
+                    units=Coalesce(Sum(quantity_expr), 0),
+                    revenue=Coalesce(
+                        Sum(revenue_expr), Decimal('0.00'),
+                    ),
+                )
+
+            category_net = {}
+            for sign, rows in (
+                (Decimal('1'), category_rows(items)),
+                (Decimal('-1'), category_rows(refunded_items, refund=True)),
+            ):
+                for row in rows:
+                    key = (
+                        row['product__category_id'],
+                        row['product__category__name'],
+                    )
+                    bucket = category_net.setdefault(
+                        key, {'units': 0, 'revenue': Decimal('0')},
+                    )
+                    bucket['units'] += int(sign) * int(row['units'] or 0)
+                    bucket['revenue'] += sign * Decimal(row['revenue'] or 0)
             category_stats = [{
-                'category_id': c['product__category_id'],
-                'category': c['product__category__name'],
-                'quantity': int(c['quantity'] or 0),
-                'revenue': str(c['revenue'] or 0),
-            } for c in category_stats]
+                'category_id': key[0],
+                'category': key[1],
+                'quantity': values['units'],
+                'revenue': str(values['revenue']),
+            } for key, values in sorted(
+                category_net.items(),
+                key=lambda item: item[1]['revenue'],
+                reverse=True,
+            ) if values['units'] or values['revenue']]
 
             return {
                 'payment_mix': payment_mix,
@@ -594,7 +870,7 @@ class ShiftService:
         all-empty map so the list still renders its base fields.
         """
         from collections import defaultdict
-        from base.models import OrderItem
+        from base.models import OrderItem, OrderRefund
         from cashbox.models import CashboxExpense
 
         zero = Decimal('0.00')
@@ -604,6 +880,8 @@ class ShiftService:
                 'expenses_total': '0.00',
                 'cancelled_orders_count': 0,
                 'cancelled_orders_value': '0.00',
+                'refunds_count': 0,
+                'refunds_total': '0.00',
                 'payment_mix': {},
                 'items_sold': 0,
                 'avg_prep_seconds': None,
@@ -648,20 +926,23 @@ class ShiftService:
             min_start = min(s.start_time for s in valid)
             max_end = max((s.end_time or now) for s in valid)
 
-            # Payment mix + counts: paid, non-cancelled, bucketed by paid_at so the
-            # mix reconciles to total_revenue (which is itself paid_at-based).
+            # Payment mix + counts: paid sales bucketed by paid_at; immutable
+            # refunds subtract from the exact shift FK that returned the money.
             # Canonical tender split per shift. ONE extra query for the payment
             # lines (never per-shift): a MIXED order contributes to BOTH cash and
             # card, so it can no longer vanish into a `MIXED` bucket.
             from base.models import OrderPayment
-            from base.services.tender import split_from_rows
+            from base.services.tender import (
+                _courier_rows_by_order,
+                split_from_rows,
+            )
             mix_acc = defaultdict(
                 lambda: {'cash': zero, 'card': zero, 'payme': zero, 'unknown': zero})
             paid_cnt = defaultdict(int)
             money_rows = list(Order.objects.filter(
                 is_deleted=False, cashier_id__in=cashier_ids, is_paid=True,
                 paid_at__gte=min_start, paid_at__lte=max_end,
-            ).exclude(status='CANCELED').values_list(
+            ).values_list(
                 'id', 'cashier_id', 'paid_at', 'total_amount', 'payment_method'))
             _ops = defaultdict(list)
             if money_rows:
@@ -669,28 +950,55 @@ class ShiftService:
                         is_deleted=False, order_id__in=[r[0] for r in money_rows],
                 ).values_list('order_id', 'method', 'amount'):
                     _ops[_oid].append((_m, _a))
+            _courier = _courier_rows_by_order([r[0] for r in money_rows])
             for oid, cid, paid_at, amt, method in money_rows:
                 sid = bucket(cid, paid_at)
                 if sid is None:
                     continue
-                _s, _ = split_from_rows(amt, method, _ops.get(oid, ()), order_id=oid)
+                _s, _ = split_from_rows(
+                    amt,
+                    method,
+                    _ops.get(oid, ()),
+                    _courier.get(oid, ()),
+                    order_id=oid,
+                )
                 acc = mix_acc[sid]
                 for _k in ('cash', 'card', 'payme', 'unknown'):
                     acc[_k] += _s[_k]
                 paid_cnt[sid] += 1
 
+            refund_cnt = defaultdict(int)
+            refund_total = defaultdict(lambda: Decimal('0.00'))
+            for sid, amount, cash, card, payme, unknown in OrderRefund.objects.filter(
+                is_deleted=False, shift_id__in=list(out.keys()),
+            ).values_list(
+                'shift_id', 'amount', 'cash_amount', 'card_amount',
+                'payme_amount', 'unknown_amount',
+            ):
+                acc = mix_acc[sid]
+                acc['cash'] -= cash or zero
+                acc['card'] -= card or zero
+                acc['payme'] -= payme or zero
+                acc['unknown'] -= unknown or zero
+                refund_cnt[sid] += 1
+                refund_total[sid] += amount or zero
+
             # Cancelled orders (count + lost value) by created_at.
             canc_cnt = defaultdict(int)
             canc_val = defaultdict(lambda: Decimal('0.00'))
-            for cid, created_at, amt in Order.objects.filter(
+            for cid, created_at, amt, is_paid in Order.objects.filter(
                 is_deleted=False, cashier_id__in=cashier_ids, status='CANCELED',
                 created_at__gte=min_start, created_at__lte=max_end,
-            ).values_list('cashier_id', 'created_at', 'total_amount'):
+            ).values_list('cashier_id', 'created_at', 'total_amount', 'is_paid'):
                 sid = bucket(cid, created_at)
                 if sid is None:
                     continue
                 canc_cnt[sid] += 1
-                canc_val[sid] += (amt or zero)
+                # Paid cancellations have an OrderRefund money event and are
+                # already netted in their refunding shift. Only unpaid canceled
+                # carts are potential/lost value (never realized revenue).
+                if not is_paid:
+                    canc_val[sid] += (amt or zero)
 
             # Peak hour + avg prep over the SOLD set (non-cancelled) by created_at.
             hour_cnt = defaultdict(lambda: defaultdict(int))
@@ -711,18 +1019,32 @@ class ShiftService:
                     prep_sum[sid] += max(0.0, (ready_at - created_at).total_seconds())
                     prep_n[sid] += 1
 
-            # Items sold: line quantities on non-cancelled orders, via the order's window.
+            # Realized units: paid sale at paid_at, full reversal at refund shift.
             units = defaultdict(int)
-            for cid, created_at, qty in OrderItem.objects.filter(
+            for cid, paid_at, qty in OrderItem.objects.filter(
                 is_deleted=False, order__is_deleted=False,
                 order__cashier_id__in=cashier_ids,
-                order__created_at__gte=min_start, order__created_at__lte=max_end,
-            ).exclude(order__status='CANCELED').values_list(
-                'order__cashier_id', 'order__created_at', 'quantity'):
-                sid = bucket(cid, created_at)
+                order__is_paid=True,
+                order__paid_at__gte=min_start, order__paid_at__lte=max_end,
+            ).values_list(
+                'order__cashier_id', 'order__paid_at', 'quantity'):
+                sid = bucket(cid, paid_at)
                 if sid is None:
                     continue
                 units[sid] += int(qty or 0)
+            from base.services.refund_lines import refund_line_quantity
+            refund_unit_rows = (
+                OrderItem.objects.filter(
+                    is_deleted=False,
+                    order__is_deleted=False,
+                    order__refund__is_deleted=False,
+                    order__refund__shift_id__in=list(out.keys()),
+                )
+                .values('order__refund__shift_id')
+                .annotate(q=Coalesce(Sum(refund_line_quantity()), 0))
+            )
+            for row in refund_unit_rows:
+                units[row['order__refund__shift_id']] -= int(row['q'] or 0)
 
             # Drawer expenses: CashboxExpense HAS a shift FK -> DB GROUP BY, no bucketing.
             exp_total = defaultdict(lambda: Decimal('0.00'))
@@ -752,6 +1074,8 @@ class ShiftService:
                     'expenses_total': money(exp_total.get(sid)),
                     'cancelled_orders_count': int(canc_cnt.get(sid, 0)),
                     'cancelled_orders_value': money(canc_val.get(sid)),
+                    'refunds_count': int(refund_cnt.get(sid, 0)),
+                    'refunds_total': money(refund_total.get(sid)),
                     'payment_mix': pm,
                     'paid_orders': int(paid_cnt.get(sid, 0)),
                     'items_sold': int(units.get(sid, 0)),
@@ -815,6 +1139,9 @@ class ShiftService:
                     } if rec.reconciled_by else None,
                     'created_at': rec.created_at.isoformat() if rec.created_at else None,
                 }
+        except CashReconciliation.DoesNotExist:
+            # Expected state until the manager reconciles an ENDED shift.
+            pass
         except Exception:
             logger.exception('failed to serialize shift reconciliation (shift=%s)', shift.id)
 
@@ -846,13 +1173,13 @@ class ShiftService:
         # expenses, cancelled orders) precomputed in ONE batched pass by
         # ShiftService.list (O(1) queries for the whole page). net_revenue is
         # derived here from the row's own live/stored total_revenue, per the FE
-        # formula: total_revenue - expenses_total - cancelled_orders_value.
+        # formula: realized revenue (already net of refunds) - cash expenses.
+        # Canceled unpaid carts are potential sales, not realized revenue.
         if extras is not None:
             result.update(extras)
             try:
                 net = (Decimal(str(total_revenue))
-                       - Decimal(result['expenses_total'])
-                       - Decimal(result['cancelled_orders_value']))
+                       - Decimal(result['expenses_total']))
             except (InvalidOperation, TypeError):
                 net = Decimal(str(total_revenue))
             result['net_revenue'] = str(net.quantize(Decimal('0.01')))
@@ -877,14 +1204,16 @@ class ShiftService:
         _paid_n = int(_ex.get('paid_orders') or 0)
         result.update({
             'gross_revenue': _q2(_tr),
-            'net_revenue': result.get('net_revenue') or _q2(_tr - _exp - _canc),
+            'net_revenue': result.get('net_revenue') or _q2(_tr - _exp),
             # card = Uzcard+Humo+Card (Payme is its own tender, no longer folded in)
             'card_collected': _q2(_dec((_ex.get('payment_mix') or {}).get('card'))),
             'payme_collected': _q2(_dec((_ex.get('payment_mix') or {}).get('payme'))),
             'expenses_total': result.get('expenses_total', _q2(_exp)),
             'cancelled_count': int(_ex.get('cancelled_orders_count') or 0),
             'cancelled_amount': _q2(_canc),
-            'expected_cash': (rec['expected_cash'] if rec else _q2(_cash)),
+            'expected_cash': (
+                rec['expected_cash'] if rec else _q2(_cash - _exp)
+            ),
             'variance': (rec['difference'] if rec else None),
             'reported': (rec['actual_cash'] if rec else None),
             'reported_by': (rec['reconciled_by'] if rec else None),

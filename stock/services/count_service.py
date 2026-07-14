@@ -566,10 +566,14 @@ class StockCountService:
                 item.adjustment_transaction_id = result["data"]["transaction_id"]
             item.save(update_fields=["is_adjusted", "adjustment_transaction"])
 
-        StockLevel.objects.filter(
+        levels = StockLevel.objects.filter(
             location=count.location,
             stock_item__in=count.items.values("stock_item")
-        ).update(last_counted_at=timezone.now())
+        )
+        counted_at = timezone.now()
+        for level in levels.select_for_update():
+            level.last_counted_at = counted_at
+            level.save(update_fields=["last_counted_at", "updated_at"])
 
     @classmethod
     @transaction.atomic

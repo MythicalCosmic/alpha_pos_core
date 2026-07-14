@@ -35,14 +35,8 @@ def _get_account_locked(kind):
 
     Must run inside an atomic block (callers are decorated).
 
-    There is no DB-level uniqueness on (kind, is_deleted), so two concurrent
-    transactions could both miss the SELECT and each INSERT a row — duplicate
-    SAFE/BANK accounts whose balances then diverge. Guard against the race in
-    code: catch the IntegrityError from a losing INSERT and re-fetch the row
-    the winner created, with the lock held. RECOMMENDED follow-up (separate
-    migration, intentionally not added here): a
-    UniqueConstraint(fields=['kind'], condition=Q(is_deleted=False)) so the DB
-    enforces a single active account per kind."""
+    The database enforces one active row per kind. Catch the losing INSERT in a
+    first-use race and re-fetch the winner with its row lock held."""
     acct = (
         TreasuryAccount.objects.select_for_update()
         .filter(kind=kind, is_deleted=False)
@@ -127,11 +121,8 @@ class TreasuryService:
 
     @staticmethod
     def get_accounts():
-        # get_or_create only collapses concurrent creators into one row when the
-        # DB enforces uniqueness on (kind, active); without the recommended
-        # UniqueConstraint(kind, condition=is_deleted=False) two callers can
-        # still each INSERT an account. .filter(...).first() picks the oldest of
-        # any duplicates so the display stays stable until the constraint lands.
+        # The conditional unique constraint makes concurrent first-use
+        # get_or_create calls converge on one active account per kind.
         data = {}
         for kind in (TreasuryAccount.Kind.SAFE, TreasuryAccount.Kind.BANK):
             acct, _ = TreasuryAccount.objects.get_or_create(

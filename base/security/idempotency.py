@@ -20,6 +20,32 @@ _SAFE_METHODS = {'GET', 'HEAD', 'OPTIONS'}
 INFLIGHT_TTL_SECONDS = 90
 
 
+def _try_take_over_stale_claim(record):
+    """Atomically take ownership of the exact stale claim we observed.
+
+    Two retries can read the same expired row before either updates it.  A
+    plain ``filter(pk=...).update(...)`` lets both retries believe they own the
+    claim and execute the protected write twice.  Matching the observed
+    ``created_at`` turns the takeover into a compare-and-swap: the first retry
+    refreshes the lease and every other stale snapshot loses.
+    """
+    claimed_at = timezone.now()
+    updated = IdempotencyKey.objects.filter(
+        pk=record.pk,
+        response_status=0,
+        created_at=record.created_at,
+    ).update(
+        response_status=0,
+        response_body={},
+        created_at=claimed_at,
+    )
+    if updated:
+        record.created_at = claimed_at
+        record.response_status = 0
+        record.response_body = {}
+    return bool(updated)
+
+
 def idempotent(scope):
     """Dedup retries of a write endpoint by the `Idempotency-Key` header.
 
@@ -97,15 +123,27 @@ def idempotent(scope):
                             },
                             status=409,
                         )
-                    # Stale zombie claim from a crashed worker. Take it over:
-                    # reset created_at (so a fresh crash gets its own TTL) and
-                    # run the view as if we own the claim.
-                    IdempotencyKey.objects.filter(pk=record.pk).update(
-                        response_status=0,
-                        response_body={},
-                        created_at=timezone.now(),
-                    )
-                    we_own_it = True
+                    # Stale zombie claim from a crashed worker. Take over only
+                    # the exact lease timestamp we observed. Another retry may
+                    # have refreshed it between our SELECT and UPDATE.
+                    we_own_it = _try_take_over_stale_claim(record)
+                    if not we_own_it:
+                        current = IdempotencyKey.objects.filter(pk=record.pk).first()
+                        if current and current.response_status:
+                            return JsonResponse(
+                                current.response_body,
+                                status=current.response_status,
+                            )
+                        # The winning retry is still running (or removed its
+                        # claim after an exception). Never execute from this
+                        # stale snapshot; the client can retry safely.
+                        return JsonResponse(
+                            {
+                                'success': False,
+                                'message': 'Duplicate request — original is still in progress.',
+                            },
+                            status=409,
+                        )
                 else:
                     return JsonResponse(
                         record.response_body,

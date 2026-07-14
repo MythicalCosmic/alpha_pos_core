@@ -288,6 +288,25 @@ def changes(request):
                 status=403,
             )
         requesting_branch = bound_branch
+    else:
+        # Legacy unbound tokens have no token->branch identity. Apply the same
+        # allowlist/fail-closed policy as the receive endpoint; otherwise one
+        # leaked legacy token can choose any X-Branch-ID and read that branch's
+        # full transactional feed. DEBUG retains the explicit development-only
+        # compatibility path.
+        allowed_ids = getattr(settings, 'ALLOWED_BRANCH_IDS', None)
+        if allowed_ids:
+            if requesting_branch not in allowed_ids:
+                return JsonResponse(
+                    {'error': 'X-Branch-ID is not in ALLOWED_BRANCH_IDS'},
+                    status=403,
+                )
+        elif not settings.DEBUG:
+            return JsonResponse(
+                {'error': 'Unbound branch tokens are not permitted in production; '
+                          'configure BRANCH_TOKEN_MAP or ALLOWED_BRANCH_IDS'},
+                status=403,
+            )
 
     # Heartbeat presence on the pull path too, so an idle till (nothing to push)
     # still refreshes its liveness every sync cycle. Best-effort.
@@ -330,13 +349,30 @@ def changes(request):
         model_class = models.get(name)
         if not model_class:
             continue
+        if getattr(model_class, '_sync_pull_disabled', False):
+            # One-way branch -> cloud evidence (AuditLog). Never expose it to
+            # branch feeds, even when it belongs to a different branch.
+            continue
 
         base_qs = model_class.objects.all()
-        # Exclude the requester's own records in SQL, *before* the page cap.
-        # Filtering after slicing would shrink a page below per_page and make
-        # has_more / the frontier inconsistent with what was actually sent.
-        if requesting_branch:
-            base_qs = base_qs.exclude(branch_id=requesting_branch)
+        # Scope before the page cap. Transactional/history/command rows are
+        # branch-owned: deliver only to their target branch (an own-push echo
+        # is harmless and idempotent), never to peer branches. Shared catalog
+        # and configuration models opt into global delivery explicitly.
+        pull_scope = getattr(model_class, 'SYNC_PULL_SCOPE', 'branch')
+        if pull_scope == 'disabled':
+            continue
+        if pull_scope == 'branch':
+            if not requesting_branch:
+                # An unbound/catch-all token has no safe transactional target.
+                continue
+            base_qs = base_qs.filter(branch_id=requesting_branch)
+        elif pull_scope != 'global':
+            logger.error(
+                'Unknown SYNC_PULL_SCOPE=%r on %s; refusing feed exposure',
+                pull_scope, model_class.__name__,
+            )
+            continue
 
         # NULL is the crash-safe, not-yet-published state. Serve every NULL row
         # on *every* pull, including cursored pulls, outside timestamp paging.

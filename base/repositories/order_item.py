@@ -1,11 +1,17 @@
 from datetime import timedelta
-from django.db.models import Sum, F, Count, DecimalField, Case, When, Value, IntegerField
+from django.db.models import (
+    Sum, F, Q, Count, DecimalField, Case, When, Value, IntegerField,
+)
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 from decimal import Decimal
 from base.repositories.base import BaseSyncRepository
 from base.models import OrderItem
 from base.services.revenue import net_line_revenue
+from base.services.refund_lines import (
+    REFUND_EVENT_ALIAS, refund_item_events, refund_line_quantity,
+    refund_line_revenue,
+)
 
 # How far back "top selling / popular" looks when ranking products.
 POPULAR_WINDOW_DAYS = 30
@@ -61,13 +67,14 @@ class OrderItemRepository(BaseSyncRepository):
         # popularity ranking (these feed the admin top-products/category stats).
         qs = cls.model.objects.filter(
             is_deleted=False, order__is_deleted=False, order__is_paid=True,
-        ).exclude(order__status='CANCELED')
+            order__paid_at__isnull=False,
+        )
         if date_from:
             qs = qs.filter(order__paid_at__gte=date_from)
         if date_to:
             qs = qs.filter(order__paid_at__lte=date_to)
 
-        return list(qs.values(
+        sales = list(qs.values(
             'product_id', 'product__name', 'product__category__name'
         ).annotate(
             total_qty=Sum('quantity'),
@@ -76,7 +83,11 @@ class OrderItemRepository(BaseSyncRepository):
                 Decimal('0.00')
             ),
             order_count=Count('order_id', distinct=True),
-        ).order_by('-total_qty')[:limit])
+        ))
+        return cls._net_refunded_item_rows(
+            sales, ('product_id', 'product__name', 'product__category__name'),
+            date_from, date_to, sort_key='total_qty', reverse=True, limit=limit,
+        )
 
     @classmethod
     def apply_popularity_order(cls, queryset, days=POPULAR_WINDOW_DAYS,
@@ -110,13 +121,14 @@ class OrderItemRepository(BaseSyncRepository):
         # popularity ranking (these feed the admin top-products/category stats).
         qs = cls.model.objects.filter(
             is_deleted=False, order__is_deleted=False, order__is_paid=True,
-        ).exclude(order__status='CANCELED')
+            order__paid_at__isnull=False,
+        )
         if date_from:
             qs = qs.filter(order__paid_at__gte=date_from)
         if date_to:
             qs = qs.filter(order__paid_at__lte=date_to)
 
-        return list(qs.values(
+        sales = list(qs.values(
             'product_id', 'product__name', 'product__category__name'
         ).annotate(
             total_qty=Sum('quantity'),
@@ -125,7 +137,11 @@ class OrderItemRepository(BaseSyncRepository):
                 Decimal('0.00')
             ),
             order_count=Count('order_id', distinct=True),
-        ).order_by('total_qty')[:limit])
+        ))
+        return cls._net_refunded_item_rows(
+            sales, ('product_id', 'product__name', 'product__category__name'),
+            date_from, date_to, sort_key='total_qty', reverse=False, limit=limit,
+        )
 
     @classmethod
     def get_product_category_stats(cls, date_from=None, date_to=None):
@@ -134,13 +150,14 @@ class OrderItemRepository(BaseSyncRepository):
         # popularity ranking (these feed the admin top-products/category stats).
         qs = cls.model.objects.filter(
             is_deleted=False, order__is_deleted=False, order__is_paid=True,
-        ).exclude(order__status='CANCELED')
+            order__paid_at__isnull=False,
+        )
         if date_from:
             qs = qs.filter(order__paid_at__gte=date_from)
         if date_to:
             qs = qs.filter(order__paid_at__lte=date_to)
 
-        return list(qs.values(
+        sales = list(qs.values(
             'product__category_id', 'product__category__name'
         ).annotate(
             total_qty=Sum('quantity'),
@@ -149,4 +166,65 @@ class OrderItemRepository(BaseSyncRepository):
                 Decimal('0.00')
             ),
             order_count=Count('order_id', distinct=True),
-        ).order_by('-total_revenue'))
+        ))
+        return cls._net_refunded_item_rows(
+            sales, ('product__category_id', 'product__category__name'),
+            date_from, date_to, sort_key='total_revenue', reverse=True,
+        )
+
+    @classmethod
+    def _net_refunded_item_rows(cls, sales, group_fields, date_from, date_to,
+                                *, sort_key, reverse, limit=None):
+        """Merge refund-date negative line events into grouped product sales."""
+        refund_filters = {}
+        if date_from:
+            refund_filters['refunded_at__gte'] = date_from
+        if date_to:
+            refund_filters['refunded_at__lte'] = date_to
+        refund_items = refund_item_events(**refund_filters)
+        refunds = list(refund_items.values(*group_fields).annotate(
+            refund_qty=Sum(refund_line_quantity(REFUND_EVENT_ALIAS)),
+            refund_revenue=Coalesce(
+                Sum(refund_line_revenue(REFUND_EVENT_ALIAS)), Decimal('0.00'),
+            ),
+            # Provider refunds reverse money, not another sold order. Reverse
+            # order count once, only for the terminal cancellation event.
+            refund_order_count=Count(
+                'order_id',
+                filter=Q(refund_event__source='ORDER_CANCEL'),
+                distinct=True,
+            ),
+        ))
+
+        def row_key(row):
+            return tuple(row.get(field) for field in group_fields)
+
+        merged = {row_key(row): dict(row) for row in sales}
+        for row in refunds:
+            target = merged.setdefault(row_key(row), {
+                field: row.get(field) for field in group_fields
+            })
+            target['refund_qty'] = row['refund_qty'] or 0
+            target['refund_revenue'] = row['refund_revenue'] or Decimal('0.00')
+            target['refund_order_count'] = row['refund_order_count'] or 0
+
+        for row in merged.values():
+            gross_qty = row.get('total_qty') or 0
+            gross_revenue = row.get('total_revenue') or Decimal('0.00')
+            gross_orders = row.get('order_count') or 0
+            row['gross_qty'] = gross_qty
+            row['gross_revenue'] = gross_revenue
+            row['gross_order_count'] = gross_orders
+            row.setdefault('refund_qty', 0)
+            row.setdefault('refund_revenue', Decimal('0.00'))
+            row.setdefault('refund_order_count', 0)
+            row['total_qty'] = gross_qty - row['refund_qty']
+            row['total_revenue'] = gross_revenue - row['refund_revenue']
+            row['order_count'] = gross_orders - row['refund_order_count']
+
+        rows = sorted(
+            merged.values(),
+            key=lambda row: row.get(sort_key) or 0,
+            reverse=reverse,
+        )
+        return rows[:limit] if limit is not None else rows

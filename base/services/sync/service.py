@@ -14,6 +14,10 @@ logger = logging.getLogger(__name__)
 LOCK_TTL = 120
 
 
+class _QuarantinedRecordDeferred(Exception):
+    """Internal control flow: rollback a temporary quarantine restore."""
+
+
 class SyncService:
 
     @classmethod
@@ -130,7 +134,16 @@ class SyncService:
                                    f'{len(batch_uuids)} record(s) rejected by receiver')
                             errors.append(msg)
                             logger.warning(msg)
+                            # A rejected parent (Order, Product, etc.) means
+                            # later models may depend on a row that is still
+                            # absent. Do not burn retry attempts/dead-letter
+                            # children on guaranteed FK failures. Confirmed
+                            # siblings are still acknowledged below; the next
+                            # push retries the failed parent before dependents.
+                            stop_push = True
                         logger.info(f'Synced {len(confirmed)} {model_name} records')
+                        if stop_push:
+                            break
                     else:
                         total_failed += len(batch)
                         error_msg = f'{model_name}: {result.get("error", "Unknown")}'
@@ -220,6 +233,10 @@ class SyncService:
         from base.services.sync.config import get_pull_enabled
         if not get_pull_enabled():
             return {'success': False, 'message': 'Pull disabled'}
+
+        # Must happen after migrations and before reading the old cursor. It is
+        # idempotent and local-only; cloud aggregate state is never cleared.
+        SyncStatus.ensure_scope_epoch()
 
         pull_token = cls._acquire_lock('pull')
         if not pull_token:
@@ -513,11 +530,21 @@ class SyncService:
                 # path could read a row, then a concurrent writer commits, and
                 # the pull's stale save() clobbers the newer version.
                 with transaction.atomic():
+                    quarantine_marker = SyncStatus.restore_quarantined_target(
+                        model_class, record,
+                    )
                     _, action = model_class.from_sync_dict(record, branch_id=source_branch)
+                    if action == 'deferred' and quarantine_marker:
+                        # Roll back the temporary restore and all partial work;
+                        # the durable marker remains for the retry.
+                        raise _QuarantinedRecordDeferred()
+                    SyncStatus.finish_quarantine_restore(quarantine_marker)
                 if action == 'deferred':
                     results['deferred'].append(record)
                 elif action in ('created', 'updated', 'skipped'):
                     results[action] += 1
+            except _QuarantinedRecordDeferred:
+                results['deferred'].append(record)
             except Exception as e:
                 results['errors'].append({
                     'uuid': record.get('uuid'),

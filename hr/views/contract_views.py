@@ -4,7 +4,7 @@ from django.views.decorators.http import require_http_methods, require_GET, requ
 from base.helpers.request import parse_json_body, safe_page, safe_per_page, safe_int
 from base.helpers.response import json_response
 from base.security.permissions import admin_required
-from hr.services import ContractService
+from hr.services import ContractDocumentService, ContractService
 
 
 @csrf_exempt
@@ -99,28 +99,38 @@ def contracts_expiring(request):
     return JsonResponse(result, status=status)
 
 
-# Contract-document attachments are not yet implemented. The view stubs
-# below previously called ContractService.list_documents / get_document /
-# create_document / delete_document, but the service has never defined
-# any of those — every call 500'd with AttributeError. Returning 501 makes
-# the unimplemented state honest to API consumers; the routes still exist
-# so the absence is discoverable rather than a NoReverseMatch.
-
 @csrf_exempt
 @require_http_methods(["GET", "POST"])
 @admin_required
 def contract_documents(request, contract_id):
-    return JsonResponse({
-        'success': False,
-        'message': 'Contract document attachments are not implemented.',
-    }, status=501)
+    if request.method == "GET":
+        result, status = ContractDocumentService.list(contract_id)
+        return JsonResponse(result, status=status)
+
+    if request.content_type == "application/json":
+        data, error = parse_json_body(request)
+        if error:
+            return json_response(error)
+    else:
+        data = request.POST.dict()
+
+    result, status = ContractDocumentService.create(
+        contract_id,
+        title=data.get("title"),
+        document_type=data.get("document_type", "CONTRACT"),
+        uploaded_file=request.FILES.get("file"),
+        file_url=data.get("file_url", ""),
+        uploaded_by_id=request.user.id,
+    )
+    return JsonResponse(result, status=status)
 
 
 @csrf_exempt
 @require_http_methods(["GET", "DELETE"])
 @admin_required
 def contract_document_detail(request, contract_id, doc_id):
-    return JsonResponse({
-        'success': False,
-        'message': 'Contract document attachments are not implemented.',
-    }, status=501)
+    if request.method == "GET":
+        result, status = ContractDocumentService.get(contract_id, doc_id)
+    else:
+        result, status = ContractDocumentService.delete(contract_id, doc_id)
+    return JsonResponse(result, status=status)

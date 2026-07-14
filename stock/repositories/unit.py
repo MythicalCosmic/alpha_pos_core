@@ -65,9 +65,10 @@ class StockItemUnitRepository(BaseSyncRepository):
 
     @classmethod
     def clear_default(cls, stock_item_id):
-        return cls.model.objects.filter(
+        qs = cls.model.objects.filter(
             stock_item_id=stock_item_id, is_default=True
-        ).update(is_default=False)
+        )
+        return cls.sync_update_queryset(qs, is_default=False)
 
     @classmethod
     def get_by_item_and_unit(cls, stock_item_id, unit_id):

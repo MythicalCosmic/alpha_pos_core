@@ -216,7 +216,7 @@ class DocumentService:
 
     @classmethod
     def get_expiring(cls, days: int = 30) -> Tuple[Dict[str, Any], int]:
-        today = timezone.now().date()
+        today = timezone.localdate()
         end = today + timedelta(days=days)
 
         docs = EmployeeDocument.objects.filter(

@@ -1,7 +1,7 @@
 from typing import Dict, Any, Optional, List
 from decimal import Decimal
 from django.db import transaction
-from django.db.models import Q, F
+from django.db.models import Q
 from django.utils import timezone
 
 from base.helpers.response import ServiceResponse
@@ -1056,10 +1056,15 @@ class RecipeStepService:
             return ServiceResponse.not_found("Recipe not found")
 
         if RecipeStepRepository.model.objects.filter(recipe=recipe, step_number=step_number).exists():
-            RecipeStepRepository.model.objects.filter(
+            # Descending order avoids transient duplicate positions and every
+            # save publishes the shifted step to the peer.
+            shifted = RecipeStepRepository.model.objects.select_for_update().filter(
                 recipe=recipe,
                 step_number__gte=step_number
-            ).update(step_number=F("step_number") + 1)
+            ).order_by('-step_number')
+            for existing in shifted:
+                existing.step_number += 1
+                existing.save(update_fields=['step_number'])
 
         step = RecipeStepRepository.create(
             recipe=recipe,
@@ -1108,10 +1113,13 @@ class RecipeStepService:
 
         step.delete()
 
-        RecipeStepRepository.model.objects.filter(
+        shifted = RecipeStepRepository.model.objects.select_for_update().filter(
             recipe_id=recipe_id,
             step_number__gt=step_number
-        ).update(step_number=F("step_number") - 1)
+        ).order_by('step_number')
+        for existing in shifted:
+            existing.step_number -= 1
+            existing.save(update_fields=['step_number'])
 
         return ServiceResponse.success(message="Step removed")
 
@@ -1119,6 +1127,11 @@ class RecipeStepService:
     @transaction.atomic
     def reorder(cls, recipe_id: int, step_ids: List[int]) -> Dict[str, Any]:
         for idx, step_id in enumerate(step_ids, 1):
-            RecipeStepRepository.model.objects.filter(id=step_id, recipe_id=recipe_id).update(step_number=idx)
+            step = RecipeStepRepository.model.objects.select_for_update().filter(
+                id=step_id, recipe_id=recipe_id,
+            ).first()
+            if step and step.step_number != idx:
+                step.step_number = idx
+                step.save(update_fields=['step_number'])
 
         return ServiceResponse.success(data={"reordered": len(step_ids)}, message="Steps reordered")

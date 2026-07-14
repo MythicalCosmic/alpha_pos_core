@@ -98,16 +98,17 @@ class TestSyncConflictTiebreaker:
         assert local.password == 'new-hash'
 
     @override_settings(DEPLOYMENT_MODE='cloud')
-    def test_equal_version_cloud_accepts_branch_push(self):
+    def test_equal_version_cloud_refuses_branch_push_to_global_user(self):
         """On the cloud (mode='cloud'), an equal-version conflict accepts the
         incoming branch push — the branch owns its transactional data."""
         from base.models import User
+        from base.services.sync.receiver import CloudReceiver
 
         local = User.objects.create(
             first_name='Local', last_name='Name', email='u@test.local',
             password='hashed', role='USER', sync_version=3,
         )
-        User.from_sync_dict({
+        result = CloudReceiver.receive_batch('user', 'branch-a', [{
             'uuid': str(local.uuid),
             'sync_version': 3,
             'is_deleted': False,
@@ -116,9 +117,10 @@ class TestSyncConflictTiebreaker:
             'email': 'u@test.local',
             'password': 'hashed',
             'role': 'USER',
-        })
+        }])
         local.refresh_from_db()
-        assert local.first_name == 'FromBranch'
+        assert result['skipped'] == 1
+        assert local.first_name == 'Local'
 
 
 class TestUserCredentialSync:
@@ -184,11 +186,11 @@ class TestUserCredentialSync:
         assert reconciled.password == 'server-hash'
 
     def test_receive_ignores_spoofed_branch_id(self):
-        from base.models import User
+        from base.models import Customer
         from base.services.sync.receiver import CloudReceiver
 
         result = CloudReceiver.receive_batch(
-            'base.User',
+            'base.Customer',
             branch_id='branch-a',
             records=[{
                 'uuid': '11111111-1111-1111-1111-111111111111',
@@ -196,12 +198,12 @@ class TestUserCredentialSync:
                 'is_deleted': False,
                 # Attacker-controlled spoof attempt; receiver must ignore it.
                 'branch_id': 'branch-b',
-                'first_name': 'Spoof', 'last_name': 'Try',
-                'email': 'spoof@test.local',
+                'name': 'Spoof Try',
+                'phone_number': '+998901234567',
             }],
         )
         assert result['created'] == 1
-        u = User.objects.get(uuid='11111111-1111-1111-1111-111111111111')
+        u = Customer.objects.get(uuid='11111111-1111-1111-1111-111111111111')
         assert u.branch_id == 'branch-a'
 
 
@@ -362,7 +364,7 @@ class TestReceiveOwnershipPreserved:
     else /changes later excludes it from that branch and cloud edits stop
     flowing down (the 'edit on local renames it branch1' bug)."""
 
-    def test_branch_edit_keeps_cloud_owner(self):
+    def test_branch_edit_of_cloud_owned_user_is_refused(self):
         from base.models import User
         from base.services.sync.receiver import CloudReceiver
         u = User.objects.create(
@@ -373,23 +375,23 @@ class TestReceiveOwnershipPreserved:
             'first_name': 'Edited', 'last_name': 'User', 'email': 'c@test.local',
             'branch_id': 'cloud',
         }])
-        assert result['updated'] == 1
+        assert result['skipped'] == 1
+        assert result['updated'] == 0
         u.refresh_from_db()
-        assert u.first_name == 'Edited'       # the edit applied
+        assert u.first_name == 'Cloud'        # centrally owned identity unchanged
         assert u.branch_id == 'cloud'         # owner preserved (NOT branch1)
 
-    def test_untagged_row_gets_tagged_on_update(self):
-        from base.models import User
+    def test_untagged_branch_row_gets_tagged_on_update(self, settings):
+        settings.DEPLOYMENT_MODE = 'cloud'
+        from base.models import Customer
         from base.services.sync.receiver import CloudReceiver
-        u = User.objects.create(
-            first_name='No', last_name='Owner', email='n@test.local',
-            password='h', role='CASHIER', sync_version=1)
+        u = Customer.objects.create(name='No Owner', sync_version=1)
         # save() auto-tags an empty branch_id with settings.BRANCH_ID, so force
         # it empty at the DB level to exercise "untagged -> tag with pusher".
-        User.objects.filter(pk=u.pk).update(branch_id='')
-        CloudReceiver.receive_batch('base.User', branch_id='branch1', records=[{
+        Customer.objects.filter(pk=u.pk).update(branch_id='')
+        CloudReceiver.receive_batch('base.Customer', branch_id='branch1', records=[{
             'uuid': str(u.uuid), 'sync_version': 2, 'is_deleted': False,
-            'first_name': 'No', 'last_name': 'Owner', 'email': 'n@test.local',
+            'name': 'Still No Owner',
         }])
         u.refresh_from_db()
         assert u.branch_id == 'branch1'        # empty -> tagged with pusher
@@ -444,6 +446,23 @@ class TestUnpaidExcludesCancelled:
         self._order(regular_user, 'CANCELED', True, 2)  # cancelled-after-payment
         qs = OrderRepository.build_filtered_queryset(payment_status='PAID')
         assert list(qs.values_list('id', flat=True)) == [paid.id]
+
+
+class TestOrderFiltersExcludeRemovedLines:
+    def test_product_and_category_filters_ignore_soft_deleted_items(
+        self, order_factory, product,
+    ):
+        from base.repositories.order import OrderRepository
+
+        order = order_factory()
+        order.items.get().delete()
+
+        assert not OrderRepository.build_filtered_queryset(
+            product_ids=[product.id],
+        ).filter(pk=order.pk).exists()
+        assert not OrderRepository.build_filtered_queryset(
+            category_ids=[product.category_id],
+        ).filter(pk=order.pk).exists()
 
 
 class TestChefQueueNumber:

@@ -9,7 +9,7 @@ SYNC_ORDER = [
     'user', 'category', 'deliveryperson', 'place', 'table', 'product',
     'customer',  # before 'order' — Order.customer FK depends on it
     'order', 'orderitem', 'orderpayment', 'cashregister', 'inkassa',
-    'shifttemplate', 'shift', 'cashreconciliation',
+    'shifttemplate', 'shift', 'orderrefund', 'cashreconciliation',
     # Stock models (synced after base, respecting FK dependencies)
     'stocklocation', 'stockunit', 'stockcategory', 'stockitem',
     'stockitemunit', 'supplier', 'supplierstockitem', 'suppliertransaction',
@@ -38,6 +38,9 @@ SYNC_ORDER = [
     # Cashbox / shift settlement (last: FK to shift/user/supplier/category,
     # all of which sync earlier). Category before the expense that references it.
     'cashboxexpensecategory', 'shiftpaymenttotal', 'cashboxexpense',
+    # One-way branch -> cloud audit trail. Kept last so actor and target rows
+    # have already had a chance to land.
+    'auditlog',
 ]
 
 MODEL_MAP = {
@@ -50,6 +53,7 @@ MODEL_MAP = {
     'order': 'base.Order',
     'orderitem': 'base.OrderItem',
     'orderpayment': 'base.OrderPayment',
+    'orderrefund': 'base.OrderRefund',
     'cashregister': 'base.CashRegister',
     'inkassa': 'base.Inkassa',
     'place': 'base.Place',
@@ -57,6 +61,7 @@ MODEL_MAP = {
     'shifttemplate': 'base.ShiftTemplate',
     'shift': 'base.Shift',
     'cashreconciliation': 'base.CashReconciliation',
+    'auditlog': 'base.AuditLog',
     # Stock models
     'stocklocation': 'stock.StockLocation',
     'stockunit': 'stock.StockUnit',
@@ -136,6 +141,7 @@ FK_UUID_MAPPINGS = {
     'shift_template_uuid': ('base', 'ShiftTemplate', 'shift_template'),
     'shift_uuid': ('base', 'Shift', 'shift'),
     'reconciled_by_uuid': ('base', 'User', 'reconciled_by'),
+    'actor_uuid': ('base', 'User', 'actor'),
     # Stock FK mappings
     'stock_item_uuid': ('stock', 'StockItem', 'stock_item'),
     'location_uuid': ('stock', 'StockLocation', 'location'),

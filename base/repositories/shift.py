@@ -31,7 +31,10 @@ class ShiftRepository(BaseSyncRepository):
     @classmethod
     def get_active_for_user(cls, user_id):
         return cls.model.objects.filter(
-            is_deleted=False, user_id=user_id, status='ACTIVE'
+            is_deleted=False,
+            user_id=user_id,
+            status='ACTIVE',
+            end_time__isnull=True,
         ).first()
 
     @classmethod

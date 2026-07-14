@@ -7,21 +7,41 @@ from base.services.sync.config import FK_UUID_MAPPINGS
 logger = logging.getLogger(__name__)
 
 
-def _resolve_foreign_keys(data):
+def _resolve_foreign_keys(model_class, data):
     """Resolve UUID-keyed FK references to local PKs.
 
     Returns (resolved, missing) where:
       resolved: {fk_field: instance} for FKs successfully looked up
       missing:  [(uuid_field, uuid_value)] for FKs that referenced an unknown
-                UUID. The caller decides whether to defer the record (for
-                non-nullable FKs the row is incomplete) or persist with NULL
-                (the legacy behavior — kept for nullable FKs).
+                UUID. Any supplied-but-unknown parent is deferred; silently
+                replacing a nullable relation with NULL would lose the link
+                permanently when the parent arrives later.
     """
     resolved = {}
     missing = []
     for uuid_field, (app_label, model_name, fk_field) in FK_UUID_MAPPINGS.items():
-        uuid_value = data.get(uuid_field)
-        if not uuid_value:
+        # Absence means "leave the relationship untouched" on a partial
+        # payload.  An explicit null is different: it means "clear this
+        # nullable relationship".  The old truthiness check conflated the two,
+        # so a relationship removed on one node survived forever on its peer.
+        if uuid_field not in data:
+            continue
+        try:
+            field = model_class._meta.get_field(fk_field)
+        except Exception:
+            # The mapping is global; most UUID keys do not belong to this
+            # particular model.
+            continue
+
+        uuid_value = data[uuid_field]
+        if uuid_value in (None, ''):
+            if field.null:
+                resolved[fk_field] = None
+            else:
+                # Reuse the existing missing-FK validation below so required
+                # relationships fail/defer instead of reaching the database as
+                # an IntegrityError (or being silently retained on update).
+                missing.append((uuid_field, uuid_value))
             continue
         try:
             related_model = apps.get_model(app_label, model_name)
@@ -190,10 +210,10 @@ class CloudReceiver:
         except Exception as e:
             return {'success': False, 'created': 0, 'updated': 0, 'skipped': 0, 'errors': [str(e)]}
 
-        # Per-model opt-out: AuditLog (and any future write-once-from-local
-        # model) sets `_sync_ingest_disabled = True` so a peer can't push
-        # forged rows. Push-side is unaffected — local writes still queue
-        # outbound for the cloud.
+        # Per-model opt-out for state that must never arrive from a peer (for
+        # example the branch-local treasury ledger). One-way collectors such
+        # as AuditLog use `_sync_pull_disabled` instead: cloud receive is
+        # allowed, but the model is omitted from branch change feeds.
         if getattr(model_class, '_sync_ingest_disabled', False):
             logger.info(
                 'sync receive: ingest disabled for %s — skipping %d record(s)',
@@ -285,6 +305,22 @@ class CloudReceiver:
         if not uuid_val:
             raise ValueError('Record missing UUID')
 
+        # Models exposed with global pull scope are cloud-owned identities and
+        # reference/catalog configuration. A branch token may consume them but
+        # must never create, mutate, re-parent, rename-by-natural-key, or delete
+        # them on the hub. Field deny-lists alone are insufficient here because
+        # UUID adoption, FK assignment, sync_version and soft-delete are handled
+        # outside the scalar-field cleaning path. Refuse the whole write before
+        # resolving any relationships. The push is acknowledged as skipped so a
+        # compromised/outdated till cannot poison its queue forever.
+        if getattr(model_class, 'SYNC_PULL_SCOPE', 'branch') == 'global':
+            existing = model_class._base_manager.filter(uuid=uuid_val).first()
+            logger.warning(
+                'sync receive: refused branch=%s write to cloud-owned %s uuid=%s',
+                branch_id, model_class.__name__, uuid_val,
+            )
+            return existing, 'skipped'
+
         sync_version = data.pop('sync_version', 1)
         is_deleted = data.pop('is_deleted', False)
         # is_deleted is popped out of `data`, so _strip_denied never sees it.
@@ -308,16 +344,20 @@ class CloudReceiver:
             )
         incoming_branch = branch_id
 
-        resolved_fks, missing_fks = _resolve_foreign_keys(data)
+        # Append-only evidence may be created once, never deleted by a peer.
+        if is_deleted and getattr(model_class, '_sync_append_only', False):
+            return None, 'skipped'
 
-        # If any *non-nullable* FK couldn't be resolved (the related model's
-        # UUID hasn't synced yet), refuse to materialize the row. The
-        # previous behavior was to silently persist with the FK as NULL,
-        # permanently losing the association even when the parent later
-        # arrived — or DB-rejecting with a NOT NULL violation. Surface as
-        # an error so the caller's retry path can re-deliver after the
-        # parent batch lands. Nullable FKs fall through to NULL, which is
-        # what the model's `null=True` already permits.
+        resolved_fks, missing_fks = _resolve_foreign_keys(model_class, data)
+
+        # Any non-empty parent UUID that has not arrived yet must defer, even
+        # when the FK column is nullable. Persisting NULL would advance the
+        # queue/cursor and permanently lose the intended association. A
+        # tombstone is different: an existing child can be deleted without
+        # resolving its old parent; a never-seen child tombstone is a no-op.
+        tombstone_target_exists = bool(
+            is_deleted and model_class.objects.filter(uuid=uuid_val).exists()
+        )
         for uuid_field, uuid_value in missing_fks:
             fk_field_name = FK_UUID_MAPPINGS[uuid_field][2]
             try:
@@ -331,22 +371,20 @@ class CloudReceiver:
                     fk_field_name, model_class.__name__, exc,
                 )
                 continue
-            if not fk_field.null:
-                if is_deleted:
-                    # A tombstone whose required parent never arrived (e.g. the
-                    # parent shift was deleted) is a no-op — there's nothing to
-                    # delete. Skip it instead of deferring forever and flooding
-                    # the queue with "parent not synced" errors.
-                    logger.info(
-                        'sync receive: skipping tombstone for %s; required FK '
-                        '%s=%s absent', model_class.__name__, fk_field_name, uuid_value,
-                    )
-                    return None, 'skipped'
-                raise ValueError(
-                    f'Unresolved required FK on {model_class.__name__}: '
-                    f'{fk_field_name}={uuid_value}. Parent record has not '
-                    'synced yet — retry after the parent batch lands.'
+            if is_deleted:
+                if tombstone_target_exists:
+                    continue
+                logger.info(
+                    'sync receive: skipping unseen tombstone for %s; FK '
+                    '%s=%s absent', model_class.__name__, fk_field_name, uuid_value,
                 )
+                return None, 'skipped'
+            relation_kind = 'nullable' if fk_field.null else 'required'
+            raise ValueError(
+                f'Unresolved {relation_kind} FK on {model_class.__name__}: '
+                f'{fk_field_name}={uuid_value}. Parent record has not '
+                'synced yet — retry after the parent batch lands.'
+            )
 
         for uuid_field in FK_UUID_MAPPINGS:
             data.pop(uuid_field, None)
@@ -363,6 +401,11 @@ class CloudReceiver:
         with transaction.atomic():
             try:
                 instance = model_class.objects.select_for_update().get(uuid=uuid_val)
+
+                if getattr(model_class, '_sync_append_only', False):
+                    # UUID is the immutable event identity. A replay is an
+                    # idempotent no-op; a higher version cannot rewrite history.
+                    return instance, 'skipped'
 
                 # Route through SyncMixin._should_replace so the deterministic
                 # tiebreaker (updated_at then branch_id) applies on equal
@@ -392,8 +435,11 @@ class CloudReceiver:
                 for key, value in _strip_denied(model_class, cleaned, creating=False).items():
                     setattr(instance, key, value)
 
+                denied = model_class._effective_denylist() \
+                    if hasattr(model_class, '_effective_denylist') else frozenset()
                 for fk_field, fk_instance in resolved_fks.items():
-                    setattr(instance, fk_field, fk_instance)
+                    if fk_field not in denied:
+                        setattr(instance, fk_field, fk_instance)
 
                 instance.sync_version = sync_version
                 if not _del_denied:           # SYNC_DENY_FROM_BRANCH guard (e.g. User.is_deleted)
@@ -433,12 +479,20 @@ class CloudReceiver:
                     # both reconcile onto the same natural-key row serialize
                     # instead of clobbering each other.
                     instance = model_class.objects.select_for_update().get(pk=natural.pk)
+                    if getattr(model_class, '_sync_append_only', False):
+                        # The natural key identifies the same immutable event
+                        # under a different UUID. Treat it as an idempotent
+                        # replay; never adopt the UUID or overwrite evidence.
+                        return instance, 'skipped'
                     instance.uuid = uuid_val
                     # Reconcile = UPDATE of an existing row: protect denied fields.
                     for key, value in _strip_denied(model_class, cleaned, creating=False).items():
                         setattr(instance, key, value)
+                    denied = model_class._effective_denylist() \
+                        if hasattr(model_class, '_effective_denylist') else frozenset()
                     for fk_field, fk_instance in resolved_fks.items():
-                        setattr(instance, fk_field, fk_instance)
+                        if fk_field not in denied:
+                            setattr(instance, fk_field, fk_instance)
                     instance.sync_version = sync_version
                     if not _del_denied:       # SYNC_DENY_FROM_BRANCH guard (e.g. User.is_deleted)
                         instance.is_deleted = is_deleted
@@ -464,8 +518,11 @@ class CloudReceiver:
                 for key, value in _strip_denied(model_class, cleaned, creating=True).items():
                     setattr(instance, key, value)
 
+                denied = model_class._effective_denylist() \
+                    if hasattr(model_class, '_effective_denylist') else frozenset()
                 for fk_field, fk_instance in resolved_fks.items():
-                    setattr(instance, fk_field, fk_instance)
+                    if fk_field not in denied:
+                        setattr(instance, fk_field, fk_instance)
 
                 instance.save(_syncing=True)
                 _preserve_updated_at(model_class, instance, incoming_updated)

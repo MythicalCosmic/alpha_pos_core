@@ -82,7 +82,7 @@ class OrderNotification:
                 # new_sent) until items are present; the post-receive hook
                 # re-dispatches once the item batch lands, and server-native
                 # orders (smartfood/admin) already have items in the same txn.
-                if not order.items.exists():
+                if not order.items.filter(is_deleted=False).exists():
                     return
                 cls.on_new_order(order)
                 disp.new_sent = True

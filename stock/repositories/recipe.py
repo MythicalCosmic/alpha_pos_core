@@ -49,10 +49,11 @@ class RecipeRepository(BaseSyncRepository):
     @classmethod
     def deactivate_other_versions(cls, recipe):
         root = recipe.parent_recipe or recipe
-        return cls.model.objects.filter(
+        qs = cls.model.objects.filter(
             Q(id=root.id) | Q(parent_recipe=root),
             is_deleted=False,
-        ).exclude(id=recipe.id).update(is_active_version=False)
+        ).exclude(id=recipe.id)
+        return cls.sync_update_queryset(qs, is_active_version=False)
 
     @classmethod
     def get_next_code_seq(cls, prefix):
@@ -92,9 +93,10 @@ class RecipeIngredientRepository(BaseSyncRepository):
     @classmethod
     def reorder(cls, recipe_id, ordered_ids):
         for idx, ing_id in enumerate(ordered_ids):
-            cls.model.objects.filter(
-                id=ing_id, recipe_id=recipe_id
-            ).update(sort_order=idx)
+            cls.sync_update_queryset(
+                cls.model.objects.filter(id=ing_id, recipe_id=recipe_id),
+                sort_order=idx,
+            )
 
 
 class RecipeIngredientSubstituteRepository(BaseSyncRepository):
@@ -140,4 +142,5 @@ class RecipeStepRepository(BaseSyncRepository):
         ).order_by('step_number')
         for idx, step in enumerate(steps, start=1):
             if step.step_number != idx:
-                cls.model.objects.filter(id=step.id).update(step_number=idx)
+                step.step_number = idx
+                step.save(update_fields=['step_number'])

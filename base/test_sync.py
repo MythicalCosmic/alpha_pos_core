@@ -84,6 +84,63 @@ class TestPushKeepsRejectedRecordsQueued:
         assert result['failed'] == 1
         assert result['success'] is False
 
+    def test_partial_parent_failure_defers_dependent_models(
+        self, settings, monkeypatch,
+    ):
+        from base.services.sync import service as sync_service
+        from base.services.sync.queue import SyncQueue
+        from base.models import SyncQueueRecord
+
+        settings.SYNC_ENABLED = True
+        settings.DEPLOYMENT_MODE = 'local'
+        settings.CLOUD_SYNC_URL = 'http://cloud.test'
+        settings.CLOUD_SYNC_TOKEN = 'tok'
+
+        parent = str(uuidlib.uuid4())
+        child = str(uuidlib.uuid4())
+        SyncQueue.add('order', parent, {'uuid': parent, 'sync_version': 1})
+        SyncQueue.add(
+            'orderitem', child,
+            {'uuid': child, 'order_uuid': parent, 'sync_version': 1},
+        )
+
+        monkeypatch.setattr(sync_service, 'check_health', lambda: True)
+        monkeypatch.setattr(
+            sync_service.SyncService, '_reconcile_unsynced',
+            classmethod(lambda cls: None),
+        )
+        monkeypatch.setattr(
+            sync_service.SyncService, '_notify_success', staticmethod(lambda *a, **k: None),
+        )
+        monkeypatch.setattr(
+            sync_service.SyncService, '_notify_error', staticmethod(lambda *a, **k: None),
+        )
+        sent_models = []
+
+        def fake_send_batch(model_name, records, retry=True):
+            sent_models.append(model_name)
+            assert model_name == 'order'
+            return {
+                'success': True, 'created': 0, 'updated': 0, 'skipped': 0,
+                'errors': [f'{parent}: parent rejected'],
+                'failed_uuids': [parent],
+            }
+
+        monkeypatch.setattr(sync_service, 'send_batch', fake_send_batch)
+
+        result = sync_service.SyncService.push()
+
+        assert result['success'] is False
+        assert sent_models == ['order']
+        parent_row = SyncQueueRecord.objects.get(
+            model_name='order', record_uuid=uuidlib.UUID(parent),
+        )
+        child_row = SyncQueueRecord.objects.get(
+            model_name='orderitem', record_uuid=uuidlib.UUID(child),
+        )
+        assert parent_row.attempts == 1
+        assert child_row.attempts == 0
+
 
 class TestPullCursorNotClobbered:
     """Regression: set_last_pull() used to stamp `last_pull` (the durable pull
@@ -209,7 +266,7 @@ def _configure_local_push(settings, monkeypatch):
 
 
 def _unpaid_order_with_only_order_unsynced(settings):
-    from base.models import Order, User
+    from base.models import Order, SyncQueueRecord, User
 
     user = User.objects.create(
         first_name='Queue', last_name='Race', email='queue-race@example.com',
@@ -218,6 +275,9 @@ def _unpaid_order_with_only_order_unsynced(settings):
     # The test is about the order slot; keep its required parent out of the
     # reconcile sweep so send_batch is invoked exactly once per push.
     User.objects.filter(pk=user.pk).update(synced_at=timezone.now())
+    SyncQueueRecord.objects.filter(
+        model_name='user', record_uuid=user.uuid,
+    ).delete()
     return Order.objects.create(
         user=user, cashier=user, status='READY', is_paid=False,
         subtotal='50000.00', total_amount='50000.00',
@@ -268,12 +328,15 @@ class TestPushQueueGenerationSafety:
         assert first['success'] is True
         assert order.is_paid is True
         assert order.synced_at is None, 'old ACK must not stamp the newer version'
-        assert not SyncQueueRecord.objects.filter(
+        queued = SyncQueueRecord.objects.get(
             model_name='order', record_uuid=order.uuid,
-        ).exists()
+        )
+        assert queued.payload['is_paid'] is True
+        assert queued.payload['sync_version'] == order.sync_version
 
-        # The next sweep must rebuild the queue from the still-unsynced live row
-        # and deliver the paid payload, rather than considering it done.
+        # The newer durable generation is already queued in the same save
+        # transaction; the next push delivers it rather than rebuilding it from
+        # a best-effort sweep.
         second = sync_service.SyncService.push()
         order.refresh_from_db()
         assert second['success'] is True

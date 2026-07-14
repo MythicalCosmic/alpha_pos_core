@@ -4,10 +4,12 @@ from django.db import transaction
 from django.utils import timezone
 
 from base.helpers.response import ServiceResponse
+from base.services.sequence import generate_number
 from hr.models import EmployeeContract, EmploymentEvent
 from hr.repositories import EmployeeRepository
 from hr.repositories.contract import ContractRepository
 from hr.repositories.contract_document import ContractDocumentRepository
+from hr.services.contract_document_service import ContractDocumentService
 
 
 def _pagination_data(page_obj, paginator):
@@ -73,21 +75,7 @@ class ContractService:
         if include_documents:
             docs = ContractDocumentRepository.get_for_contract(contract.id)
             data["documents"] = [
-                {
-                    "id": doc.id,
-                    "uuid": str(doc.uuid),
-                    "title": doc.title,
-                    "document_type": doc.document_type,
-                    "document_type_display": doc.get_document_type_display(),
-                    "file_url": doc.file_url,
-                    "uploaded_by": {
-                        "id": doc.uploaded_by.id,
-                        "first_name": doc.uploaded_by.first_name,
-                        "last_name": doc.uploaded_by.last_name,
-                    } if doc.uploaded_by_id and doc.uploaded_by else None,
-                    "uploaded_at": doc.uploaded_at.isoformat(),
-                }
-                for doc in docs
+                ContractDocumentService.serialize(doc) for doc in docs
             ]
         else:
             data["documents"] = []
@@ -96,21 +84,7 @@ class ContractService:
 
     @classmethod
     def _generate_number(cls) -> str:
-        today = timezone.now()
-        date_part = today.strftime("%Y%m%d")
-        prefix = "CTR"
-        filter_kwargs = {"contract_number__startswith": f"{prefix}-{date_part}"}
-        last = EmployeeContract.objects.filter(**filter_kwargs).order_by("-contract_number").first()
-
-        if last:
-            try:
-                seq = int(last.contract_number.split("-")[-1]) + 1
-            except Exception:
-                seq = 1
-        else:
-            seq = 1
-
-        return f"{prefix}-{date_part}-{seq:04d}"
+        return generate_number("CTR", EmployeeContract, "contract_number")
 
     @classmethod
     def list(cls,
@@ -251,7 +225,7 @@ class ContractService:
         EmploymentEvent.objects.create(
             employee_id=contract.employee_id,
             event_type=event_type,
-            event_date=timezone.now().date(),
+            event_date=timezone.localdate(),
             description=f"Contract {contract.contract_number} activated",
             new_value=contract.contract_number,
             created_by_id=contract.created_by_id,
@@ -282,7 +256,7 @@ class ContractService:
             )
 
         if termination_date is None:
-            termination_date = timezone.now().date()
+            termination_date = timezone.localdate()
 
         contract.status = EmployeeContract.Status.TERMINATED
         contract.termination_date = termination_date
@@ -334,7 +308,7 @@ class ContractService:
         new_contract = ContractRepository.create(
             employee_id=old_contract.employee_id,
             contract_number=contract_number,
-            start_date=new_start_date or timezone.now().date(),
+            start_date=new_start_date or timezone.localdate(),
             end_date=new_end_date,
             contract_type=EmployeeContract.ContractType.RENEWAL,
             status=EmployeeContract.Status.ACTIVE,
@@ -348,7 +322,7 @@ class ContractService:
         EmploymentEvent.objects.create(
             employee_id=old_contract.employee_id,
             event_type=EmploymentEvent.EventType.CONTRACT_RENEWED,
-            event_date=timezone.now().date(),
+            event_date=timezone.localdate(),
             description=f"Contract renewed: {old_contract.contract_number} -> {contract_number}",
             old_value=old_contract.contract_number,
             new_value=contract_number,

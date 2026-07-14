@@ -5,6 +5,8 @@ from django.db import transaction
 from django.db.models import Sum, F
 from django.utils import timezone
 
+from base.services.sequence import generate_number
+
 from base.helpers.response import ServiceResponse
 from stock.models import StockBatch, StockItem
 from stock.services.base_service import to_decimal
@@ -78,7 +80,7 @@ class StockBatchService:
     def _days_until_expiry(cls, batch: StockBatch) -> Optional[int]:
         if not batch.expiry_date:
             return None
-        today = timezone.now().date()
+        today = timezone.localdate()
         delta = batch.expiry_date - today
         return delta.days
 
@@ -86,7 +88,7 @@ class StockBatchService:
     def _is_expired(cls, batch: StockBatch) -> bool:
         if not batch.expiry_date:
             return False
-        return batch.expiry_date < timezone.now().date()
+        return batch.expiry_date < timezone.localdate()
 
     @classmethod
     def list(cls,
@@ -114,14 +116,15 @@ class StockBatchService:
         if has_stock_only:
             queryset = queryset.filter(current_quantity__gt=0)
 
+        today = timezone.localdate()
         if expired_only:
-            queryset = queryset.filter(expiry_date__lt=timezone.now().date())
+            queryset = queryset.filter(expiry_date__lt=today)
         elif expiring_within_days:
-            expiry_threshold = timezone.now().date() + timedelta(days=expiring_within_days)
+            expiry_threshold = today + timedelta(days=expiring_within_days)
             queryset = queryset.filter(
                 expiry_date__isnull=False,
                 expiry_date__lte=expiry_threshold,
-                expiry_date__gte=timezone.now().date()
+                expiry_date__gte=today
             )
 
         queryset = queryset.order_by("expiry_date", "created_at")
@@ -164,7 +167,7 @@ class StockBatchService:
         # Exclude expired and filter for actually available quantity
         return list(
             queryset.exclude(
-                expiry_date__lt=timezone.now().date()
+                expiry_date__lt=timezone.localdate()
             ).filter(
                 current_quantity__gt=F("reserved_quantity")
             )
@@ -260,7 +263,7 @@ class StockBatchService:
             unit_cost = stock_item.avg_cost_price
 
         if not expiry_date and stock_item.track_expiry and stock_item.default_expiry_days:
-            manufactured = manufactured_date or timezone.now().date()
+            manufactured = manufactured_date or timezone.localdate()
             expiry_date = manufactured + timedelta(days=stock_item.default_expiry_days)
 
         supplier = None
@@ -296,14 +299,9 @@ class StockBatchService:
 
     @classmethod
     def _generate_batch_number(cls, stock_item: StockItem) -> str:
-        today = timezone.now()
-        prefix = f"B{today.strftime('%y%m%d')}"
-        count = StockBatchRepository.count(
-            stock_item=stock_item,
-            batch_number__startswith=prefix
-        )
-
-        return f"{prefix}-{stock_item.sku or stock_item.id}-{count + 1:03d}"
+        # The local primary key is compact and keeps SequenceCounter.scope
+        # within its 64-character limit even when an imported SKU is very long.
+        return generate_number(f"BAT-{stock_item.id}", StockBatch, "batch_number")
 
     @classmethod
     @transaction.atomic

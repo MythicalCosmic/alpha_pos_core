@@ -100,6 +100,22 @@ def test_order_new_held_until_items_present(server_edition, monkeypatch):
 
 
 @pytest.mark.django_db
+def test_order_new_held_when_only_item_is_soft_deleted(server_edition, monkeypatch):
+    sent = []
+    monkeypatch.setattr(SenderService, 'send', classmethod(
+        lambda cls, ntype, ctx, order_id=None, thread_role=None: sent.append(ntype)))
+
+    order = _order('PREPARING')
+    order.items.get().delete()
+
+    OrderNotification.dispatch(order)
+
+    assert sent == []
+    dispatch = OrderNotificationDispatch.objects.get(order_id=order.id)
+    assert dispatch.new_sent is False
+
+
+@pytest.mark.django_db
 def test_notification_chat_syncs_settings_and_routing():
     """Editing NotificationChat rows rebuilds the derived chat_ids + chat_routing
     that the send path reads — so the admin is the single editable surface."""

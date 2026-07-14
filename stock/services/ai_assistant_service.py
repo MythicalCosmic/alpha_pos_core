@@ -14,11 +14,15 @@ from stock.models import (
 )
 
 from base.models import (
-    User, Order, OrderItem, Product, Category,
+    User, Order, OrderItem, OrderRefund, Product, Category,
     Inkassa, Session
 )
 from base.services.business_day import business_day_date_expr
 from base.services.revenue import net_line_revenue
+from base.services.refund_lines import (
+    REFUND_EVENT_ALIAS, refund_item_events, refund_line_quantity,
+    refund_line_revenue,
+)
 from stock.services.ai_context import (
     current_cash_register, resolve_ai_context, scope_branch,
     scope_location_owned, scope_optional_location_owned,
@@ -38,7 +42,7 @@ You have full access to sales data, stock/inventory data, AND pre-computed busin
 - GROUND EVERY NUMBER IN REAL DATA. Never estimate, guess, approximate, round from memory, or invent ANY number, name, date, product, or total. Every figure in your answer must come DIRECTLY from the provided data or a tool result - if it is not in the data, you do not know it.
 - USE TOOLS FOR EVERYTHING NUMERIC. When tools are available, CALL them to fetch the exact rows before answering - never answer a numeric/analytics question from the quick overview alone. Call as many tools as needed, page through capped lists, and narrow with filters. First resolve any relative period ("today", "this week", "yesterday", "this month") with the datetime tool, then query that exact range.
 - SHOW AND RE-CHECK THE MATH. For every computed figure (sum, count, average, %, growth, margin, forecast) compute it explicitly from the data and VERIFY it before stating it: the parts must add up to the stated total, a set of shares must sum to ~100%, an average must equal total / count, a growth % must match (new-old)/old. If a check fails, recompute - never publish a number you have not verified.
-- USE PRECISE DEFINITIONS. Revenue = SUM of total_amount for PAID, non-CANCELED orders, attributed and bucketed by paid_at. Product sales use order.paid_at. Operational creation/status volume uses created_at. Always state the exact date range and filters so every figure is auditable.
+- USE PRECISE DEFINITIONS. Net revenue = paid sale events bucketed by paid_at MINUS immutable refund events bucketed by refunded_at. A cancelled paid order remains its original sale and has a separate negative refund; an unpaid cancellation has no money event. Product sales follow the same sale/refund event dates. Operational creation/status volume uses created_at. Always state the exact date range and filters so every figure is auditable.
 - NO GAP-FILLING. If the data needed for an exact answer is missing, capped, or ambiguous, say precisely what is missing and answer only what the data supports. Never fill a gap with a plausible-looking number.
 - WHEN UNSURE, DO NOT ASSERT. If you are not certain a figure is exact, say "I don't have that exact number" rather than state it as fact. A wrong number is far worse than an honest "not available".
 
@@ -253,14 +257,25 @@ class AIStockAssistant:
         week_orders = all_orders.filter(created_at__gte=week_lo, created_at__lt=week_hi)
         month_orders = all_orders.filter(created_at__gte=month_lo, created_at__lt=month_hi)
 
-        settled_orders = all_orders.filter(is_paid=True).exclude(
-            status=Order.Status.CANCELED,
-        )
+        settled_orders = all_orders.filter(is_paid=True, paid_at__isnull=False)
         today_sales = settled_orders.filter(paid_at__gte=today_lo, paid_at__lt=today_hi)
         week_sales = settled_orders.filter(paid_at__gte=week_lo, paid_at__lt=week_hi)
         month_sales = settled_orders.filter(paid_at__gte=month_lo, paid_at__lt=month_hi)
 
-        def order_stats(volume_qs, sales_qs):
+        all_refunds = scope_branch(
+            OrderRefund.objects.filter(is_deleted=False), context.branch_id,
+        )
+        today_refunds = all_refunds.filter(
+            refunded_at__gte=today_lo, refunded_at__lt=today_hi,
+        )
+        week_refunds = all_refunds.filter(
+            refunded_at__gte=week_lo, refunded_at__lt=week_hi,
+        )
+        month_refunds = all_refunds.filter(
+            refunded_at__gte=month_lo, refunded_at__lt=month_hi,
+        )
+
+        def order_stats(volume_qs, sales_qs, refund_qs):
             volume = volume_qs.aggregate(
                 count=Count('id'),
                 unpaid_count=Count(
@@ -273,11 +288,19 @@ class AIStockAssistant:
                 avg_order=Avg('total_amount'),
                 paid_count=Count('id'),
             )
+            refund_money = refund_qs.aggregate(
+                total_refunds=Sum('amount'), refunded_count=Count('id'),
+            )
+            gross = money['total_revenue'] or 0
+            refunded = refund_money['total_refunds'] or 0
             by_status = dict(volume_qs.values_list('status').annotate(c=Count('id')).values_list('status', 'c'))
             by_type = dict(volume_qs.values_list('order_type').annotate(c=Count('id')).values_list('order_type', 'c'))
             return {
                 "count": volume['count'] or 0,
-                "total_revenue_uzs": float(money['total_revenue'] or 0),
+                "total_revenue_uzs": float(gross - refunded),
+                "gross_sales_uzs": float(gross),
+                "refunds_uzs": float(refunded),
+                "refunded": refund_money['refunded_count'] or 0,
                 "avg_order_uzs": float(money['avg_order'] or 0),
                 "paid": money['paid_count'] or 0,
                 "unpaid": volume['unpaid_count'] or 0,
@@ -289,52 +312,68 @@ class AIStockAssistant:
         month_items = OrderItem.objects.filter(
             is_deleted=False, order__is_deleted=False, order__is_paid=True,
             order__paid_at__gte=month_lo, order__paid_at__lt=month_hi,
-        ).exclude(order__status='CANCELED')
+        )
         month_items = scope_branch(month_items, context.branch_id, 'order__branch_id')
         today_items = OrderItem.objects.filter(
             is_deleted=False, order__is_deleted=False, order__is_paid=True,
             order__paid_at__gte=today_lo, order__paid_at__lt=today_hi,
-        ).exclude(order__status='CANCELED')
-        today_items = scope_branch(today_items, context.branch_id, 'order__branch_id')
-
-        top_products = list(
-            month_items.values('product__name', 'product__price').annotate(
-                qty_sold=Sum('quantity'),
-                revenue=Sum(net_line_revenue())
-            ).order_by('-revenue')[:15]
         )
+        today_items = scope_branch(today_items, context.branch_id, 'order__branch_id')
+        month_refund_items = refund_item_events(
+            refunded_at__gte=month_lo,
+            refunded_at__lt=month_hi,
+        )
+        month_refund_items = scope_branch(
+            month_refund_items, context.branch_id, 'order__branch_id',
+        )
+        today_refund_items = refund_item_events(
+            refunded_at__gte=today_lo,
+            refunded_at__lt=today_hi,
+        )
+        today_refund_items = scope_branch(
+            today_refund_items, context.branch_id, 'order__branch_id',
+        )
+        from stock.services.ai_tools_service import _net_grouped_items
+
+        top_products = _net_grouped_items(
+            month_items, month_refund_items,
+            ('product__name', 'product__price'),
+        )
+        top_products.sort(key=lambda row: (-(row['rev'] or 0), row['product__name']))
         top_products_data = [{
             "name": p['product__name'],
             "unit_price_uzs": float(p['product__price']),
-            "qty_sold": p['qty_sold'],
-            "revenue_uzs": float(p['revenue'] or 0),
-        } for p in top_products]
+            "qty_sold": p['q'],
+            "revenue_uzs": float(p['rev'] or 0),
+            "gross_sales_uzs": float(p['gross_rev'] or 0),
+            "refunds_uzs": float(p['refund_rev'] or 0),
+        } for p in top_products[:15]]
 
         # ── Top products TODAY ──
-        top_products_today = list(
-            today_items.values('product__name').annotate(
-                qty_sold=Sum('quantity'),
-                revenue=Sum(net_line_revenue())
-            ).order_by('-revenue')[:10]
+        top_products_today = _net_grouped_items(
+            today_items, today_refund_items, ('product__name',),
         )
+        top_products_today.sort(key=lambda row: (-(row['rev'] or 0), row['product__name']))
         top_products_today_data = [{
             "name": p['product__name'],
-            "qty_sold": p['qty_sold'],
-            "revenue_uzs": float(p['revenue'] or 0),
-        } for p in top_products_today]
+            "qty_sold": p['q'],
+            "revenue_uzs": float(p['rev'] or 0),
+            "gross_sales_uzs": float(p['gross_rev'] or 0),
+            "refunds_uzs": float(p['refund_rev'] or 0),
+        } for p in top_products_today[:10]]
 
         # ── Category revenue (30 days) ──
-        category_revenue = list(
-            month_items.values('product__category__name').annotate(
-                revenue=Sum(net_line_revenue()),
-                qty_sold=Sum('quantity')
-            ).order_by('-revenue')[:10]
+        category_revenue = _net_grouped_items(
+            month_items, month_refund_items, ('product__category__name',),
         )
+        category_revenue.sort(key=lambda row: (-(row['rev'] or 0), row['product__category__name'] or ''))
         category_data = [{
             "category": c['product__category__name'],
-            "revenue_uzs": float(c['revenue'] or 0),
-            "qty_sold": c['qty_sold'],
-        } for c in category_revenue]
+            "revenue_uzs": float(c['rev'] or 0),
+            "qty_sold": c['q'],
+            "gross_sales_uzs": float(c['gross_rev'] or 0),
+            "refunds_uzs": float(c['refund_rev'] or 0),
+        } for c in category_revenue[:10]]
 
         # ── Cashier performance (30 days) ──
         cashier_volume = list(
@@ -356,6 +395,13 @@ class AIStockAssistant:
                 total_revenue=Sum('total_amount'), avg_order=Avg('total_amount'),
             )
         )
+        cashier_refunds = list(
+            month_refunds.filter(cashier__isnull=False).values(
+                'cashier__id', 'cashier__first_name', 'cashier__last_name',
+            ).annotate(
+                total_refunds=Sum('amount'), refunded=Count('id'),
+            )
+        )
         cashier_rows = {}
         for c in cashier_volume:
             cashier_rows[c['cashier__id']] = {
@@ -370,7 +416,23 @@ class AIStockAssistant:
                 "orders": 0, "completed": 0, "canceled": 0,
             })
             row['revenue_uzs'] = float(c['total_revenue'] or 0)
+            row['gross_sales_uzs'] = float(c['total_revenue'] or 0)
             row['avg_order_uzs'] = float(c['avg_order'] or 0)
+        for c in cashier_refunds:
+            row = cashier_rows.setdefault(c['cashier__id'], {
+                "name": f"{c['cashier__first_name']} {c['cashier__last_name']}",
+                "orders": 0, "completed": 0, "canceled": 0,
+                "revenue_uzs": 0.0, "gross_sales_uzs": 0.0,
+                "avg_order_uzs": 0.0,
+            })
+            refund_value = float(c['total_refunds'] or 0)
+            row['refunds_uzs'] = refund_value
+            row['refunded'] = c['refunded'] or 0
+            row['revenue_uzs'] = row.get('revenue_uzs', 0.0) - refund_value
+        for row in cashier_rows.values():
+            row.setdefault('gross_sales_uzs', row.get('revenue_uzs', 0.0))
+            row.setdefault('refunds_uzs', 0.0)
+            row.setdefault('refunded', 0)
         cashier_data = sorted(
             cashier_rows.values(),
             key=lambda row: (-row['revenue_uzs'], row['name']),
@@ -388,10 +450,21 @@ class AIStockAssistant:
             hourly_rows.setdefault(
                 h['hour'], {'orders': 0, 'revenue': 0},
             )['revenue'] = h['revenue'] or 0
+        for h in today_refunds.annotate(hour=TruncHour('refunded_at')).values(
+            'hour'
+        ).annotate(revenue=Sum('amount'), count=Count('id')):
+            target = hourly_rows.setdefault(
+                h['hour'], {'orders': 0, 'revenue': 0},
+            )
+            target['refunds'] = h['revenue'] or 0
+            target['refunded'] = h['count'] or 0
+            target['revenue'] = (target.get('revenue') or 0) - (h['revenue'] or 0)
         hourly_data = [{
             "hour": hour.strftime('%H:%M') if hour else '',
             "orders": hourly_rows[hour]['orders'],
             "revenue_uzs": float(hourly_rows[hour]['revenue']),
+            "refunds_uzs": float(hourly_rows[hour].get('refunds') or 0),
+            "refunded": hourly_rows[hour].get('refunded', 0),
         } for hour in sorted(hourly_rows, key=lambda value: value or today_lo)]
 
         # ── Daily trend (7 days) ──
@@ -406,10 +479,21 @@ class AIStockAssistant:
             daily_rows.setdefault(
                 d['day'], {'orders': 0, 'revenue': 0},
             )['revenue'] = d['revenue'] or 0
+        for d in week_refunds.annotate(
+            day=business_day_date_expr('refunded_at')
+        ).values('day').annotate(revenue=Sum('amount'), count=Count('id')):
+            target = daily_rows.setdefault(
+                d['day'], {'orders': 0, 'revenue': 0},
+            )
+            target['refunds'] = d['revenue'] or 0
+            target['refunded'] = d['count'] or 0
+            target['revenue'] = (target.get('revenue') or 0) - (d['revenue'] or 0)
         daily_data = [{
             "date": day.isoformat() if day else '',
             "orders": daily_rows[day]['orders'],
             "revenue_uzs": float(daily_rows[day]['revenue']),
+            "refunds_uzs": float(daily_rows[day].get('refunds') or 0),
+            "refunded": daily_rows[day].get('refunded', 0),
         } for day in sorted(daily_rows, key=lambda value: value or bd)]
 
         # ── Users ──
@@ -469,9 +553,9 @@ class AIStockAssistant:
         categories_count = Category.objects.filter(is_deleted=False, status='ACTIVE').count()
 
         return {
-            "today": order_stats(today_orders, today_sales),
-            "this_week": order_stats(week_orders, week_sales),
-            "this_month": order_stats(month_orders, month_sales),
+            "today": order_stats(today_orders, today_sales, today_refunds),
+            "this_week": order_stats(week_orders, week_sales, week_refunds),
+            "this_month": order_stats(month_orders, month_sales, month_refunds),
             "top_products_30_days": top_products_data,
             "top_products_today": top_products_today_data,
             "category_revenue": category_data,
@@ -977,20 +1061,40 @@ class AIStockAssistant:
         start_date = end_date - timedelta(days=days - 1)
         lo, hi = range_window(start_date, end_date)
 
-        product_sales = OrderItem.objects.filter(
+        sale_items = OrderItem.objects.filter(
             is_deleted=False, order__is_deleted=False, order__is_paid=True,
             order__paid_at__gte=lo, order__paid_at__lt=hi,
-        ).exclude(
-            order__status='CANCELED',
-        ).values(
-            "product__id", "product__name", "product__price",
-            "product__category__name"
-        ).annotate(
-            qty_sold=Sum("quantity"),
-            revenue=Sum(net_line_revenue())
-        ).order_by("-qty_sold")
-        product_sales = scope_branch(
-            product_sales, context.branch_id, 'order__branch_id',
+        )
+        sale_items = scope_branch(
+            sale_items, context.branch_id, 'order__branch_id',
+        )
+        refund_items = refund_item_events(
+            refunded_at__gte=lo,
+            refunded_at__lt=hi,
+        )
+        refund_items = scope_branch(
+            refund_items, context.branch_id, 'order__branch_id',
+        )
+        from stock.services.ai_tools_service import _net_grouped_items
+        product_sales = _net_grouped_items(
+            sale_items, refund_items,
+            (
+                'product__id', 'product__name', 'product__price',
+                'product__category__name',
+            ),
+        )
+        product_sales = [
+            {
+                **row,
+                'qty_sold': row['q'],
+                'revenue': row['rev'],
+                'refund_revenue': row['refund_rev'],
+            }
+            for row in product_sales
+            if (row['q'] or 0) > 0 or (row['rev'] or 0) > 0
+        ]
+        product_sales.sort(
+            key=lambda row: (-(row['qty_sold'] or 0), row['product__name']),
         )
 
         if not product_sales:
@@ -1039,6 +1143,7 @@ class AIStockAssistant:
                 "margin_pct": round(margin_pct, 1) if cost_known else None,
                 "qty_sold": qty,
                 "revenue_uzs": revenue,
+                "refunds_uzs": float(ps.get('refund_revenue') or 0),
                 "profit_uzs": (
                     round(revenue - ingredient_cost * qty, 2)
                     if cost_known else None
@@ -1289,8 +1394,15 @@ class AIStockAssistant:
         sales = OrderItem.objects.filter(
             is_deleted=False, order__is_deleted=False, order__is_paid=True,
             order__paid_at__gte=lo, order__paid_at__lt=hi,
-        ).exclude(order__status='CANCELED')
+        )
         sales = scope_branch(sales, context.branch_id, 'order__branch_id')
+        refunds = refund_item_events(
+            refunded_at__gte=lo,
+            refunded_at__lt=hi,
+        )
+        refunds = scope_branch(
+            refunds, context.branch_id, 'order__branch_id',
+        )
         start = business_day_start()
         shifted_paid = ExpressionWrapper(
             F('order__paid_at') - timedelta(
@@ -1308,20 +1420,50 @@ class AIStockAssistant:
             revenue=Sum(net_line_revenue())
         ).order_by("product__name", "week")
 
+        shifted_refunded = ExpressionWrapper(
+            F(f'{REFUND_EVENT_ALIAS}__refunded_at') - timedelta(
+                hours=start.hour, minutes=start.minute, seconds=start.second,
+            ),
+            output_field=DateTimeField(),
+        )
+        refund_weekly = refunds.annotate(
+            week=TruncWeek(shifted_refunded, tzinfo=timezone.get_current_timezone())
+        ).values(
+            'product__name', 'week'
+        ).annotate(
+            qty=Sum(refund_line_quantity(REFUND_EVENT_ALIAS)),
+            revenue=Sum(refund_line_revenue(REFUND_EVENT_ALIAS)),
+        ).order_by('product__name', 'week')
+
         products = {}
         for row in weekly:
             name = row["product__name"]
             if name not in products:
-                products[name] = {"name": name, "weeks": []}
-            products[name]["weeks"].append({
-                "week": row["week"].isoformat() if row["week"] else "",
-                "qty": row["qty"],
-                "revenue_uzs": float(row["revenue"] or 0),
+                products[name] = {"name": name, "week_map": {}}
+            week = row['week'].isoformat() if row['week'] else ''
+            products[name]['week_map'][week] = {
+                'week': week, 'qty': row['qty'] or 0,
+                'revenue_uzs': float(row['revenue'] or 0),
+                'gross_sales_uzs': float(row['revenue'] or 0),
+                'refunds_uzs': 0.0,
+            }
+        for row in refund_weekly:
+            name = row['product__name']
+            if name not in products:
+                products[name] = {'name': name, 'week_map': {}}
+            week = row['week'].isoformat() if row['week'] else ''
+            bucket = products[name]['week_map'].setdefault(week, {
+                'week': week, 'qty': 0, 'revenue_uzs': 0.0,
+                'gross_sales_uzs': 0.0, 'refunds_uzs': 0.0,
             })
+            refund_revenue = float(row['revenue'] or 0)
+            bucket['qty'] -= row['qty'] or 0
+            bucket['refunds_uzs'] += refund_revenue
+            bucket['revenue_uzs'] -= refund_revenue
 
         velocity = []
         for name, data in products.items():
-            weeks = data["weeks"]
+            weeks = [data['week_map'][key] for key in sorted(data['week_map'])]
             if len(weeks) >= 2:
                 first_rev = weeks[0]["revenue_uzs"]
                 last_rev = weeks[-1]["revenue_uzs"]
@@ -1331,6 +1473,12 @@ class AIStockAssistant:
 
             total_rev = sum(w["revenue_uzs"] for w in weeks)
             total_qty = sum(w["qty"] for w in weeks)
+
+            # A sale and its full cancellation in the same reporting window
+            # are valid gross + refund events but have zero net velocity. Keep
+            # negative refund-only carryover visible; omit only exact zeroes.
+            if total_rev == 0 and total_qty == 0:
+                continue
 
             velocity.append({
                 "name": name,

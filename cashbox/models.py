@@ -5,8 +5,8 @@ Design (see the Money & Shift Logic spec):
     CashRegister. It's *derived* (cash sales - cash expenses - cash returns
     since shift start), so there is no stored running-balance column to drift.
   * At shift close the cashier counts each tender type; ShiftPaymentTotal
-    freezes expected/counted/difference per method, then the manager confirms
-    and the money posts to the branch SAFE (cash) / BANK (cards).
+    freezes expected/counted/difference per method and manager reconciliation
+    confirms that evidence. Inkassa is the sole later SAFE/BANK movement.
   * CashboxExpense is money paid OUT of the drawer (its own model, not hr.Expense).
 
 Money fields carry SYNC_WRITE_DENYLIST so a branch only ever owns its own
@@ -36,7 +36,7 @@ class ShiftPaymentTotal(SyncMixin, models.Model):
     expected  = system figure (Σ OrderPayment for the method in the shift window,
                 minus cash expenses for CASH).
     counted   = what the cashier physically counted at close (blind).
-    confirmed = the manager's final accepted figure (posts to SAFE/BANK).
+    confirmed = the manager's final accepted audit figure.
     difference= counted - expected (frozen at close).
     """
     shift = models.ForeignKey(
@@ -83,6 +83,7 @@ class ShiftPaymentTotal(SyncMixin, models.Model):
 
 
 class CashboxExpenseCategory(SyncMixin, models.Model):
+    SYNC_PULL_SCOPE = 'global'
     """Catalog of cashbox (drawer) expense categories. Separate from
     hr.ExpenseCategory — these are POS/drawer expenses, not payroll/HR."""
     name = models.CharField(max_length=100)
@@ -107,6 +108,8 @@ class CashboxExpense(SyncMixin, models.Model):
     a supplier, the service layer also writes a SupplierTransaction so the
     supplier balance reflects cash paid from the drawer (see P5).
     """
+    REGISTER_COMMAND_MARKER = '[ALPHAPOS_CASHBOX_COMMAND_V1]'
+
     shift = models.ForeignKey(
         'base.Shift', on_delete=models.CASCADE, related_name='cashbox_expenses',
     )
@@ -115,6 +118,10 @@ class CashboxExpense(SyncMixin, models.Model):
         null=True, blank=True, related_name='expenses',
     )
     amount = models.DecimalField(max_digits=12, decimal_places=2)
+    # Cloud-created drawer expenses are durable commands. The owning branch
+    # applies them to CashRegister on pull; ordinary till-created expenses are
+    # already applied locally and keep this False.
+    register_command = models.BooleanField(default=False)
     comment = models.TextField(blank=True, default='')
     recipient_user = models.ForeignKey(
         'base.User', on_delete=models.SET_NULL,
@@ -133,6 +140,7 @@ class CashboxExpense(SyncMixin, models.Model):
 
     # Branch-owned money.
     SYNC_WRITE_DENYLIST = frozenset({'amount'})
+    SYNC_DENY_FROM_BRANCH = frozenset({'register_command'})
 
     objects = SyncManager()
 
@@ -158,6 +166,31 @@ class CashboxExpense(SyncMixin, models.Model):
         data['recipient_supplier_uuid'] = str(self.recipient_supplier.uuid) if self.recipient_supplier else None
         data['created_by_uuid'] = str(self.created_by.uuid) if self.created_by else None
         return data
+
+    @classmethod
+    def command_comment(cls, comment=''):
+        return f'{cls.REGISTER_COMMAND_MARKER}\n{str(comment or "")}'
+
+    @classmethod
+    def visible_comment(cls, comment=''):
+        text = str(comment or '')
+        prefix = f'{cls.REGISTER_COMMAND_MARKER}\n'
+        return text[len(prefix):] if text.startswith(prefix) else text
+
+    @classmethod
+    def from_sync_dict(cls, data, branch_id=None):
+        instance, action = super().from_sync_dict(data, branch_id=branch_id)
+        if instance is not None and not instance.is_deleted and (
+            instance.register_command
+            or str(instance.comment or '').startswith(cls.REGISTER_COMMAND_MARKER)
+        ):
+            # One cumulative register adjustment covers both remote expenses
+            # and inkassa. It is idempotent if the same pull record is replayed.
+            from base.models import Inkassa
+            applied = Inkassa._apply_pending_register_commands(instance.branch_id)
+            if not applied:
+                return instance, 'deferred'
+        return instance, action
 
     def __str__(self):
         return f"CashboxExpense {self.amount} (shift {self.shift_id})"

@@ -5,7 +5,6 @@ from django.db import transaction
 from base.helpers.response import ServiceResponse
 from stock.services.base_service import to_decimal
 from stock.repositories import (
-    ProductStockLinkRepository, ProductComponentStockRepository,
     StockTransactionRepository,
     StockSettingsRepository,
 )
@@ -107,7 +106,9 @@ class OrderStockService:
                             modifiers: List[Dict],
                             location_id: int,
                             user_id: int) -> Tuple[Dict[str, Any], int]:
-        deduction_items = ProductStockLinkService.get_deduction_items(product_id, quantity)
+        deduction_items = ProductStockLinkService.get_deduction_items(
+            product_id, quantity, modifiers=modifiers,
+        )
 
         if not deduction_items:
             return ServiceResponse.success(data={"deductions": []})
@@ -130,62 +131,16 @@ class OrderStockService:
                 transaction.set_rollback(True)
                 return result, status
 
-            deductions.append({
+            deduction = {
                 "stock_item_id": item["stock_item_id"],
                 "quantity": str(item["quantity"]),
                 "transaction_id": result.get("data", {}).get("transaction_id")
-            })
-
-        link = ProductStockLinkRepository.first(
-            product_id=product_id,
-            link_type="COMPONENT_BASED"
-        )
-
-        if link and modifiers:
-            for mod in modifiers:
-                component_id = mod.get("component_id")
-                action = mod.get("action")
-
-                if not component_id:
-                    continue
-
-                comp = ProductComponentStockRepository.get_by_id(component_id)
-
-                if not comp:
-                    continue
-
-                if action == "REMOVE" and comp.is_removable:
-                    # NOT IMPLEMENTED: crediting a removed component back to
-                    # stock requires either a dedicated `MODIFIER_CREDIT`
-                    # movement_type or count-based bookkeeping in
-                    # reverse_deduction (which currently short-circuits the
-                    # moment any RETURN_FROM_CUSTOMER row exists for the
-                    # order). Until that lands, "no onions" does not return
-                    # the onion to stock — the base recipe deducted it and
-                    # we leak the gram. See ROADMAP.
-                    pass
-                elif action == "ADD" and comp.is_addable:
-                    result, status = StockLevelService.adjust(
-                        stock_item_id=comp.stock_item_id,
-                        location_id=location_id,
-                        quantity=-comp.quantity * quantity,
-                        movement_type="SALE_OUT",
-                        user_id=user_id,
-                        unit_id=comp.unit_id,
-                        order_id=order_id,
-                        notes=f"Order #{order_id} - Added component"
-                    )
-
-                    if status >= 400:
-                        transaction.set_rollback(True)
-                        return result, status
-
-                    deductions.append({
-                        "stock_item_id": comp.stock_item_id,
-                        "quantity": str(comp.quantity * quantity),
-                        "modifier": "ADD",
-                        "transaction_id": result.get("data", {}).get("transaction_id")
-                    })
+            }
+            if item.get("modifier"):
+                deduction["modifier"] = item["modifier"]
+            if item.get("component_id"):
+                deduction["component_id"] = item["component_id"]
+            deductions.append(deduction)
 
         return ServiceResponse.success(data={"deductions": deductions})
 
@@ -290,7 +245,9 @@ class OrderStockService:
             product_id = order_item["product_id"]
             quantity = to_decimal(order_item.get("quantity", 1))
 
-            deduction_items = ProductStockLinkService.get_deduction_items(product_id, quantity)
+            deduction_items = ProductStockLinkService.get_deduction_items(
+                product_id, quantity, modifiers=order_item.get("modifiers", []),
+            )
 
             if not deduction_items:
                 results.append({
@@ -355,7 +312,9 @@ class OrderStockService:
             product_id = order_item["product_id"]
             quantity = to_decimal(order_item.get("quantity", 1))
 
-            deduction_items = ProductStockLinkService.get_deduction_items(product_id, quantity)
+            deduction_items = ProductStockLinkService.get_deduction_items(
+                product_id, quantity, modifiers=order_item.get("modifiers", []),
+            )
 
             for item in deduction_items:
                 result, status = StockLevelService.reserve(
@@ -426,7 +385,7 @@ class OrderStockService:
             # idempotency check above can never match prior releases and
             # the second call falls into the for-loop, hitting "Cannot
             # release X: only Y reserved" instead of a clean skip.
-            StockLevelService.release_reservation(
+            result, status = StockLevelService.release_reservation(
                 stock_item_id=res.stock_item_id,
                 location_id=res.location_id,
                 quantity=res.base_quantity,
@@ -434,6 +393,10 @@ class OrderStockService:
                 reference_type="Order",
                 reference_id=order_id,
             )
+
+            if status >= 400:
+                transaction.set_rollback(True)
+                return result, status
 
             releases.append({
                 "stock_item_id": res.stock_item_id,
@@ -478,6 +441,12 @@ class OrderStockService:
                 "reason": "No quantity change"
             })
 
+        if not location_id:
+            return ServiceResponse.validation_error(
+                errors={"location_id": "A default stock location is required"},
+                message="Stock adjustment could not be applied",
+            )
+
         deduction_items = ProductStockLinkService.get_deduction_items(
             product_id, abs(quantity_delta)
         )
@@ -514,6 +483,14 @@ class OrderStockService:
                     notes=f"Item removed/decreased in order #{order_id} - Product #{product_id}"
                 )
 
+            if status >= 400:
+                # This method may already have applied earlier recipe/component
+                # rows.  Returning an error without marking the enclosing
+                # atomic block would commit those rows and leave the order edit
+                # only partly represented in inventory.
+                transaction.set_rollback(True)
+                return result, status
+
             adjustments.append({
                 "stock_item_id": item["stock_item_id"],
                 "quantity": str(item["quantity"]),
@@ -533,6 +510,7 @@ class OrderStockService:
 class OrderStatusHandler:
 
     @classmethod
+    @transaction.atomic
     def on_status_change(cls,
                          order_id: int,
                          old_status: str,
@@ -543,33 +521,61 @@ class OrderStatusHandler:
 
         settings = StockSettingsRepository.load()
 
-        if not settings.stock_enabled:
-            return ServiceResponse.success(data={"skipped": True, "reason": "Stock disabled"})
+        if not settings.stock_enabled or not settings.auto_deduct_on_sale:
+            return ServiceResponse.success(data={
+                "skipped": True,
+                "reason": "Stock disabled or auto-deduct off",
+            })
 
         result = {"actions": []}
 
         if settings.reserve_on_order_create and old_status is None:
-            res = OrderStockService.reserve_for_order(
+            response, status = OrderStockService.reserve_for_order(
                 order_id, order_items, location_id, user_id
             )
-            result["actions"].append({"action": "reserve", "result": res})
+            if status >= 400:
+                transaction.set_rollback(True)
+                return response, status
+            result["actions"].append({"action": "reserve", "result": response})
 
         if new_status == settings.deduct_on_order_status:
             if settings.reserve_on_order_create:
-                OrderStockService.release_reservation(order_id, user_id)
+                response, status = OrderStockService.release_reservation(
+                    order_id, user_id,
+                )
+                if status >= 400:
+                    transaction.set_rollback(True)
+                    return response, status
+                result["actions"].append({
+                    "action": "release", "result": response,
+                })
 
-            res = OrderStockService.deduct_for_order(
+            response, status = OrderStockService.deduct_for_order(
                 order_id, order_items, location_id, user_id, new_status
             )
-            result["actions"].append({"action": "deduct", "result": res})
+            if status >= 400:
+                transaction.set_rollback(True)
+                return response, status
+            result["actions"].append({"action": "deduct", "result": response})
 
         if new_status == "CANCELED":
             if settings.reserve_on_order_create:
-                OrderStockService.release_reservation(order_id, user_id)
+                response, status = OrderStockService.release_reservation(
+                    order_id, user_id,
+                )
+                if status >= 400:
+                    transaction.set_rollback(True)
+                    return response, status
+                result["actions"].append({
+                    "action": "release", "result": response,
+                })
 
-            res = OrderStockService.reverse_deduction(
+            response, status = OrderStockService.reverse_deduction(
                 order_id, user_id, "Order cancelled"
             )
-            result["actions"].append({"action": "reverse", "result": res})
+            if status >= 400:
+                transaction.set_rollback(True)
+                return response, status
+            result["actions"].append({"action": "reverse", "result": response})
 
         return ServiceResponse.success(data=result)

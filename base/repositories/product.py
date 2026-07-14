@@ -126,7 +126,10 @@ class ProductRepository(BaseSyncRepository):
 
     @classmethod
     def bulk_soft_delete(cls, ids):
-        return cls.model.objects.filter(id__in=ids, is_deleted=False).update(is_deleted=True)
+        return cls.sync_update_queryset(
+            cls.model.objects.filter(id__in=ids, is_deleted=False),
+            is_deleted=True,
+        )
 
     @classmethod
     def invalidate_cache(cls):

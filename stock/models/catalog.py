@@ -50,6 +50,7 @@ class StockLocation(SyncMixin, models.Model):
 
 
 class StockUnit(SyncMixin, models.Model):
+    SYNC_PULL_SCOPE = 'global'
     class UnitType(models.TextChoices):
         WEIGHT = "WEIGHT", "Weight"
         VOLUME = "VOLUME", "Volume"
@@ -98,6 +99,7 @@ class StockUnit(SyncMixin, models.Model):
 
 
 class StockCategory(SyncMixin, models.Model):
+    SYNC_PULL_SCOPE = 'global'
     class CategoryType(models.TextChoices):
         RAW_MATERIAL = "RAW_MATERIAL", "Raw Material"
         SEMI_FINISHED = "SEMI_FINISHED", "Semi-Finished"
