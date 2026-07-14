@@ -23,7 +23,7 @@ from django.db.models.functions import TruncHour
 from django.utils import timezone
 
 from base.models import (
-    User, Order, OrderItem, OrderRefund, Product, Category, Customer,
+    User, Order, OrderItem, OrderPayment, OrderRefund, Product, Category, Customer,
     CashRegister, Inkassa, Shift, CashReconciliation,
 )
 from stock.models import StockLevel, StockBatch, StockLocation
@@ -181,7 +181,9 @@ def _bd_today():
 # models are deliberately ABSENT, and sensitive fields are stripped from every
 # result — even reached through a relation (cashier__password).
 _QUERYABLE_MODELS = {
-    'order': Order, 'orderitem': OrderItem, 'product': Product, 'category': Category,
+    'order': Order, 'orderitem': OrderItem,
+    'orderpayment': OrderPayment, 'orderrefund': OrderRefund,
+    'product': Product, 'category': Category,
     'customer': Customer, 'user': User, 'cashier': User, 'staff': User,
     'shift': Shift, 'cashreconciliation': CashReconciliation,
     'cashregister': CashRegister, 'inkassa': Inkassa,
@@ -667,12 +669,17 @@ class AIToolbox:
                 "with Django-style field lookups, and either return matching rows (choose the "
                 "fields) OR aggregate (count / sum:field / avg:field / min:field / max:field, "
                 "optionally grouped). Queryable models: order, orderitem, product, category, "
-                "customer, user, shift, cashreconciliation, cashregister, inkassa, stocklevel, "
-                "stockbatch, stocklocation. For money/revenue or product-sales windows, "
-                "filter orders by paid_at (order items by order__paid_at), is_paid=true, "
-                "and exclude CANCELED; use created_at for operational creation/status volume. "
-                'Revenue filters: {"is_paid":true,"paid_at__date":"2026-07-04"}, '
-                'exclude {"status":"CANCELED"}. Aggregate example: '
+                "orderpayment, orderrefund, customer, user, shift, cashreconciliation, "
+                "cashregister, inkassa, stocklevel, stockbatch, stocklocation. Prefer "
+                "sales_report for money because it already applies the restaurant business-day "
+                "cutover and nets the immutable ledgers correctly. If a custom ledger query is "
+                "necessary: every is_paid order is a gross sale at paid_at even when its later "
+                "operational status is CANCELED; NEVER exclude a paid sale because of status. "
+                "Refunds are separate orderrefund events at refunded_at, so net revenue is gross "
+                "paid orders minus refund events. Use explicit half-open datetime bounds "
+                "(__gte start, __lt end), not __date, for business-day windows. Use created_at "
+                "only for operational creation/status volume. orderpayment rows are tender legs, "
+                "not additional revenue. Aggregate example: "
                 'aggregate {"revenue":"sum:total_amount","orders":"count"} '
                 'group_by ["cashier"]. Row example: fields ["id","total_amount","status",'
                 '"cashier__first_name"]. Prefer a specific tool when it already computes the exact '
@@ -682,8 +689,8 @@ class AIToolbox:
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "model": {"type": "string", "description": "order, orderitem, product, category, customer, user, shift, cashreconciliation, cashregister, inkassa, stocklevel, stockbatch, stocklocation"},
-                    "filters": {"type": "object", "description": 'Django lookups. Revenue: {"is_paid":true,"paid_at__gte":"2026-07-01"}; operational volume: {"created_at__gte":"2026-07-01"}.'},
+                    "model": {"type": "string", "description": "order, orderitem, orderpayment, orderrefund, product, category, customer, user, shift, cashreconciliation, cashregister, inkassa, stocklevel, stockbatch, stocklocation"},
+                    "filters": {"type": "object", "description": 'Django lookups. Use explicit half-open bounds, e.g. {"is_paid":true,"paid_at__gte":"2026-07-01T03:00:00+05:00","paid_at__lt":"2026-07-02T03:00:00+05:00"}.'},
                     "exclude": {"type": "object", "description": "Same shape as filters, rows to exclude"},
                     "aggregate": {"type": "object", "description": '{alias:"func:field" | "count"}, func: sum/avg/min/max. e.g. {"revenue":"sum:total_amount","n":"count"}'},
                     "group_by": {"type": "array", "items": {"type": "string"}, "description": 'Group aggregates by these field paths, e.g. ["cashier","status"]'},
@@ -755,7 +762,8 @@ class AIToolbox:
         # built tools, otherwise the model can accidentally sum every branch.
         context = _context(args)
         branch_models = {
-            Order, OrderItem, Customer, Shift, CashReconciliation, CashRegister, Inkassa,
+            Order, OrderItem, OrderPayment, OrderRefund, Customer, Shift,
+            CashReconciliation, CashRegister, Inkassa,
             StockLocation,
         }
         if model in (StockLevel, StockBatch):
@@ -763,6 +771,7 @@ class AIToolbox:
         elif model in branch_models:
             branch_field = {
                 OrderItem: 'order__branch_id',
+                OrderPayment: 'order__branch_id',
                 CashReconciliation: 'shift__branch_id',
             }.get(model, 'branch_id')
             qs = scope_branch(qs, context.branch_id, branch_field)

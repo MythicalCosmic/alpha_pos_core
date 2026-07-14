@@ -164,6 +164,64 @@ class TestPullCursorNotClobbered:
         assert 'last_pull_at' in data
 
 
+class TestPullTruthfulFailureStatus:
+    def _configure(self, settings, monkeypatch):
+        from base.services.sync import service as sync_service
+        from base.services.sync.status import SyncStatus
+
+        settings.SYNC_ENABLED = True
+        settings.SYNC_PULL_ENABLED = True
+        settings.DEPLOYMENT_MODE = 'local'
+        settings.BRANCH_ID = 'main'
+        settings.CLOUD_SYNC_URL = 'https://cloud.test'
+        monkeypatch.setattr(sync_service, 'check_health', lambda: True)
+        monkeypatch.setattr(sync_service, 'SYNC_ORDER', [])
+        monkeypatch.setattr(sync_service, 'get_all_models', lambda: {})
+        monkeypatch.setattr(
+            sync_service.SyncService, '_acquire_lock',
+            classmethod(lambda cls, name: 'owner'),
+        )
+        monkeypatch.setattr(
+            sync_service.SyncService, '_release_lock',
+            classmethod(lambda cls, name, token: None),
+        )
+        monkeypatch.setattr(
+            sync_service.SyncService, '_notify_error',
+            classmethod(lambda cls, *args: None),
+        )
+        SyncStatus.clear()
+        return sync_service, SyncStatus
+
+    def test_fetch_error_is_persisted_in_status(self, settings, monkeypatch):
+        sync_service, status = self._configure(settings, monkeypatch)
+        monkeypatch.setattr(sync_service, 'fetch_changes', lambda **kwargs: {
+            'success': False,
+            'error': 'TLS certificate rejected',
+        })
+
+        result = sync_service.SyncService.pull_from_cloud()
+
+        assert result['success'] is False
+        assert result['message'] == 'TLS certificate rejected'
+        assert status.get()['last_pull_error'] == 'TLS certificate rejected'
+
+    def test_nonadvancing_feed_is_reported_as_failure(self, settings, monkeypatch):
+        sync_service, status = self._configure(settings, monkeypatch)
+        monkeypatch.setattr(sync_service, 'fetch_changes', lambda **kwargs: {
+            'success': True,
+            'data': {},
+            'has_more': True,
+            'next_since': None,
+            'server_timestamp': '2026-07-14T00:00:00+00:00',
+        })
+
+        result = sync_service.SyncService.pull_from_cloud()
+
+        assert result['success'] is False
+        assert result['errors'] == ['Cloud change feed cursor did not advance']
+        assert status.get()['last_pull_error'] == result['errors'][0]
+
+
 class TestPullCursorWaitsForDeferredRecords:
     def _configure(self, settings, monkeypatch, apply_results):
         from base.services.sync import service as sync_service
@@ -221,7 +279,7 @@ class TestPullCursorWaitsForDeferredRecords:
 
         result = sync_service.SyncService.pull_from_cloud()
 
-        assert result['success'] is True
+        assert result['success'] is False
         assert result['errors']
         assert status.get_cursor() == '2026-07-13T11:00:00+00:00'
 
@@ -266,7 +324,7 @@ def _configure_local_push(settings, monkeypatch):
 
 
 def _unpaid_order_with_only_order_unsynced(settings):
-    from base.models import Order, SyncQueueRecord, User
+    from base.models import CashRegister, Order, SyncQueueRecord, User
 
     user = User.objects.create(
         first_name='Queue', last_name='Race', email='queue-race@example.com',
@@ -277,6 +335,18 @@ def _unpaid_order_with_only_order_unsynced(settings):
     User.objects.filter(pk=user.pk).update(synced_at=timezone.now())
     SyncQueueRecord.objects.filter(
         model_name='user', record_uuid=user.uuid,
+    ).delete()
+    # Paying the order now takes the branch accounting lock. Seed that owner
+    # row as already synchronized so this generation-safety fixture still has
+    # exactly one live/queued model under test: Order.
+    register = CashRegister.objects.create(
+        branch_id=settings.BRANCH_ID, current_balance=0,
+    )
+    CashRegister.objects.filter(pk=register.pk).update(
+        synced_at=timezone.now(),
+    )
+    SyncQueueRecord.objects.filter(
+        model_name='cashregister', record_uuid=register.uuid,
     ).delete()
     return Order.objects.create(
         user=user, cashier=user, status='READY', is_paid=False,

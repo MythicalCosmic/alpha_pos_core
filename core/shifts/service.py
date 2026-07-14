@@ -305,10 +305,14 @@ class ShiftService:
         # The old guard blocked on ANY OPEN/PREPARING/READY order regardless of
         # payment, so paid orders the kitchen never marked COMPLETED piled up and the
         # shift could never be closed at all (the bug this fixes).
+        now = timezone.now()
+
         blocking = Order.objects.filter(
             is_deleted=False,
             cashier_id=shift.user_id,
+            branch_id=shift.branch_id,
             created_at__gte=shift.start_time,
+            created_at__lt=now,
             is_paid=False,
             status=Order.Status.OPEN,
         ).count()
@@ -318,14 +322,13 @@ class ShiftService:
                 "Take payment or cancel them first."
             )
 
-        now = timezone.now()
-
         # total_orders = orders TAKEN this shift, attributed by created_at.
         orders_taken = Order.objects.filter(
             is_deleted=False,
             cashier_id=shift.user_id,
+            branch_id=shift.branch_id,
             created_at__gte=shift.start_time,
-            created_at__lte=now,
+            created_at__lt=now,
         ).aggregate(total_orders=Count('id'))
 
         # Revenue and cash are attributed by paid_at, NOT created_at: the cash
@@ -340,9 +343,10 @@ class ShiftService:
         paid_orders = Order.objects.filter(
             is_deleted=False,
             cashier_id=shift.user_id,
+            branch_id=shift.branch_id,
             is_paid=True,
             paid_at__gte=shift.start_time,
-            paid_at__lte=now,
+            paid_at__lt=now,
         )
         # cash_collected is DERIVED from the tender split, not from
         # Sum(total_amount, filter=payment_method='CASH'): that booked a MIXED
@@ -354,7 +358,7 @@ class ShiftService:
         from base.models import OrderRefund
         from base.services.order_refund import refund_totals
         _refunded = refund_totals(OrderRefund.objects.filter(
-            is_deleted=False, shift=shift,
+            is_deleted=False, shift=shift, branch_id=shift.branch_id,
         ))
         money = {
             'total_revenue': paid_orders.aggregate(
@@ -671,11 +675,13 @@ class ShiftService:
         start = shift.start_time
         orders_taken = Order.objects.filter(
             is_deleted=False, cashier_id=shift.user_id,
-            created_at__gte=start, created_at__lte=end,
+            branch_id=shift.branch_id,
+            created_at__gte=start, created_at__lt=end,
         ).aggregate(total_orders=Count('id'))
         paid_orders = Order.objects.filter(
             is_deleted=False, cashier_id=shift.user_id, is_paid=True,
-            paid_at__gte=start, paid_at__lte=end,
+            branch_id=shift.branch_id,
+            paid_at__gte=start, paid_at__lt=end,
         )
         money = paid_orders.aggregate(
             total_revenue=Coalesce(Sum('total_amount'), Decimal('0.00'), output_field=DecimalField()),
@@ -688,7 +694,7 @@ class ShiftService:
         from base.models import OrderRefund
         from base.services.order_refund import refund_totals
         refunded = refund_totals(OrderRefund.objects.filter(
-            is_deleted=False, shift=shift,
+            is_deleted=False, shift=shift, branch_id=shift.branch_id,
         ))
         return (
             orders_taken['total_orders'] or 0,
@@ -704,7 +710,8 @@ class ShiftService:
         and the frozen difference. Drawn from the ShiftPaymentTotal rows."""
         from cashbox.models import ShiftPaymentTotal
         rows = ShiftPaymentTotal.objects.filter(
-            shift=shift, is_deleted=False).order_by('method')
+            shift=shift, branch_id=shift.branch_id, is_deleted=False,
+        ).order_by('method')
         return [{
             'method': r.method,
             'expected': str(r.expected_amount),
@@ -727,7 +734,8 @@ class ShiftService:
         try:
             sold = Order.objects.filter(
                 is_deleted=False, cashier_id=shift.user_id,
-                created_at__gte=start, created_at__lte=end,
+                branch_id=shift.branch_id,
+                created_at__gte=start, created_at__lt=end,
             ).exclude(status='CANCELED')
 
             # Money belongs to the shift in which it was PAID, even when the
@@ -736,9 +744,10 @@ class ShiftService:
             paid = Order.objects.filter(
                 is_deleted=False,
                 cashier_id=shift.user_id,
+                branch_id=shift.branch_id,
                 is_paid=True,
                 paid_at__gte=start,
-                paid_at__lte=end,
+                paid_at__lt=end,
             )
             # Canonical tenders. MIXED is never a bucket: a split sale is attributed
             # to its real tenders (cash is the bill portion, not the tendered cash).
@@ -746,7 +755,7 @@ class ShiftService:
             _split, _detail = breakdown_for_orders(paid)
             from base.services.order_refund import refund_totals
             refunds = OrderRefund.objects.filter(
-                is_deleted=False, shift=shift,
+                is_deleted=False, shift=shift, branch_id=shift.branch_id,
             )
             refunded = refund_totals(refunds)
             net_split = {
@@ -780,27 +789,27 @@ class ShiftService:
                 order__is_deleted=False,
                 order__in=paid,
             )
-            refunded_items = OrderItem.objects.filter(
-                is_deleted=False,
-                order__is_deleted=False,
-                order__refund__in=refunds,
-            )
+            from base.services.refund_lines import refund_item_events
+            refunded_items = refund_item_events(id__in=refunds)
             sold_units = items.aggregate(q=Coalesce(Sum('quantity'), 0))['q']
             from base.services.refund_lines import (
+                REFUND_EVENT_ALIAS,
                 refund_line_quantity,
                 refund_line_revenue,
             )
             refunded_units = refunded_items.aggregate(
-                q=Coalesce(Sum(refund_line_quantity()), 0),
+                q=Coalesce(Sum(refund_line_quantity(REFUND_EVENT_ALIAS)), 0),
             )['q']
             units_sold = (sold_units or 0) - (refunded_units or 0)
             from base.services.revenue import net_line_revenue
             def category_rows(qs, *, refund=False):
                 quantity_expr = (
-                    refund_line_quantity() if refund else 'quantity'
+                    refund_line_quantity(REFUND_EVENT_ALIAS)
+                    if refund else 'quantity'
                 )
                 revenue_expr = (
-                    refund_line_revenue() if refund else net_line_revenue()
+                    refund_line_revenue(REFUND_EVENT_ALIAS)
+                    if refund else net_line_revenue()
                 )
                 return qs.values(
                     'product__category_id', 'product__category__name'
@@ -859,7 +868,8 @@ class ShiftService:
         The manager dashboard shows these on every shift card: payment mix
         (amount + order count per tender), items sold, avg prep, peak hour, drawer
         expenses, and cancelled-order figures. Order has no shift FK, so orders
-        attribute to a shift by cashier_id + the shift's [start_time, end] window
+        attribute to a shift by branch_id + cashier_id + the shift's
+        [start_time, end_time) window
         (end = now for a live ACTIVE shift), bucketed in Python. A FIXED set of
         grouped queries runs for the entire page regardless of row count.
 
@@ -894,14 +904,19 @@ class ShiftService:
             return out
         try:
             now = now or timezone.now()
-            # Per-cashier window list sorted by start. Each window END matches
+            # Per-(branch, cashier) window list sorted by start. Branch is part
+            # of the owner key because cashier identities are global and may be
+            # reused by tills at different branches.
+            #
+            # Each window END matches
             # _serialize_shift's effective_end EXACTLY using the SAME shared `now`,
             # so the paid_at-bucketed payment_mix reconciles to the row's
             # total_revenue by construction. Only a genuinely live shift (ACTIVE +
             # no end_time) extends to now; any OTHER null-end shift (e.g. ABANDONED)
             # gets a degenerate window so it can't scoop a later shift's orders
             # while its own serialized totals read frozen-zero.
-            by_cashier = defaultdict(list)   # cashier_id -> [(start, end, shift_id)]
+            by_owner = defaultdict(list)
+            shift_branches = {}
             for s in valid:
                 if s.end_time:
                     end = s.end_time
@@ -909,20 +924,26 @@ class ShiftService:
                     end = now
                 else:
                     end = s.start_time       # non-active, no end_time -> empty window
-                by_cashier[s.user_id].append((s.start_time, end, s.id))
-            for cid in by_cashier:
-                by_cashier[cid].sort(key=lambda t: t[0])
+                owner = (s.branch_id, s.user_id)
+                by_owner[owner].append((s.start_time, end, s.id))
+                shift_branches[s.id] = s.branch_id
+            for owner in by_owner:
+                by_owner[owner].sort(key=lambda t: t[0])
 
-            def bucket(cid, ts):
+            def bucket(branch_id, cid, ts):
                 if ts is None:
                     return None
+                # Half-open end makes an exact handoff timestamp belong only to
+                # the later shift. Last match still resolves malformed overlaps
+                # deterministically to the latest start.
                 found = None
-                for start, end, sid in by_cashier.get(cid, ()):  # sorted asc
-                    if start <= ts <= end:
-                        found = sid                              # last match = latest start
+                for start, end, sid in by_owner.get((branch_id, cid), ()):
+                    if start <= ts < end:
+                        found = sid
                 return found
 
-            cashier_ids = list(by_cashier.keys())
+            cashier_ids = list({owner[1] for owner in by_owner})
+            branch_ids = list({owner[0] for owner in by_owner})
             min_start = min(s.start_time for s in valid)
             max_end = max((s.end_time or now) for s in valid)
 
@@ -941,9 +962,11 @@ class ShiftService:
             paid_cnt = defaultdict(int)
             money_rows = list(Order.objects.filter(
                 is_deleted=False, cashier_id__in=cashier_ids, is_paid=True,
-                paid_at__gte=min_start, paid_at__lte=max_end,
+                branch_id__in=branch_ids,
+                paid_at__gte=min_start, paid_at__lt=max_end,
             ).values_list(
-                'id', 'cashier_id', 'paid_at', 'total_amount', 'payment_method'))
+                'id', 'branch_id', 'cashier_id', 'paid_at',
+                'total_amount', 'payment_method'))
             _ops = defaultdict(list)
             if money_rows:
                 for _oid, _m, _a in OrderPayment.objects.filter(
@@ -951,8 +974,8 @@ class ShiftService:
                 ).values_list('order_id', 'method', 'amount'):
                     _ops[_oid].append((_m, _a))
             _courier = _courier_rows_by_order([r[0] for r in money_rows])
-            for oid, cid, paid_at, amt, method in money_rows:
-                sid = bucket(cid, paid_at)
+            for oid, branch_id, cid, paid_at, amt, method in money_rows:
+                sid = bucket(branch_id, cid, paid_at)
                 if sid is None:
                     continue
                 _s, _ = split_from_rows(
@@ -969,12 +992,16 @@ class ShiftService:
 
             refund_cnt = defaultdict(int)
             refund_total = defaultdict(lambda: Decimal('0.00'))
-            for sid, amount, cash, card, payme, unknown in OrderRefund.objects.filter(
-                is_deleted=False, shift_id__in=list(out.keys()),
+            for sid, row_branch, amount, cash, card, payme, unknown in OrderRefund.objects.filter(
+                is_deleted=False,
+                shift_id__in=list(out.keys()),
+                branch_id__in=branch_ids,
             ).values_list(
-                'shift_id', 'amount', 'cash_amount', 'card_amount',
+                'shift_id', 'branch_id', 'amount', 'cash_amount', 'card_amount',
                 'payme_amount', 'unknown_amount',
             ):
+                if shift_branches.get(sid) != row_branch:
+                    continue
                 acc = mix_acc[sid]
                 acc['cash'] -= cash or zero
                 acc['card'] -= card or zero
@@ -986,11 +1013,14 @@ class ShiftService:
             # Cancelled orders (count + lost value) by created_at.
             canc_cnt = defaultdict(int)
             canc_val = defaultdict(lambda: Decimal('0.00'))
-            for cid, created_at, amt, is_paid in Order.objects.filter(
+            for branch_id, cid, created_at, amt, is_paid in Order.objects.filter(
                 is_deleted=False, cashier_id__in=cashier_ids, status='CANCELED',
-                created_at__gte=min_start, created_at__lte=max_end,
-            ).values_list('cashier_id', 'created_at', 'total_amount', 'is_paid'):
-                sid = bucket(cid, created_at)
+                branch_id__in=branch_ids,
+                created_at__gte=min_start, created_at__lt=max_end,
+            ).values_list(
+                'branch_id', 'cashier_id', 'created_at', 'total_amount', 'is_paid',
+            ):
+                sid = bucket(branch_id, cid, created_at)
                 if sid is None:
                     continue
                 canc_cnt[sid] += 1
@@ -1004,12 +1034,13 @@ class ShiftService:
             hour_cnt = defaultdict(lambda: defaultdict(int))
             prep_sum = defaultdict(float)
             prep_n = defaultdict(int)
-            for cid, created_at, ready_at in Order.objects.filter(
+            for branch_id, cid, created_at, ready_at in Order.objects.filter(
                 is_deleted=False, cashier_id__in=cashier_ids,
-                created_at__gte=min_start, created_at__lte=max_end,
+                branch_id__in=branch_ids,
+                created_at__gte=min_start, created_at__lt=max_end,
             ).exclude(status='CANCELED').values_list(
-                'cashier_id', 'created_at', 'ready_at'):
-                sid = bucket(cid, created_at)
+                'branch_id', 'cashier_id', 'created_at', 'ready_at'):
+                sid = bucket(branch_id, cid, created_at)
                 if sid is None:
                     continue
                 # localtime() -> project-tz wall-clock hour (matches analytics).
@@ -1021,37 +1052,64 @@ class ShiftService:
 
             # Realized units: paid sale at paid_at, full reversal at refund shift.
             units = defaultdict(int)
-            for cid, paid_at, qty in OrderItem.objects.filter(
+            for branch_id, cid, paid_at, qty in OrderItem.objects.filter(
                 is_deleted=False, order__is_deleted=False,
                 order__cashier_id__in=cashier_ids,
+                order__branch_id__in=branch_ids,
                 order__is_paid=True,
-                order__paid_at__gte=min_start, order__paid_at__lte=max_end,
+                order__paid_at__gte=min_start, order__paid_at__lt=max_end,
             ).values_list(
-                'order__cashier_id', 'order__paid_at', 'quantity'):
-                sid = bucket(cid, paid_at)
+                'order__branch_id', 'order__cashier_id',
+                'order__paid_at', 'quantity'):
+                sid = bucket(branch_id, cid, paid_at)
                 if sid is None:
                     continue
                 units[sid] += int(qty or 0)
-            from base.services.refund_lines import refund_line_quantity
+            from base.services.refund_lines import (
+                REFUND_EVENT_ALIAS,
+                refund_item_events,
+                refund_line_quantity,
+            )
             refund_unit_rows = (
-                OrderItem.objects.filter(
-                    is_deleted=False,
-                    order__is_deleted=False,
-                    order__refund__is_deleted=False,
-                    order__refund__shift_id__in=list(out.keys()),
+                refund_item_events(
+                    shift_id__in=list(out.keys()),
+                    branch_id__in=branch_ids,
                 )
-                .values('order__refund__shift_id')
-                .annotate(q=Coalesce(Sum(refund_line_quantity()), 0))
+                .filter(
+                    order__branch_id__in=branch_ids,
+                )
+                .values(
+                    f'{REFUND_EVENT_ALIAS}__shift_id',
+                    f'{REFUND_EVENT_ALIAS}__branch_id',
+                    'order__branch_id',
+                )
+                .annotate(q=Coalesce(Sum(
+                    refund_line_quantity(REFUND_EVENT_ALIAS)
+                ), 0))
             )
             for row in refund_unit_rows:
-                units[row['order__refund__shift_id']] -= int(row['q'] or 0)
+                sid = row[f'{REFUND_EVENT_ALIAS}__shift_id']
+                refund_branch = row[f'{REFUND_EVENT_ALIAS}__branch_id']
+                if not (
+                    shift_branches.get(sid)
+                    == refund_branch
+                    == row['order__branch_id']
+                ):
+                    continue
+                units[sid] -= int(row['q'] or 0)
 
             # Drawer expenses: CashboxExpense HAS a shift FK -> DB GROUP BY, no bucketing.
             exp_total = defaultdict(lambda: Decimal('0.00'))
             for r in (CashboxExpense.objects
-                      .filter(shift_id__in=list(out.keys()), is_deleted=False)
-                      .values('shift_id')
+                      .filter(
+                          shift_id__in=list(out.keys()),
+                          branch_id__in=branch_ids,
+                          is_deleted=False,
+                      )
+                      .values('shift_id', 'branch_id')
                       .annotate(t=Coalesce(Sum('amount'), zero, output_field=DecimalField()))):
+                if shift_branches.get(r['shift_id']) != r['branch_id']:
+                    continue
                 exp_total[r['shift_id']] = r['t'] or zero
 
             def money(d):

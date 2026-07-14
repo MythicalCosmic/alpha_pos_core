@@ -1,8 +1,13 @@
+import logging
+
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_POST, require_http_methods
 from django.conf import settings
 from base.helpers.request import safe_per_page
+
+
+logger = logging.getLogger(__name__)
 
 
 @csrf_exempt
@@ -78,6 +83,26 @@ def receive(request):
             return JsonResponse({'error': 'Invalid branch token'}, status=401)
 
     branch_id = request.META.get('HTTP_X_BRANCH_ID', 'unknown')
+
+    if is_cloud:
+        # ``Cloud`` is a legacy direct hub -> terminal credential.  It is not
+        # valid on the hub itself: accepting it there would turn one shared
+        # outbound secret into an unbound arbitrary-branch write credential.
+        # Normal branch -> hub traffic uses a branch-bound token, and normal
+        # hub -> terminal replication uses the authenticated /changes pull.
+        node_mode = getattr(settings, 'DEPLOYMENT_MODE', '')
+        local_branch = str(getattr(settings, 'BRANCH_ID', '') or '').strip()
+        if node_mode != 'local':
+            return JsonResponse(
+                {'error': 'Cloud receive credentials are valid only on local nodes'},
+                status=403,
+            )
+        if not local_branch or branch_id != local_branch:
+            return JsonResponse(
+                {'error': 'X-Branch-ID must match this local node'},
+                status=403,
+            )
+        branch_id = local_branch
 
     # If the token was bound to a specific branch, the caller MUST present an
     # X-Branch-ID equal to that bound branch. Previously a bound token also

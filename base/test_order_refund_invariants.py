@@ -64,9 +64,11 @@ def test_local_cash_refund_cannot_make_register_negative():
 
     cashier, _shift = _cashier_and_shift()
     order = _paid_cash_order(cashier)
-    register = CashRegister.objects.create(
-        branch_id='branch-a', current_balance='40.00',
+    register = CashRegister.objects.get(
+        branch_id='branch-a', is_deleted=False,
     )
+    register.current_balance = Decimal('40.00')
+    register.save(update_fields=['current_balance'])
 
     with pytest.raises(SettlementInvariantError, match='available cash'):
         record_paid_order_refund(order, cashier.id, reason='customer return')
@@ -86,9 +88,11 @@ def test_cloud_cash_refund_reserves_against_other_pending_commands():
 
     cashier, _shift = _cashier_and_shift()
     order = _paid_cash_order(cashier, amount='50.00')
-    register = CashRegister.objects.create(
-        branch_id='branch-a', current_balance='100.00',
+    register = CashRegister.objects.get(
+        branch_id='branch-a', is_deleted=False,
     )
+    register.current_balance = Decimal('100.00')
+    register.save(update_fields=['current_balance'])
     Inkassa.objects.create(
         cashier=cashier,
         amount='60.00',
@@ -117,9 +121,11 @@ def test_cloud_refund_uses_one_legacy_compatible_cash_command():
 
     cashier, _shift = _cashier_and_shift()
     order = _paid_cash_order(cashier, amount='50.00')
-    register = CashRegister.objects.create(
-        branch_id='branch-a', current_balance='100.00',
+    register = CashRegister.objects.get(
+        branch_id='branch-a', is_deleted=False,
     )
+    register.current_balance = Decimal('100.00')
+    register.save(update_fields=['current_balance'])
 
     refund, created = record_paid_order_refund(
         order, cashier.id, reason='customer return',
@@ -209,7 +215,9 @@ def test_remote_cash_command_stays_deferred_when_drawer_is_short():
     register.current_balance = Decimal('40.00')
     register.save(update_fields=['current_balance'])
     _command, action = Inkassa.from_sync_dict(payload, branch_id='branch-a')
-    assert action == 'updated'
+    # The row itself is an idempotent equal-version replay; the deferred cash
+    # command side effect is what advances once funds become available.
+    assert action == 'skipped'
     register.refresh_from_db()
     assert register.current_balance == Decimal('10.00')
     assert register.remote_cash_out_applied_total == Decimal('30.00')

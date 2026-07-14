@@ -96,7 +96,7 @@ def record_paid_order_refund(order_or_id, cashier_id, *, reason=''):
     has no settlement to reverse.
     """
     from base.models import Inkassa, Order, OrderRefund
-    from base.repositories import CashRegisterRepository
+    from base.services.accounting_cursor import lock_branch_accounting
     from base.services.tender import order_tender_sources
 
     order_id = getattr(order_or_id, 'pk', order_or_id)
@@ -180,12 +180,12 @@ def record_paid_order_refund(order_or_id, cashier_id, *, reason=''):
     # and other refunds.  On cloud the synchronized balance is only the last
     # branch report, so subtract every issued-but-unacknowledged command before
     # deciding whether another remote cash-out is safe.
-    register = None
+    # Every cancellation refund advances the branch-local accounting cursor.
+    # Courier handover takes these same branch locks before its cutoff and reads
+    # accounting_recorded_at, so a late/blocked refund rolls forward exactly once.
+    register = lock_branch_accounting(refund_branch)
     register_balance = Decimal('0.00')
     if drawer_cash:
-        register = CashRegisterRepository.get_or_create_current(
-            refund_branch, for_update=True,
-        )
         register_balance = Decimal(register.current_balance or 0)
         pending = Inkassa.pending_register_amount(register)
         available = register_balance - pending

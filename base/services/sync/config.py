@@ -17,11 +17,16 @@ SYNC_ORDER = [
     'recipebyproduct', 'recipestep',
     'productstocklink', 'productcomponentstock',
     'purchaseorder', 'purchaseorderitem',
-    'purchasereceiving', 'purchasereceivingitem',
-    'stocklevel', 'stockbatch', 'stocktransaction',
-    'productionorder', 'productionorderingredient',
+    'purchasereceiving', 'stocklevel',
+    # Parents referenced by inventory event rows must land first. In
+    # particular, StockBatch can point at a ProductionOrder, while receiving
+    # items can point at the batch they created and StockTransaction can point
+    # at either a production order or transfer. Sending the children first
+    # permanently dead-lettered otherwise-valid inventory rows on a new hub.
+    'productionorder', 'stocktransfer', 'stockbatch',
+    'purchasereceivingitem', 'productionorderingredient',
     'productionorderoutput', 'productionorderstep',
-    'stocktransfer', 'stocktransferitem',
+    'stocktransferitem', 'stocktransaction',
     'variancereasoncode', 'stockcount', 'stockcountitem',
     'stocksettings', 'stockalertconfig',
     # HR models

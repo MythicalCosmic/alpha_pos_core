@@ -70,7 +70,12 @@ def test_multiple_provider_refunds_are_idempotent_append_only_events():
     assert second.drawer_cash_amount == Decimal('0.00')
     assert OrderRefund.objects.filter(order=order).count() == 2
     assert refund_totals(OrderRefund.objects.filter(order=order))['amount'] == Decimal('100.00')
-    assert not CashRegister.objects.filter(branch_id=order.branch_id).exists()
+    # The database-local accounting cursor serializes on the branch register,
+    # but provider refunds must not move physical drawer cash.
+    register = CashRegister.objects.get(
+        branch_id=order.branch_id, is_deleted=False,
+    )
+    assert register.current_balance == Decimal('0.00')
 
     order.refresh_from_db()
     payment.refresh_from_db()

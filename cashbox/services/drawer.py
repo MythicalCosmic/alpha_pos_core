@@ -30,14 +30,16 @@ logger = logging.getLogger(__name__)
 
 def _shift_orders(shift):
     """Orders whose money landed in this shift: paid inside the window by this
-    cashier, excluding cancellations."""
+    cashier and branch. Paid sales remain included after later cancellation;
+    the immutable refund ledger is the separate reversal event."""
     end = shift.end_time or timezone.now()
     return Order.objects.filter(
         is_deleted=False,
         cashier_id=shift.user_id,
+        branch_id=shift.branch_id,
         is_paid=True,
         paid_at__gte=shift.start_time,
-        paid_at__lte=end,
+        paid_at__lt=end,
     )
 
 
@@ -53,6 +55,7 @@ def expected_payment_totals(shift):
     refunds = OrderRefund.objects.filter(
         is_deleted=False,
         shift=shift,
+        branch_id=shift.branch_id,
     )
     from base.services.order_refund import refund_totals
     refunded = refund_totals(refunds)
@@ -72,7 +75,9 @@ def expected_payment_totals(shift):
     totals['PAYME'] = split['payme'] - refunded['payme_amount']
 
     cash_expenses = (
-        CashboxExpense.objects.filter(shift=shift, is_deleted=False)
+        CashboxExpense.objects.filter(
+            shift=shift, branch_id=shift.branch_id, is_deleted=False,
+        )
         .aggregate(s=Sum('amount'))['s'] or Decimal('0')
     )
     totals['CASH'] = (

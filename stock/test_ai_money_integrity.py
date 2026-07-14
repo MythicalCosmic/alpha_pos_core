@@ -2,6 +2,7 @@
 from datetime import datetime, time, timedelta
 from decimal import Decimal
 import json
+from uuid import uuid4
 
 import pytest
 from django.test import override_settings
@@ -201,6 +202,64 @@ def test_generic_customer_query_is_branch_scoped():
     assert result['result']['n'] == 1
 
 
+def test_generic_query_money_guidance_preserves_immutable_ledgers():
+    from stock.services.ai_tools_service import _QUERYABLE_MODELS
+
+    query_tool = next(
+        tool for tool in AIToolbox.TOOLS if tool['name'] == 'query_db'
+    )
+    description = query_tool['description']
+
+    assert 'NEVER exclude a paid sale because of status' in description
+    assert 'Refunds are separate orderrefund events at refunded_at' in description
+    assert 'not __date' in description
+    assert 'paid_at__date' not in description
+    assert {'orderpayment', 'orderrefund'} <= set(_QUERYABLE_MODELS)
+
+
+@override_settings(DEPLOYMENT_MODE='cloud', BRANCH_ID='cloud')
+def test_generic_payment_and_refund_ledgers_are_branch_scoped():
+    location = StockLocation.objects.create(
+        name='Ledger A', type=StockLocation.LocationType.KITCHEN,
+        branch_id='branch-a',
+    )
+    user = _user('ledger-query@test.local')
+    own = _order(user, branch='branch-a', total='20', paid_at=timezone.now())
+    other = _order(user, branch='branch-b', total='90', paid_at=timezone.now())
+    OrderPayment.objects.create(
+        order=own, method='CASH', amount='20', branch_id='branch-a',
+    )
+    OrderPayment.objects.create(
+        order=other, method='CASH', amount='90', branch_id='branch-b',
+    )
+    OrderRefund.objects.create(
+        order=own, branch_id='branch-a', amount='20',
+        cash_amount='20', refunded_at=timezone.now(),
+        source=OrderRefund.Source.COURIER_PAYMENT,
+        source_id=f'own-{uuid4().hex}',
+    )
+    OrderRefund.objects.create(
+        order=other, branch_id='branch-b', amount='90',
+        cash_amount='90', refunded_at=timezone.now(),
+        source=OrderRefund.Source.COURIER_PAYMENT,
+        source_id=f'other-{uuid4().hex}',
+    )
+
+    payments = json.loads(AIToolbox.execute(
+        'query_db',
+        {'model': 'orderpayment', 'aggregate': {'n': 'count'}},
+        location.id,
+    ))
+    refunds = json.loads(AIToolbox.execute(
+        'query_db',
+        {'model': 'orderrefund', 'aggregate': {'n': 'count'}},
+        location.id,
+    ))
+
+    assert payments['matched'] == payments['result']['n'] == 1
+    assert refunds['matched'] == refunds['result']['n'] == 1
+
+
 @override_settings(DEPLOYMENT_MODE='cloud', BRANCH_ID='cloud')
 def test_shift_volume_uses_created_at_but_revenue_uses_paid_at_and_branch():
     user = _user()
@@ -304,7 +363,9 @@ def test_created_day_gets_volume_while_paid_day_gets_money_and_product_sales():
     order = _order(
         user, total='100',
         created_at=_local_at(created_day, 10),
-        paid_at=_local_at(paid_day, 10),
+        # Keep the settlement inside "today so far" even when the suite runs
+        # before 10:00 local time.
+        paid_at=timezone.now() - timedelta(minutes=1),
     )
     OrderItem.objects.create(
         order=order, product=product, quantity=1, price='100', branch_id='branch-a',

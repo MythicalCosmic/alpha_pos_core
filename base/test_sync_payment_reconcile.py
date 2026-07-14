@@ -37,11 +37,13 @@ def _evidence(order_factory, settings):
 def test_payment_batch_repairs_exact_later_unpaid_header(
     order_factory, settings, monkeypatch,
 ):
+    from base.models import CashRegister
     from base.services.order_payment_reconciliation import (
         reconcile_stale_paid_headers,
     )
 
     order, payment, _ = _evidence(order_factory, settings)
+    receipt_floor = timezone.now()
     repaired = reconcile_stale_paid_headers([order.id])
 
     order.refresh_from_db()
@@ -49,6 +51,12 @@ def test_payment_batch_repairs_exact_later_unpaid_header(
     assert order.is_paid is True
     assert order.payment_method == 'CASH'
     assert order.paid_at == payment.created_at
+    # Order.save supplies the commit-order cursor even though this repair
+    # intentionally keeps the original payment's economic timestamp.
+    assert order.accounting_recorded_at >= receipt_floor
+    assert CashRegister.objects.filter(
+        branch_id=order.branch_id, is_deleted=False,
+    ).exists()
 
 
 def test_older_payment_cannot_resurrect_a_newer_unpay_header(

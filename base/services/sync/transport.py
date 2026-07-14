@@ -82,7 +82,9 @@ def send_batch(model_name, records, retry=True):
         'records': records,
     }, cls=SyncEncoder)
 
-    max_retries = get_sync_max_retries() if retry else 1
+    # A bad SYNC_MAX_RETRIES=0 setting must not turn sync into a silent no-op
+    # that reports error=None without issuing even one request.
+    max_retries = max(1, get_sync_max_retries()) if retry else 1
     timeout = get_sync_timeout()
     last_error = None
 
@@ -98,12 +100,20 @@ def send_batch(model_name, records, retry=True):
             if resp.status_code == 200:
                 data = resp.json()
                 errors = data.get('errors', [])
+                failed_uuids = data.get('failed_uuids', [])
 
-                if errors and data.get('created', 0) == 0 and data.get('updated', 0) == 0:
+                # HTTP 200 with per-record failures is a valid partial-batch
+                # acknowledgement. Let the pusher ACK successful/skipped UUIDs
+                # and retain only failed_uuids. Treat only a batch-level receiver
+                # failure (no record identities) as a transport failure.
+                if data.get('success') is False or (errors and not failed_uuids):
                     return {
                         'success': False,
-                        'error': f'Server rejected all records: {errors[0][:200]}',
-                        'failed_uuids': data.get('failed_uuids', []),
+                        'error': (
+                            f'Server rejected batch: {errors[0][:200]}'
+                            if errors else 'Server rejected batch'
+                        ),
+                        'failed_uuids': failed_uuids,
                         'response': data,
                     }
 
@@ -115,7 +125,7 @@ def send_batch(model_name, records, retry=True):
                     'errors': errors,
                     # Records the receiver could not apply. The pusher keeps these
                     # queued instead of purging them on this HTTP-200.
-                    'failed_uuids': data.get('failed_uuids', []),
+                    'failed_uuids': failed_uuids,
                     'response': data,
                 }
 
@@ -152,7 +162,7 @@ def fetch_changes(since_timestamp=None):
     if since_timestamp:
         params['since'] = since_timestamp
 
-    max_retries = get_sync_max_retries()
+    max_retries = max(1, get_sync_max_retries())
     timeout = get_sync_timeout()
     last_error = None
 

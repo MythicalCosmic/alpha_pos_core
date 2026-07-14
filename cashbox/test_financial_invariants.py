@@ -230,6 +230,69 @@ def test_end_shift_settlement_rows_inherit_shift_branch():
     assert set(rows.values_list('branch_id', flat=True)) == {'branch-a'}
 
 
+def test_shift_totals_are_branch_scoped_and_handoff_is_half_open():
+    from cashbox.services.drawer import expected_payment_totals
+    from core.shifts.service import ShiftService
+
+    user = _user(branch='branch-a')
+    t0 = timezone.now() - timedelta(hours=3)
+    handoff = t0 + timedelta(hours=1)
+    t2 = handoff + timedelta(hours=1)
+    first = _shift(
+        user, status='ENDED', start=t0, end=handoff, branch='branch-a',
+    )
+    second = _shift(
+        user, status='ENDED', start=handoff, end=t2, branch='branch-a',
+    )
+
+    # Exact boundary belongs to the later shift only.
+    _paid_order(
+        user, Decimal('100.00'), paid_at=handoff,
+        created_at=handoff, branch='branch-a',
+    )
+    # Same global cashier and timestamp, but another branch: never leaks in.
+    _paid_order(
+        user, Decimal('900.00'), paid_at=handoff + timedelta(minutes=5),
+        created_at=handoff + timedelta(minutes=5), branch='branch-b',
+    )
+
+    assert ShiftService._live_totals(first, handoff) == (
+        0, Decimal('0.00'), Decimal('0.00'),
+    )
+    assert ShiftService._live_totals(second, t2) == (
+        1, Decimal('100.00'), Decimal('100.00'),
+    )
+    assert expected_payment_totals(first)['CASH'] == Decimal('0.00')
+    assert expected_payment_totals(second)['CASH'] == Decimal('100.00')
+
+    extras = ShiftService._batch_list_extras([first, second], now=t2)
+    assert Decimal(extras[first.id]['payment_mix'].get('cash', '0')) == Decimal('0')
+    assert Decimal(extras[second.id]['payment_mix']['cash']) == Decimal('100.00')
+
+
+def test_other_branch_open_order_does_not_block_shift_close():
+    from base.models import Order
+    from core.shifts.service import ShiftService
+
+    user = _user(branch='branch-a')
+    shift = _shift(user, branch='branch-a')
+    Order.objects.create(
+        user=user,
+        cashier=user,
+        branch_id='branch-b',
+        status=Order.Status.OPEN,
+        is_paid=False,
+        subtotal='50.00',
+        total_amount='50.00',
+    )
+
+    result, status = ShiftService.end_shift(
+        shift.id, user.id, notes='', actor=user,
+    )
+
+    assert status == 200, result
+
+
 def test_shift_detail_uses_paid_clock_and_net_active_lines():
     from base.models import Category, Order, OrderItem, Product
     from core.shifts.service import ShiftService

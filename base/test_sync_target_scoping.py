@@ -169,7 +169,7 @@ def test_target_cash_command_applies_once_and_persists_cumulative_ack(settings):
         payload, branch_id='branch-a',
     )
     register.refresh_from_db()
-    assert replay_action == 'updated'
+    assert replay_action == 'skipped'
     assert register.current_balance == 75000
     assert register.remote_cash_out_applied_total == 25000
     assert Inkassa.pending_register_amount(register) == 0

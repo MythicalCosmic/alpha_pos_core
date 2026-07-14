@@ -135,7 +135,7 @@ class TestShiftPaymentTotalSync:
             branch_id=s.branch_id,
         )
         incoming = str(_uuid.uuid4())
-        result = CloudReceiver.receive_batch('shiftpaymenttotal', 'branch1', [{
+        result = CloudReceiver.receive_batch('shiftpaymenttotal', s.branch_id, [{
             'uuid': incoming, 'sync_version': 5, 'is_deleted': False,
             'shift_uuid': str(s.uuid), 'method': 'CASH',
             'expected_amount': '250', 'counted_amount': '250',

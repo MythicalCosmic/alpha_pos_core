@@ -274,7 +274,7 @@ class SyncService:
                     error = result.get('error', 'Unknown')
                     cls._notify_error(f'Pull failed: {error}')
                     SyncStatus.set_last_pull(
-                        total_created, total_updated, [str(e) for e in errors[:1]]
+                        total_created, total_updated, [str(error)]
                     )
                     return {'success': False, 'message': error,
                             'created': total_created, 'updated': total_updated}
@@ -317,6 +317,7 @@ class SyncService:
                         'Pull: has_more set but cursor cannot advance '
                         '(next_since=%r); stopping to avoid data loss', next_since
                     )
+                    errors.append('Cloud change feed cursor did not advance')
                     break
 
                 # Advance in memory only. A child from an earlier page may be
@@ -326,6 +327,7 @@ class SyncService:
                 cursor = next_since
             else:
                 logger.warning('Pull: hit MAX_PAGES (%s); will resume next cycle', MAX_PAGES)
+                errors.append(f'Pull exceeded safety limit of {MAX_PAGES} pages')
 
             # Retry FK-deferred records now that the whole change set is applied
             # (a full-drain pull fetches parents across pages in dependency
@@ -350,6 +352,14 @@ class SyncService:
                 deferred_by_model = next_deferred
                 if not progressed:
                     break
+            if not deferred_by_model:
+                # Any per-record exception from an earlier pass was transient
+                # and has now been applied successfully. Do not leave desktop
+                # health red after recovery.
+                errors = [
+                    error for error in errors
+                    if not isinstance(error, dict)
+                ]
             if deferred_by_model:
                 stuck = sum(len(v) for v in deferred_by_model.values())
                 logger.warning(
@@ -375,7 +385,7 @@ class SyncService:
                 cls._notify_error(f'Pull errors: {errors[0]}')
 
             return {
-                'success': True,
+                'success': not errors and not deferred_by_model,
                 'created': total_created,
                 'updated': total_updated,
                 'errors': [str(e) for e in errors],
@@ -519,10 +529,28 @@ class SyncService:
         # required FK parent isn't present (or a transient error hit). The pull
         # loop retries them once the rest of the change set has landed, so a
         # child pulled before its parent isn't lost when the cursor advances.
+        from django.conf import settings
         from django.db import transaction
         results = {'created': 0, 'updated': 0, 'skipped': 0, 'errors': [], 'deferred': []}
         for record in records:
             try:
+                if (
+                    getattr(settings, 'DEPLOYMENT_MODE', 'local') == 'local'
+                    and getattr(model_class, 'SYNC_PULL_SCOPE', 'branch') == 'branch'
+                ):
+                    own_branch = str(getattr(settings, 'BRANCH_ID', '') or '')
+                    record_branch = str(
+                        record.get('branch_id') or source_branch or ''
+                    )
+                    if not own_branch or record_branch != own_branch:
+                        logger.warning(
+                            'Pull: refused %s uuid=%s targeted to branch=%s '
+                            'on local branch=%s',
+                            model_class.__name__, record.get('uuid'),
+                            record_branch, own_branch,
+                        )
+                        results['skipped'] += 1
+                        continue
                 # Each record applies in its own transaction so the get()->
                 # compare->save inside from_sync_dict (which now takes a
                 # select_for_update row lock) is atomic against a concurrent

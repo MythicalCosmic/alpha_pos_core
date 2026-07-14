@@ -7,18 +7,22 @@ from base.services.sync.config import FK_UUID_MAPPINGS
 logger = logging.getLogger(__name__)
 
 
-def _resolve_foreign_keys(model_class, data):
+def _resolve_foreign_keys(model_class, data, incoming_branch):
     """Resolve UUID-keyed FK references to local PKs.
 
-    Returns (resolved, missing) where:
+    Returns (resolved, missing, forbidden) where:
       resolved: {fk_field: instance} for FKs successfully looked up
       missing:  [(uuid_field, uuid_value)] for FKs that referenced an unknown
                 UUID. Any supplied-but-unknown parent is deferred; silently
                 replacing a nullable relation with NULL would lose the link
                 permanently when the parent arrives later.
+      forbidden: references to a known parent owned by another branch. These
+                 are permanent scope violations and must be acknowledged as
+                 skipped rather than retried into the dead-letter queue.
     """
     resolved = {}
     missing = []
+    forbidden = []
     for uuid_field, (app_label, model_name, fk_field) in FK_UUID_MAPPINGS.items():
         # Absence means "leave the relationship untouched" on a partial
         # payload.  An explicit null is different: it means "clear this
@@ -47,14 +51,34 @@ def _resolve_foreign_keys(model_class, data):
             related_model = apps.get_model(app_label, model_name)
             instance = related_model.objects.filter(uuid=uuid_value).first()
             if instance:
-                resolved[fk_field] = instance
+                parent_scope = getattr(
+                    related_model, 'SYNC_PULL_SCOPE', 'branch',
+                )
+                parent_branch = str(getattr(instance, 'branch_id', '') or '')
+                if (
+                    parent_scope == 'branch'
+                    and parent_branch != str(incoming_branch or '')
+                ):
+                    # Never let a child authenticated as branch A attach to a
+                    # branch-B parent merely because it knows that row's UUID.
+                    # Blank legacy ownership also requires deterministic repair,
+                    # not first-writer-wins adoption during a request.
+                    logger.warning(
+                        'FK owner mismatch: %s uuid=%s owner=%s incoming=%s',
+                        model_name, uuid_value, parent_branch, incoming_branch,
+                    )
+                    forbidden.append((
+                        uuid_field, uuid_value, parent_branch,
+                    ))
+                else:
+                    resolved[fk_field] = instance
             else:
                 logger.warning(f'FK not found: {model_name} uuid={uuid_value}')
                 missing.append((uuid_field, uuid_value))
         except Exception as e:
             logger.error(f'FK resolve error {uuid_field}: {e}')
             missing.append((uuid_field, uuid_value))
-    return resolved, missing
+    return resolved, missing, forbidden
 
 
 def _parse_temporal(field_type, value):
@@ -146,33 +170,31 @@ def _strip_denied(model_class, cleaned, *, creating):
     return strip(cleaned, creating=creating)
 
 
-def _preserve_updated_at(model_class, instance, incoming_updated):
-    # .update() bypasses auto_now so the source-of-truth updated_at survives
-    # the receive write and the _should_replace tiebreaker stays meaningful.
-    if incoming_updated is None or not hasattr(instance, 'updated_at'):
-        return
-    model_class.objects.filter(pk=instance.pk).update(updated_at=incoming_updated)
-    instance.updated_at = incoming_updated
+def _pop_automatic_values(model_class, cleaned):
+    """Capture every source timestamp save() would replace with local time."""
+    values = {}
+    for field in model_class._meta.concrete_fields:
+        if not (getattr(field, 'auto_now', False)
+                or getattr(field, 'auto_now_add', False)):
+            continue
+        if field.name not in cleaned:
+            continue
+        value = cleaned.pop(field.name)
+        if value is not None:
+            values[field.name] = value
+    return values
 
 
-def _preserve_created_at(model_class, instance, raw_created):
-    # created_at is auto_now_add on every SyncMixin model, so save() stamps the
-    # RECEIVER's clock on INSERT. When an offline till syncs a backlog (e.g. a whole
-    # day worked while the cloud was down), every row would otherwise land with
-    # TODAY's created_at — dumping yesterday's sales into today and corrupting all
-    # time-series analytics (revenue-by-day, "today", business-day windows).
-    # .update() bypasses auto_now_add so the origin created_at from the pushing
-    # branch survives. No-op on UPDATE (auto_now_add only fires on INSERT), but
-    # harmless there and it also corrects a row whose created_at was mis-stamped
-    # by an earlier (buggy) receive.
-    from django.utils.dateparse import parse_datetime
-    if not raw_created or not hasattr(instance, 'created_at'):
+def _preserve_automatic_values(model_class, instance, values, *, creating):
+    # QuerySet.update() bypasses auto_now/auto_now_add. This preserves both the
+    # conventional fields and named event clocks such as Inkassa.period_end and
+    # DiscountUsage.used_at.
+    allowed = _strip_denied(model_class, values, creating=creating)
+    if not allowed:
         return
-    val = parse_datetime(raw_created) if isinstance(raw_created, str) else raw_created
-    if val is None:
-        return
-    model_class.objects.filter(pk=instance.pk).update(created_at=val)
-    instance.created_at = val
+    model_class.objects.filter(pk=instance.pk).update(**allowed)
+    for field_name, value in allowed.items():
+        setattr(instance, field_name, value)
 
 
 class CloudReceiver:
@@ -344,11 +366,40 @@ class CloudReceiver:
             )
         incoming_branch = branch_id
 
+        # Branch-scoped UUIDs are owned by exactly one authenticated branch.
+        # Check before resolving FKs so a forged cross-branch update is
+        # acknowledged as refused instead of becoming a poison retry. Repeat
+        # under the row lock below to close a concurrent-create race.
+        if getattr(model_class, 'SYNC_PULL_SCOPE', 'branch') == 'branch':
+            existing = model_class._base_manager.filter(uuid=uuid_val).first()
+            if (
+                existing is not None
+                and str(existing.branch_id or '') != str(incoming_branch or '')
+            ):
+                logger.warning(
+                    'sync receive: refused branch=%s write to %s uuid=%s '
+                    'owned by branch=%s',
+                    incoming_branch, model_class.__name__, uuid_val,
+                    existing.branch_id,
+                )
+                return existing, 'skipped'
+
         # Append-only evidence may be created once, never deleted by a peer.
         if is_deleted and getattr(model_class, '_sync_append_only', False):
             return None, 'skipped'
 
-        resolved_fks, missing_fks = _resolve_foreign_keys(model_class, data)
+        resolved_fks, missing_fks, forbidden_fks = _resolve_foreign_keys(
+            model_class, data, incoming_branch,
+        )
+
+        if forbidden_fks:
+            logger.warning(
+                'sync receive: refused %s uuid=%s branch=%s cross-branch '
+                'parent reference(s): %s',
+                model_class.__name__, uuid_val, incoming_branch,
+                forbidden_fks,
+            )
+            return None, 'skipped'
 
         # Any non-empty parent UUID that has not arrived yet must defer, even
         # when the FK column is nullable. Persisting NULL would advance the
@@ -402,6 +453,18 @@ class CloudReceiver:
             try:
                 instance = model_class.objects.select_for_update().get(uuid=uuid_val)
 
+                if (
+                    getattr(model_class, 'SYNC_PULL_SCOPE', 'branch') == 'branch'
+                    and str(instance.branch_id or '') != str(incoming_branch or '')
+                ):
+                    logger.warning(
+                        'sync receive: refused raced branch=%s write to %s '
+                        'uuid=%s owned by branch=%s',
+                        incoming_branch, model_class.__name__, uuid_val,
+                        instance.branch_id,
+                    )
+                    return instance, 'skipped'
+
                 if getattr(model_class, '_sync_append_only', False):
                     # UUID is the immutable event identity. A replay is an
                     # idempotent no-op; a higher version cannot rewrite history.
@@ -425,12 +488,9 @@ class CloudReceiver:
                 if instance.is_deleted and not is_deleted:
                     return instance, 'skipped'
 
-                # Preserve source-of-truth updated_at across save(): every SyncMixin
-                # model declares updated_at with auto_now=True, so save() would stamp
-                # the receiver's local clock and defeat the _should_replace tiebreaker
-                # on every subsequent compare. Pop it and re-apply via .update(),
-                # which bypasses auto_now (same approach as SyncMixin.from_sync_dict).
-                incoming_updated = cleaned.pop('updated_at', None)
+                # Capture every automatic source timestamp before save() stamps
+                # the receiver clock; restore them with QuerySet.update below.
+                automatic_values = _pop_automatic_values(model_class, cleaned)
 
                 for key, value in _strip_denied(model_class, cleaned, creating=False).items():
                     setattr(instance, key, value)
@@ -457,13 +517,14 @@ class CloudReceiver:
                 if not instance.branch_id:
                     instance.branch_id = incoming_branch
                 instance.save(_syncing=True)
-                _preserve_updated_at(model_class, instance, incoming_updated)
-                _preserve_created_at(model_class, instance, cleaned.get('created_at'))
+                _preserve_automatic_values(
+                    model_class, instance, automatic_values, creating=False,
+                )
                 instance._publish_synced_at_after_commit(using=instance._state.db)
                 return instance, 'updated'
 
             except model_class.DoesNotExist:
-                incoming_updated = cleaned.pop('updated_at', None)
+                automatic_values = _pop_automatic_values(model_class, cleaned)
 
                 # Reconcile onto an existing row that already owns this model's
                 # natural key (e.g. User.email) instead of INSERTing a duplicate
@@ -502,8 +563,9 @@ class CloudReceiver:
                     if not instance.branch_id:
                         instance.branch_id = incoming_branch
                     instance.save(_syncing=True)
-                    _preserve_updated_at(model_class, instance, incoming_updated)
-                    _preserve_created_at(model_class, instance, cleaned.get('created_at'))
+                    _preserve_automatic_values(
+                        model_class, instance, automatic_values, creating=False,
+                    )
                     instance._publish_synced_at_after_commit(using=instance._state.db)
                     return instance, 'updated'
 
@@ -525,7 +587,8 @@ class CloudReceiver:
                         setattr(instance, fk_field, fk_instance)
 
                 instance.save(_syncing=True)
-                _preserve_updated_at(model_class, instance, incoming_updated)
-                _preserve_created_at(model_class, instance, cleaned.get('created_at'))
+                _preserve_automatic_values(
+                    model_class, instance, automatic_values, creating=True,
+                )
                 instance._publish_synced_at_after_commit(using=instance._state.db)
                 return instance, 'created'

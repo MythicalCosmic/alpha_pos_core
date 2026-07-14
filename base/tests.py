@@ -13,9 +13,9 @@ pytestmark = pytest.mark.django_db
 
 class TestSyncConflictTiebreaker:
     """Higher sync_version always wins. On an equal-version conflict the policy
-    is BRANCH-dominant: a branch (mode='local') keeps its own row, while the
-    cloud (mode='cloud') accepts the incoming branch push. This is deterministic
-    and doesn't depend on cross-machine clock skew."""
+    is ownership-aware: a branch keeps its own branch-scoped row, while global
+    catalog/identity configuration remains cloud-dominant. This is deterministic
+    and does not depend on cross-machine clock skew."""
 
     def test_higher_version_wins(self):
         from base.models import User
@@ -62,19 +62,17 @@ class TestSyncConflictTiebreaker:
         """On a branch, an equal-version conflict on the branch's OWN record
         (branch_id == ours) keeps local — the till's transactional data is never
         clobbered by a stale cloud echo. This is the 'local dominant' intent."""
-        from base.models import User
+        from base.models import Customer
 
-        local = User.objects.create(
-            first_name='Local', last_name='Name', email='u@test.local',
-            password='hashed', role='USER', sync_version=3, branch_id='branch1',
+        local = Customer.objects.create(
+            name='Local', sync_version=3, branch_id='branch1',
         )
-        User.from_sync_dict({
+        Customer.from_sync_dict({
             'uuid': str(local.uuid), 'sync_version': 3, 'is_deleted': False,
-            'first_name': 'Echo', 'last_name': 'Name', 'email': 'u@test.local',
-            'password': 'hashed', 'role': 'USER', 'branch_id': 'branch1',
-        })
+            'name': 'Echo', 'branch_id': 'branch1',
+        }, branch_id='branch1')
         local.refresh_from_db()
-        assert local.first_name == 'Local'
+        assert local.name == 'Local'
 
     @override_settings(BRANCH_ID='branch1')
     def test_tie_branch_accepts_cloud_owned_record(self):
@@ -381,7 +379,7 @@ class TestReceiveOwnershipPreserved:
         assert u.first_name == 'Cloud'        # centrally owned identity unchanged
         assert u.branch_id == 'cloud'         # owner preserved (NOT branch1)
 
-    def test_untagged_branch_row_gets_tagged_on_update(self, settings):
+    def test_untagged_branch_row_is_not_claimed_at_request_time(self, settings):
         settings.DEPLOYMENT_MODE = 'cloud'
         from base.models import Customer
         from base.services.sync.receiver import CloudReceiver
@@ -389,12 +387,14 @@ class TestReceiveOwnershipPreserved:
         # save() auto-tags an empty branch_id with settings.BRANCH_ID, so force
         # it empty at the DB level to exercise "untagged -> tag with pusher".
         Customer.objects.filter(pk=u.pk).update(branch_id='')
-        CloudReceiver.receive_batch('base.Customer', branch_id='branch1', records=[{
+        result = CloudReceiver.receive_batch('base.Customer', branch_id='branch1', records=[{
             'uuid': str(u.uuid), 'sync_version': 2, 'is_deleted': False,
             'name': 'Still No Owner',
         }])
         u.refresh_from_db()
-        assert u.branch_id == 'branch1'        # empty -> tagged with pusher
+        assert result['skipped'] == 1
+        assert u.branch_id == ''
+        assert u.name == 'No Owner'
 
 
 class TestReceiveResolvesNonBaseModels:

@@ -80,8 +80,10 @@ def test_push_rejects_explicit_null_for_required_fk():
     from base.models import Place, Table
     from base.services.sync.receiver import CloudReceiver
 
-    place = Place.objects.create(name='Hall')
-    table = Table.objects.create(place=place, number='1', sync_version=1)
+    place = Place.objects.create(name='Hall', branch_id='branch1')
+    table = Table.objects.create(
+        place=place, number='1', sync_version=1, branch_id='branch1',
+    )
     payload = table.to_sync_dict()
     payload['sync_version'] = 2
     payload['place_uuid'] = None

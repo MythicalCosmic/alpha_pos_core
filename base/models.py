@@ -1,6 +1,7 @@
 import uuid
 from decimal import Decimal
 from django.db import models, transaction
+from django.db.models.functions import Now
 from django.db.models.fields.files import FieldFile
 from django.conf import settings
 
@@ -421,9 +422,52 @@ class SyncMixin(models.Model):
         return cleaned
 
     @classmethod
+    def _pop_sync_automatic_values(cls, data):
+        """Remove and parse source values Django would otherwise overwrite.
+
+        ``auto_now``/``auto_now_add`` are not limited to the conventional
+        created_at/updated_at names. Financial event models also use fields
+        such as Inkassa.period_end and DiscountUsage.used_at. Preserving only
+        two hard-coded names moves offline events into the receive window and
+        corrupts time-series analytics.
+        """
+        import logging
+
+        values = {}
+        for field in cls._meta.concrete_fields:
+            if not (getattr(field, 'auto_now', False)
+                    or getattr(field, 'auto_now_add', False)):
+                continue
+            if field.name not in data:
+                continue
+            raw_value = data.pop(field.name)
+            if raw_value in (None, ''):
+                continue
+            try:
+                value = field.to_python(raw_value)
+            except Exception as exc:  # noqa: BLE001
+                logging.getLogger(__name__).warning(
+                    'sync ingest: invalid automatic timestamp %s=%r on %s: %s',
+                    field.name, raw_value, cls.__name__, exc,
+                )
+                continue
+            if value is not None:
+                values[field.name] = value
+        return values
+
+    @classmethod
+    def _restore_sync_automatic_values(cls, instance, values, *, creating):
+        """Restore source event times after save() has applied local clocks."""
+        allowed = cls._strip_sync_denied(values, creating=creating)
+        if not allowed:
+            return
+        cls.objects.filter(pk=instance.pk).update(**allowed)
+        for field_name, value in allowed.items():
+            setattr(instance, field_name, value)
+
+    @classmethod
     def from_sync_dict(cls, data, branch_id=None):
         from django.utils import timezone
-        from django.utils.dateparse import parse_datetime
         from django.apps import apps
         from base.services.sync.config import FK_UUID_MAPPINGS
 
@@ -495,6 +539,25 @@ class SyncMixin(models.Model):
             except Exception:
                 related = None
             if related is not None:
+                parent_scope = getattr(
+                    type(related), 'SYNC_PULL_SCOPE', 'branch',
+                )
+                parent_branch = str(getattr(related, 'branch_id', '') or '')
+                if (
+                    parent_scope == 'branch'
+                    and parent_branch != str(incoming_branch or '')
+                ):
+                    # A known parent owned by another branch is a permanent
+                    # feed-scope violation, not an ordering problem. ACK it as
+                    # skipped so it cannot poison every later pull.
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        'sync ingest: refused cross-branch FK %s=%s owner=%s '
+                        'incoming=%s on %s uuid=%s',
+                        fk_field, uuid_value, parent_branch, incoming_branch,
+                        cls.__name__, uuid_val,
+                    )
+                    return None, 'skipped'
                 resolved_fks[fk_field] = related
             else:
                 if is_deleted:
@@ -513,20 +576,11 @@ class SyncMixin(models.Model):
                 )
                 return None, 'deferred'
 
-        # Source-of-truth `updated_at`. We need to preserve this across the
-        # save(), because every SyncMixin model declares updated_at with
-        # auto_now=True — Django would otherwise overwrite the incoming
-        # timestamp with the receiver's local clock at save-time, silently
-        # breaking the equal-version tiebreaker on the next round.
-        incoming_updated = data.pop('updated_at', None)
-        if isinstance(incoming_updated, str):
-            incoming_updated = parse_datetime(incoming_updated)
-        # created_at is auto_now_add — save() would stamp the receiver's clock on
-        # INSERT (an offline backlog would then all read "created today"). Preserve
-        # the origin value; restored via .update() on the create branch below.
-        incoming_created = data.pop('created_at', None)
-        if isinstance(incoming_created, str):
-            incoming_created = parse_datetime(incoming_created)
+        # Capture every source automatic timestamp before save() replaces it
+        # with the receiver's clock. updated_at remains available to conflict
+        # resolution below; the full set is restored after the write.
+        automatic_values = cls._pop_sync_automatic_values(data)
+        incoming_updated = automatic_values.get('updated_at')
 
         try:
             # Row-lock the existing row for the get()->compare->save sequence so
@@ -540,6 +594,21 @@ class SyncMixin(models.Model):
             if transaction.get_connection().in_atomic_block:
                 base_qs = cls.objects.select_for_update()
             instance = base_qs.get(uuid=uuid_val)
+            if (
+                getattr(cls, 'SYNC_PULL_SCOPE', 'branch') == 'branch'
+                and incoming_branch
+                and str(instance.branch_id or '') != str(incoming_branch)
+            ):
+                # A scoped feed must never revise a UUID already owned by a
+                # different branch.  The service-level target guard protects
+                # normal pulls; this model-level check also covers direct
+                # callers and corrupted/legacy feeds without mutating evidence.
+                import logging
+                logging.getLogger(__name__).warning(
+                    'sync ingest: refused %s uuid=%s owner=%s incoming=%s',
+                    cls.__name__, uuid_val, instance.branch_id, incoming_branch,
+                )
+                return instance, 'skipped'
             # Refuse to resurrect a hard-deleted row's slot via an older
             # incoming payload. (Soft-deletes are handled by is_deleted
             # propagation; this branch only fires for live rows.)
@@ -562,11 +631,9 @@ class SyncMixin(models.Model):
             instance.is_deleted = is_deleted
             instance.synced_at = timezone.now()
             instance.save(_syncing=True)
-            if incoming_updated and hasattr(instance, 'updated_at'):
-                # .update() bypasses auto_now so the source-of-truth
-                # timestamp survives. Reload onto the instance for callers.
-                cls.objects.filter(pk=instance.pk).update(updated_at=incoming_updated)
-                instance.updated_at = incoming_updated
+            cls._restore_sync_automatic_values(
+                instance, automatic_values, creating=False,
+            )
             return instance, 'updated'
         except cls.DoesNotExist:
             # uuid not present locally. Before INSERTing, check whether a
@@ -593,9 +660,9 @@ class SyncMixin(models.Model):
                 instance.synced_at = timezone.now()
                 instance.branch_id = incoming_branch or instance.branch_id or ''
                 instance.save(_syncing=True)
-                if incoming_updated and hasattr(instance, 'updated_at'):
-                    cls.objects.filter(pk=instance.pk).update(updated_at=incoming_updated)
-                    instance.updated_at = incoming_updated
+                cls._restore_sync_automatic_values(
+                    instance, automatic_values, creating=False,
+                )
                 return instance, 'updated'
 
             instance = cls(
@@ -611,12 +678,9 @@ class SyncMixin(models.Model):
             for fk_field, related in resolved_fks.items():
                 setattr(instance, fk_field, related)
             instance.save(_syncing=True)
-            if incoming_updated and hasattr(instance, 'updated_at'):
-                cls.objects.filter(pk=instance.pk).update(updated_at=incoming_updated)
-                instance.updated_at = incoming_updated
-            if incoming_created and hasattr(instance, 'created_at'):
-                cls.objects.filter(pk=instance.pk).update(created_at=incoming_created)
-                instance.created_at = incoming_created
+            cls._restore_sync_automatic_values(
+                instance, automatic_values, creating=True,
+            )
             return instance, 'created'
 
     @classmethod
@@ -639,6 +703,12 @@ class SyncMixin(models.Model):
             # The hub accepts the branch push (branches own their transactional
             # data). Cloud-owned fields are still protected by the direction-aware
             # SYNC_DENY_FROM_BRANCH denylist, so this can't rewrite credentials.
+            return True
+        if getattr(cls, 'SYNC_PULL_SCOPE', 'branch') == 'global':
+            # Global catalog/configuration is cloud-owned. A local edit may
+            # independently reach the same version, but it is never allowed to
+            # win the tie and make an authoritative cloud menu/price/user update
+            # disappear. Branch pushes for these models are refused by the hub.
             return True
         # On a branch: keep our row ONLY when it's THIS branch's OWN record
         # (orders, drawer, the till's transactions) — that's the "local
@@ -828,31 +898,13 @@ class Category(SyncMixin, models.Model):
 
     @classmethod
     def from_sync_dict(cls, data, branch_id=None):
-        # The base implementation only setattrs keys the model has, so
-        # parent_category_uuid (a synthetic FK pointer) is silently dropped on
-        # the pull path — flattening the category tree on pulled branches.
-        # Resolve it explicitly here, then defer to the base for everything
-        # else (updated_at preservation, version tiebreaker, branch checks).
-        from django.utils import timezone
-
+        # A malformed self-reference cannot ever resolve into a valid tree.
+        # All ordinary parent resolution (including defer-until-parent-arrives)
+        # belongs to the generic sync contract.
         data = data.copy()
-        parent_uuid = data.pop('parent_category_uuid', None)
-        instance, action = super().from_sync_dict(data, branch_id=branch_id)
-        # Only touch the parent link when the row was actually written —
-        # a 'skipped' result means the incoming version lost the tiebreaker,
-        # so its parent must not overwrite the newer local value.
-        if instance is None or action not in ('created', 'updated'):
-            return instance, action
-
-        parent = None
-        if parent_uuid and parent_uuid != str(instance.uuid):  # never self-parent
-            parent = cls.objects.filter(uuid=parent_uuid).first()
-        if instance.parent_id != (parent.id if parent else None):
-            instance.parent = parent
-            cls.objects.filter(pk=instance.pk).update(
-                parent=parent, synced_at=timezone.now(),
-            )
-        return instance, action
+        if str(data.get('parent_category_uuid') or '') == str(data.get('uuid') or ''):
+            data['parent_category_uuid'] = None
+        return super().from_sync_dict(data, branch_id=branch_id)
 
     def __str__(self):
         return self.name
@@ -894,70 +946,6 @@ class Product(SyncMixin, models.Model):
         data = super().to_sync_dict()
         data['category_uuid'] = str(self.category.uuid) if self.category else None
         return data
-
-    @classmethod
-    def from_sync_dict(cls, data, branch_id=None):
-        from django.utils import timezone
-        from django.utils.dateparse import parse_datetime
-
-        data = data.copy()
-        category_uuid = data.pop('category_uuid', None)
-        uuid_val = data.pop('uuid')
-        sync_version = data.pop('sync_version', 1)
-        is_deleted = data.pop('is_deleted', False)
-        incoming_branch = data.pop('branch_id', branch_id)
-
-        # Preserve the source-of-truth updated_at across save(). updated_at is
-        # auto_now=True, so a plain setattr+save would overwrite it with the
-        # receiver's local clock and silently break the equal-version
-        # tiebreaker in _should_replace on the next sync round.
-        incoming_updated = data.pop('updated_at', None)
-        if isinstance(incoming_updated, str):
-            incoming_updated = parse_datetime(incoming_updated)
-
-        category = None
-        if category_uuid:
-            try:
-                category = Category.objects.get(uuid=category_uuid)
-            except Category.DoesNotExist:
-                pass
-
-        try:
-            instance = cls.objects.get(uuid=uuid_val)
-            if cls._should_replace(
-                instance, sync_version,
-                {**data, 'updated_at': incoming_updated}, incoming_branch,
-            ):
-                for key, value in cls._strip_sync_denied(data, creating=False).items():
-                    if hasattr(instance, key):
-                        setattr(instance, key, value)
-                if category:
-                    instance.category = category
-                instance.sync_version = sync_version
-                instance.is_deleted = is_deleted
-                instance.synced_at = timezone.now()
-                instance.save(_syncing=True)
-                if incoming_updated:
-                    cls.objects.filter(pk=instance.pk).update(updated_at=incoming_updated)
-                    instance.updated_at = incoming_updated
-            return instance, 'updated'
-        except cls.DoesNotExist:
-            instance = cls(
-                uuid=uuid_val,
-                sync_version=sync_version,
-                is_deleted=is_deleted,
-                branch_id=incoming_branch or '',
-                synced_at=timezone.now(),
-                category=category,
-            )
-            for key, value in cls._strip_sync_denied(data, creating=True).items():
-                if hasattr(instance, key):
-                    setattr(instance, key, value)
-            instance.save(_syncing=True)
-            if incoming_updated:
-                cls.objects.filter(pk=instance.pk).update(updated_at=incoming_updated)
-                instance.updated_at = incoming_updated
-            return instance, 'created'
 
     def __str__(self):
         return self.name
@@ -1313,6 +1301,13 @@ class Order(SyncMixin, models.Model):
     # Revenue, tender, product-sales, shift, and anomaly reporting uses the
     # settlement event. This index keeps those range queries off a growing heap.
     paid_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    # Database-local commit cursor for Inkassa batches. ``paid_at`` is the
+    # economic event time and may arrive from an offline branch long after that
+    # business-time window was collected. This cursor is stamped under the
+    # branch CashRegister lock and never synchronized.
+    accounting_recorded_at = models.DateTimeField(
+        null=True, blank=True, editable=False,
+    )
     # Waiter "send to cashier" signal: stamped when a waiter asks the cashier to
     # collect payment for their (unpaid) order. Advisory only — the cashier
     # screen highlights orders with this set and is_paid=False; it is implicitly
@@ -1330,7 +1325,9 @@ class Order(SyncMixin, models.Model):
     SYNC_WRITE_DENYLIST = frozenset({
         'is_paid', 'payment_method', 'total_amount', 'subtotal',
         'discount_amount', 'discount_percent', 'paid_at',
+        'accounting_recorded_at',
     })
+    SYNC_DENY_FROM_BRANCH = frozenset({'accounting_recorded_at'})
 
     def to_sync_dict(self):
         data = super().to_sync_dict()
@@ -1345,6 +1342,7 @@ class Order(SyncMixin, models.Model):
         data.pop('chef_queue_number', None)
         # Local waiter→cashier UI signal (see field comment) — never synced.
         data.pop('payment_requested_at', None)
+        data.pop('accounting_recorded_at', None)
         data['user_uuid'] = str(self.user.uuid) if self.user else None
         data['cashier_uuid'] = str(self.cashier.uuid) if self.cashier else None
         data['delivery_person_uuid'] = str(self.delivery_person.uuid) if self.delivery_person else None
@@ -1355,161 +1353,46 @@ class Order(SyncMixin, models.Model):
 
     @classmethod
     def from_sync_dict(cls, data, branch_id=None):
-        from django.utils import timezone
-        from django.utils.dateparse import parse_datetime
-
         data = data.copy()
-        user_uuid = data.pop('user_uuid', None)
-        cashier_uuid = data.pop('cashier_uuid', None)
-        delivery_person_uuid = data.pop('delivery_person_uuid', None)
-        place_uuid = data.pop('place_uuid', None)
-        table_uuid = data.pop('table_uuid', None)
-        customer_uuid = data.pop('customer_uuid', None)
-        uuid_val = data.pop('uuid')
-        sync_version = data.pop('sync_version', 1)
-        is_deleted = data.pop('is_deleted', False)
-        incoming_branch = data.pop('branch_id', branch_id)
+        data.pop('accounting_recorded_at', None)
+        return super().from_sync_dict(data, branch_id=branch_id)
 
-        # Preserve the source-of-truth updated_at across save() (auto_now would
-        # overwrite it with the local clock and break the equal-version
-        # tiebreaker — see the base from_sync_dict for the full rationale).
-        incoming_updated = data.pop('updated_at', None)
-        if isinstance(incoming_updated, str):
-            incoming_updated = parse_datetime(incoming_updated)
-        # created_at is auto_now_add: preserve the origin time so an offline
-        # backlog sync doesn't stamp every order with the receive date.
-        incoming_created = data.pop('created_at', None)
-        if isinstance(incoming_created, str):
-            incoming_created = parse_datetime(incoming_created)
+    class Meta:
+        indexes = [
+            models.Index(
+                fields=['branch_id', 'accounting_recorded_at'],
+                name='order_branch_acct_idx',
+            ),
+        ]
 
-        user = None
-        cashier = None
-        delivery_person = None
-        place = None
-        table = None
+    def save(self, *args, **kwargs):
+        """Stamp the first paid accounting cursor under the branch owner lock."""
+        if not (
+            self.is_paid
+            and self.paid_at is not None
+            and self.accounting_recorded_at is None
+        ):
+            return super().save(*args, **kwargs)
 
-        if user_uuid:
-            try:
-                user = User.objects.get(uuid=user_uuid)
-            except User.DoesNotExist:
-                user = None
+        using = kwargs.get('using') or self._state.db or 'default'
+        with transaction.atomic(using=using):
+            from django.utils import timezone
+            from base.services.accounting_cursor import lock_branch_accounting
 
-        # A uuid that's present but not yet synced locally must NOT overwrite an
-        # existing attribution link to NULL on update — that silently
-        # de-attributes the order and corrupts cashier/shift stats. Track
-        # resolvability so the update branch can skip the overwrite.
-        cashier_unresolved = False
-        if cashier_uuid:
-            try:
-                cashier = User.objects.get(uuid=cashier_uuid)
-            except User.DoesNotExist:
-                cashier_unresolved = True
-
-        delivery_unresolved = False
-        if delivery_person_uuid:
-            try:
-                delivery_person = DeliveryPerson.objects.get(uuid=delivery_person_uuid)
-            except DeliveryPerson.DoesNotExist:
-                delivery_unresolved = True
-
-        place_unresolved = False
-        if place_uuid:
-            try:
-                place = Place.objects.get(uuid=place_uuid)
-            except Place.DoesNotExist:
-                place_unresolved = True
-
-        table_unresolved = False
-        if table_uuid:
-            try:
-                table = Table.objects.get(uuid=table_uuid)
-            except Table.DoesNotExist:
-                table_unresolved = True
-
-        # Optional client link — same soft-FK rule as cashier/delivery_person: a
-        # uuid not yet synced locally must not wipe an existing link on update.
-        customer = None
-        customer_unresolved = False
-        if customer_uuid:
-            try:
-                customer = Customer.objects.get(uuid=customer_uuid)
-            except Customer.DoesNotExist:
-                customer_unresolved = True
-
-        if not user:
-            # Required FK (Order.user) not present yet — defer for retry after
-            # the rest of the pull lands the user, instead of erroring it away.
-            return None, 'deferred'
-
-        try:
-            from django.db import transaction
-            base_qs = cls.objects
-            if transaction.get_connection().in_atomic_block:
-                base_qs = cls.objects.select_for_update()
-            instance = base_qs.get(uuid=uuid_val)
-            if not cls._should_replace(
-                instance, sync_version,
-                {**data, 'updated_at': incoming_updated}, incoming_branch,
-            ):
-                # Stale/older payload — report the skip honestly so pull stats
-                # don't over-count it as an applied update.
-                return instance, 'skipped'
-            # A locally-tombstoned order is terminal — never resurrect it from a
-            # stale pre-delete payload.
-            if instance.is_deleted and not is_deleted:
-                return instance, 'skipped'
-            for key, value in cls._strip_sync_denied(data, creating=False).items():
-                if hasattr(instance, key):
-                    setattr(instance, key, value)
-            instance.user = user
-            # Don't wipe an existing attribution link when the incoming uuid
-            # simply hasn't synced locally yet (see resolution above).
-            if not cashier_unresolved:
-                instance.cashier = cashier
-            if not delivery_unresolved:
-                instance.delivery_person = delivery_person
-            if not place_unresolved:
-                instance.place = place
-            if not table_unresolved:
-                instance.table = table
-            if not customer_unresolved:
-                instance.customer = customer
-            instance.sync_version = sync_version
-            instance.is_deleted = is_deleted
-            instance.synced_at = timezone.now()
-            instance.save(_syncing=True)
-            if incoming_updated:
-                cls.objects.filter(pk=instance.pk).update(updated_at=incoming_updated)
-                instance.updated_at = incoming_updated
-            if incoming_created:
-                cls.objects.filter(pk=instance.pk).update(created_at=incoming_created)
-                instance.created_at = incoming_created
-            return instance, 'updated'
-        except cls.DoesNotExist:
-            instance = cls(
-                uuid=uuid_val,
-                sync_version=sync_version,
-                is_deleted=is_deleted,
-                branch_id=incoming_branch or '',
-                synced_at=timezone.now(),
-                user=user,
-                cashier=cashier,
-                delivery_person=delivery_person,
-                place=place,
-                table=table,
-                customer=customer,
-            )
-            for key, value in cls._strip_sync_denied(data, creating=True).items():
-                if hasattr(instance, key):
-                    setattr(instance, key, value)
-            instance.save(_syncing=True)
-            if incoming_updated:
-                cls.objects.filter(pk=instance.pk).update(updated_at=incoming_updated)
-                instance.updated_at = incoming_updated
-            if incoming_created:
-                cls.objects.filter(pk=instance.pk).update(created_at=incoming_created)
-                instance.created_at = incoming_created
-            return instance, 'created'
+            register = lock_branch_accounting(self.branch_id or None)
+            branch_added = False
+            if not self.branch_id:
+                self.branch_id = register.branch_id
+                branch_added = True
+            self.accounting_recorded_at = timezone.now()
+            update_fields = kwargs.get('update_fields')
+            if update_fields is not None:
+                fields = set(update_fields)
+                fields.add('accounting_recorded_at')
+                if branch_added:
+                    fields.add('branch_id')
+                kwargs['update_fields'] = list(fields)
+            return super().save(*args, **kwargs)
 
     def __str__(self):
         return f"Order #{self.display_id} - {self.order_type} - {self.status}"
@@ -1539,68 +1422,6 @@ class OrderItem(SyncMixin, models.Model):
         data['order_uuid'] = str(self.order.uuid) if self.order else None
         data['product_uuid'] = str(self.product.uuid) if self.product else None
         return data
-
-    @classmethod
-    def from_sync_dict(cls, data, branch_id=None):
-        from django.utils import timezone
-
-        data = data.copy()
-        order_uuid = data.pop('order_uuid', None)
-        product_uuid = data.pop('product_uuid', None)
-        uuid_val = data.pop('uuid')
-        sync_version = data.pop('sync_version', 1)
-        is_deleted = data.pop('is_deleted', False)
-        incoming_branch = data.pop('branch_id', branch_id)
-        data = cls._strip_sync_denied(data)
-
-        order = None
-        product = None
-
-        if order_uuid:
-            try:
-                order = Order.objects.get(uuid=order_uuid)
-            except Order.DoesNotExist:
-                order = None
-
-        if product_uuid:
-            try:
-                product = Product.objects.get(uuid=product_uuid)
-            except Product.DoesNotExist:
-                pass
-
-        if not order:
-            # Required FK (OrderItem.order) not present yet — defer for retry.
-            return None, 'deferred'
-
-        try:
-            instance = cls.objects.get(uuid=uuid_val)
-            if cls._should_replace(instance, sync_version, data, incoming_branch):
-                for key, value in data.items():
-                    if hasattr(instance, key):
-                        setattr(instance, key, value)
-                instance.order = order
-                if product:
-                    instance.product = product
-                instance.sync_version = sync_version
-                instance.is_deleted = is_deleted
-                instance.synced_at = timezone.now()
-                instance.save(_syncing=True)
-            return instance, 'updated'
-        except cls.DoesNotExist:
-            instance = cls(
-                uuid=uuid_val,
-                sync_version=sync_version,
-                is_deleted=is_deleted,
-                branch_id=incoming_branch or '',
-                synced_at=timezone.now(),
-                order=order,
-                product=product,
-            )
-            for key, value in data.items():
-                if hasattr(instance, key):
-                    setattr(instance, key, value)
-            instance.save(_syncing=True)
-            return instance, 'created'
 
     def __str__(self):
         return f"{self.product.name} x {self.quantity}"
@@ -1892,77 +1713,25 @@ class Inkassa(SyncMixin, models.Model):
 
     @classmethod
     def from_sync_dict(cls, data, branch_id=None):
-        from django.utils import timezone
-
-        data = data.copy()
-        cashier_uuid = data.pop('cashier_uuid', None)
-        uuid_val = data.pop('uuid')
-        sync_version = data.pop('sync_version', 1)
-        is_deleted = data.pop('is_deleted', False)
-        incoming_branch = data.pop('branch_id', branch_id)
-
-        cashier = None
-        if cashier_uuid:
-            try:
-                cashier = User.objects.get(uuid=cashier_uuid)
-            except User.DoesNotExist:
-                pass
-
-        try:
-            instance = cls.objects.get(uuid=uuid_val)
-            if cls._should_replace(instance, sync_version, data, incoming_branch):
-                for key, value in cls._strip_sync_denied(data, creating=False).items():
-                    if hasattr(instance, key):
-                        setattr(instance, key, value)
-                instance.cashier = cashier
-                instance.sync_version = sync_version
-                instance.is_deleted = is_deleted
-                instance.synced_at = timezone.now()
-                instance.save(_syncing=True)
-            # A transition-era desktop may already hold this row with only the
-            # marker in notes. Apply based on either representation even when
-            # version conflict resolution kept the existing row.
-            if (
-                not instance.is_deleted
-                and instance.inkass_type == cls.InkassType.CASH
-                and (
-                    instance.register_command
-                    or str(instance.notes or '').startswith(
-                        cls.REGISTER_COMMAND_MARKER
-                    )
+        instance, action = super().from_sync_dict(data, branch_id=branch_id)
+        # A transition-era desktop may already hold this row with only the
+        # marker in notes. Apply based on either representation even when
+        # conflict resolution kept the existing row.
+        if (
+            instance is not None
+            and not instance.is_deleted
+            and instance.inkass_type == cls.InkassType.CASH
+            and (
+                instance.register_command
+                or str(instance.notes or '').startswith(
+                    cls.REGISTER_COMMAND_MARKER
                 )
-            ):
-                applied = cls._apply_pending_register_commands(instance.branch_id)
-                if not applied:
-                    return instance, 'deferred'
-            return instance, 'updated'
-        except cls.DoesNotExist:
-            instance = cls(
-                uuid=uuid_val,
-                sync_version=sync_version,
-                is_deleted=is_deleted,
-                branch_id=incoming_branch or '',
-                synced_at=timezone.now(),
-                cashier=cashier,
             )
-            for key, value in cls._strip_sync_denied(data, creating=True).items():
-                if hasattr(instance, key):
-                    setattr(instance, key, value)
-            instance.save(_syncing=True)
-            if (
-                not instance.is_deleted
-                and instance.inkass_type == cls.InkassType.CASH
-                and (
-                    instance.register_command
-                    or str(instance.notes or '').startswith(
-                        cls.REGISTER_COMMAND_MARKER
-                    )
-                )
-            ):
-                applied = cls._apply_pending_register_commands(instance.branch_id)
-                if not applied:
-                    return instance, 'deferred'
-            return instance, 'created'
+        ):
+            applied = cls._apply_pending_register_commands(instance.branch_id)
+            if not applied:
+                return instance, 'deferred'
+        return instance, action
 
     def __str__(self):
         return f"Inkassa #{self.id} - {self.amount} on {self.created_at.strftime('%Y-%m-%d %H:%M')}"
@@ -2543,6 +2312,11 @@ class OrderRefund(SyncMixin, models.Model):
     # collapsed card_amount remains the presentation/reporting bucket.
     card_detail = models.JSONField(default=dict, blank=True)
     refunded_at = models.DateTimeField(db_index=True)
+    # Database-local receipt cursor. A late synced refund keeps its economic
+    # refunded_at while entering the next unclosed Inkassa accounting batch.
+    accounting_recorded_at = models.DateTimeField(
+        db_default=Now(), editable=False,
+    )
     # True only for a cloud-issued instruction. A locally-created refund
     # debits its drawer in the same transaction and therefore leaves this False.
     register_command = models.BooleanField(default=False)
@@ -2562,15 +2336,21 @@ class OrderRefund(SyncMixin, models.Model):
     SYNC_WRITE_DENYLIST = frozenset({
         'amount', 'cash_amount', 'drawer_cash_amount', 'card_amount', 'payme_amount',
         'unknown_amount', 'card_detail', 'refunded_at', 'register_command',
-        'source', 'source_id', 'reason',
+        'source', 'source_id', 'reason', 'accounting_recorded_at',
     })
-    SYNC_DENY_FROM_BRANCH = frozenset({'register_command'})
+    SYNC_DENY_FROM_BRANCH = frozenset({
+        'register_command', 'accounting_recorded_at',
+    })
 
     class Meta:
         db_table = 'order_refund'
         indexes = [
             models.Index(fields=['refunded_at', 'cashier']),
             models.Index(fields=['branch_id', 'refunded_at']),
+            models.Index(
+                fields=['branch_id', 'accounting_recorded_at'],
+                name='refund_branch_acct_idx',
+            ),
         ]
         constraints = [
             models.CheckConstraint(
@@ -2624,6 +2404,7 @@ class OrderRefund(SyncMixin, models.Model):
         data['order_uuid'] = str(self.order.uuid) if self.order else None
         data['shift_uuid'] = str(self.shift.uuid) if self.shift else None
         data['cashier_uuid'] = str(self.cashier.uuid) if self.cashier else None
+        data.pop('accounting_recorded_at', None)
         return data
 
     @classmethod
@@ -2639,6 +2420,8 @@ class OrderRefund(SyncMixin, models.Model):
     @classmethod
     def from_sync_dict(cls, data, branch_id=None):
         """Materialize once; never let a peer revise or tombstone a ledger row."""
+        data = data.copy()
+        data.pop('accounting_recorded_at', None)
         if data.get('is_deleted'):
             return None, 'skipped'
         existing = cls.objects.filter(uuid=data.get('uuid')).first()
@@ -2676,7 +2459,25 @@ class OrderRefund(SyncMixin, models.Model):
         syncing = kwargs.get('_syncing', False)
         if self.pk and not syncing:
             raise TypeError('OrderRefund is append-only and cannot be edited')
-        return super().save(*args, **kwargs)
+        if self.pk:
+            return super().save(*args, **kwargs)
+
+        using = kwargs.get('using') or self._state.db or 'default'
+        with transaction.atomic(using=using):
+            from base.services.accounting_cursor import lock_branch_accounting
+
+            branch = self.branch_id
+            if not branch and self.order_id:
+                branch = self.order.branch_id
+            register = lock_branch_accounting(branch or None)
+            if not self.branch_id:
+                self.branch_id = register.branch_id
+            # The database default is evaluated only after the serialization
+            # lock above has been acquired.  Keeping it in the DDL also lets
+            # older cross-app data migrations insert ledger rows safely on a
+            # brand-new database even though their historical model state does
+            # not know this newer column exists.
+            return super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):
         raise TypeError('OrderRefund is append-only and cannot be deleted')

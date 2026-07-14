@@ -51,38 +51,39 @@ def test_every_registered_fk_has_a_uuid_mapping():
     assert not missing, 'FKs without UUID sync mapping: ' + ', '.join(missing)
 
 
-def test_branch_owned_financial_children_follow_registered_parent_order():
-    """Money children must pull after their authoritative branch parent."""
+def test_registered_models_follow_all_cross_model_fk_dependencies():
+    """Every sync child must be sent/pulled after its registered parent."""
     from django.apps import apps
+    from base.models import SyncMixin
     from base.services.sync.config import MODEL_MAP, SYNC_ORDER
 
-    parent_fields = {
-        'base.OrderItem': ('order', 'base.Order'),
-        'base.OrderPayment': ('order', 'base.Order'),
-        'base.OrderRefund': ('order', 'base.Order'),
-        'discounts.OrderDiscount': ('order', 'base.Order'),
-        'discounts.DiscountUsage': ('order', 'base.Order'),
-        'base.CashReconciliation': ('shift', 'base.Shift'),
-        'cashbox.ShiftPaymentTotal': ('shift', 'base.Shift'),
-        'cashbox.CashboxExpense': ('shift', 'base.Shift'),
-    }
     registry_key = {
         label.lower(): key for key, label in MODEL_MAP.items()
     }
     position = {key: index for index, key in enumerate(SYNC_ORDER)}
+    violations = []
 
-    for child_label, (field_name, parent_label) in parent_fields.items():
+    for child_label in MODEL_MAP.values():
         child = apps.get_model(child_label)
-        parent = apps.get_model(parent_label)
-        field = child._meta.get_field(field_name)
-
-        assert field.related_model is parent
-        assert not field.null
-        assert getattr(child, 'SYNC_PULL_SCOPE', 'branch') == 'branch'
-        assert getattr(parent, 'SYNC_PULL_SCOPE', 'branch') == 'branch'
-
         child_key = registry_key[child._meta.label_lower]
-        parent_key = registry_key[parent._meta.label_lower]
-        assert position[parent_key] < position[child_key], (
-            parent_key, child_key,
-        )
+        for field in child._meta.concrete_fields:
+            parent = getattr(field, 'related_model', None)
+            if (
+                parent is None
+                or parent is child  # self-references cannot be topologically sorted
+                or not issubclass(parent, SyncMixin)
+                or getattr(parent, '_sync_local_only', False)
+            ):
+                continue
+            parent_key = registry_key.get(parent._meta.label_lower)
+            if parent_key is None:
+                violations.append(
+                    f'{child_key}.{field.name} -> unregistered '
+                    f'{parent._meta.label_lower}'
+                )
+            elif position[parent_key] >= position[child_key]:
+                violations.append(
+                    f'{child_key}.{field.name} -> {parent_key}'
+                )
+
+    assert not violations, 'Out-of-order sync FKs: ' + ', '.join(violations)
