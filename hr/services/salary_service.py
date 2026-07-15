@@ -1,7 +1,7 @@
 from typing import Dict, Any, Tuple
 from decimal import Decimal
 from django.db import IntegrityError, transaction
-from django.db.models import Sum
+from django.db.models import Q, Sum
 from django.utils import timezone
 
 from base.helpers.response import ServiceResponse
@@ -76,7 +76,8 @@ class SalaryService:
              employee_id: int = None,
              year: int = None,
              month: int = None,
-             status: str = None) -> Tuple[Dict[str, Any], int]:
+             status: str = None,
+             search: str = None) -> Tuple[Dict[str, Any], int]:
         queryset = SalaryPayment.objects.filter(
             is_deleted=False
         ).select_related("employee__user", "approved_by", "created_by")
@@ -92,6 +93,13 @@ class SalaryService:
 
         if status:
             queryset = queryset.filter(status=status)
+
+        if search:
+            queryset = queryset.filter(
+                Q(employee__user__first_name__icontains=search)
+                | Q(employee__user__last_name__icontains=search)
+                | Q(employee__position__icontains=search)
+            )
 
         queryset = queryset.order_by("-period_year", "-period_month", "employee__user__first_name")
 

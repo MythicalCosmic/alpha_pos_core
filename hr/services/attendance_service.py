@@ -4,6 +4,7 @@ from django.db import transaction
 from django.db.models import Sum
 from django.core.paginator import Paginator
 from django.utils import timezone
+from django.utils.dateparse import parse_date
 
 from base.helpers.response import ServiceResponse
 from hr.models import Attendance
@@ -344,6 +345,16 @@ class AttendanceService:
     def get_daily_report(cls, date=None) -> Tuple[Dict[str, Any], int]:
         if date is None:
             date = timezone.localdate()
+        elif isinstance(date, str):
+            try:
+                parsed = parse_date(date)
+            except (TypeError, ValueError):
+                parsed = None
+            if parsed is None:
+                return ServiceResponse.validation_error(
+                    errors={"date": "Use YYYY-MM-DD format"},
+                )
+            date = parsed
 
         records = Attendance.objects.filter(
             date=date, is_deleted=False

@@ -5,6 +5,7 @@ from base.helpers.request import parse_json_body, safe_page, safe_per_page
 from base.helpers.response import json_response
 from base.security.permissions import admin_required
 from hr.services import DepartmentService
+from hr.views.filters import query_bool, query_value
 
 
 @csrf_exempt
@@ -14,7 +15,12 @@ def departments(request):
     if request.method == "GET":
         page = safe_page(request)
         per_page = safe_per_page(request, 20)
-        result, status = DepartmentService.list(page=page, per_page=per_page)
+        result, status = DepartmentService.list(
+            page=page,
+            per_page=per_page,
+            search=query_value(request, "search"),
+            is_active=query_bool(request, "is_active", "status"),
+        )
         return JsonResponse(result, status=status)
 
     data, error = parse_json_body(request)

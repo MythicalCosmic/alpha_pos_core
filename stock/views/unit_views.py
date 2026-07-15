@@ -23,6 +23,10 @@ def units(request):
     if error:
         return json_response(error)
 
+    # Older service versions do not expose activation at creation time.  The
+    # desktop sends the form's is_active field unconditionally, so discard it
+    # instead of leaking a TypeError/500; new units safely start active.
+    data.pop("is_active", None)
     result, status = StockUnitService.create(**data)
     return JsonResponse(result, status=status)
 

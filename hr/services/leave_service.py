@@ -2,6 +2,7 @@ from typing import Dict, Any, Tuple
 from decimal import Decimal
 from django.db import IntegrityError, transaction
 from django.core.paginator import Paginator
+from django.db.models import Q
 from django.utils import timezone
 
 from base.helpers.response import ServiceResponse
@@ -109,16 +110,29 @@ class LeaveService:
     # ── LeaveType CRUD ────────────────────────────────────────────
 
     @classmethod
-    def list_types(cls, is_active: bool = None) -> Tuple[Dict[str, Any], int]:
+    def list_types(cls,
+                   is_active: bool = None,
+                   page: int = 1,
+                   per_page: int = 20,
+                   search: str = None) -> Tuple[Dict[str, Any], int]:
         queryset = LeaveType.objects.filter(is_deleted=False)
 
         if is_active is not None:
             queryset = queryset.filter(is_active=is_active)
 
+        if search:
+            queryset = queryset.filter(
+                Q(name__icontains=search) | Q(short_name__icontains=search)
+            )
+
         queryset = queryset.order_by('name')
 
+        paginator = Paginator(queryset, per_page)
+        page_obj = paginator.get_page(page)
+
         return ServiceResponse.success(data={
-            "leave_types": [cls._serialize_type(lt) for lt in queryset],
+            "leave_types": [cls._serialize_type(lt) for lt in page_obj],
+            "pagination": _pagination_data(page_obj, paginator),
         })
 
     @classmethod

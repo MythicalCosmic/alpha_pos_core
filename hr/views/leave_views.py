@@ -5,6 +5,7 @@ from base.helpers.request import parse_json_body, safe_page, safe_per_page
 from base.helpers.response import json_response
 from base.security.permissions import admin_required
 from hr.services import LeaveService
+from hr.views.filters import query_bool, query_value
 
 
 @csrf_exempt
@@ -12,7 +13,12 @@ from hr.services import LeaveService
 @admin_required
 def leave_types(request):
     if request.method == "GET":
-        result, status = LeaveService.list_types()
+        result, status = LeaveService.list_types(
+            page=safe_page(request),
+            per_page=safe_per_page(request, 20),
+            search=query_value(request, "search"),
+            is_active=query_bool(request, "is_active", "status"),
+        )
         return JsonResponse(result, status=status)
 
     data, error = parse_json_body(request)

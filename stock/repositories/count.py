@@ -18,7 +18,10 @@ class VarianceReasonCodeRepository(BaseSyncRepository):
 
     @classmethod
     def code_exists(cls, code, exclude_id=None):
-        qs = cls.model.objects.filter(code=code, is_deleted=False)
+        # ``code`` is database-unique even for soft-deleted rows.  Include
+        # tombstones here so create/update returns a clean validation response
+        # instead of leaking an IntegrityError after a code is deleted.
+        qs = cls.model.objects.filter(code__iexact=code)
         if exclude_id:
             qs = qs.exclude(id=exclude_id)
         return qs.exists()

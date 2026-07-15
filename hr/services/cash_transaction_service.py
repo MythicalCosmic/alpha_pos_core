@@ -1,6 +1,7 @@
 from typing import Dict, Any, Tuple
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from django.db import transaction
+from django.db.models import Q
 
 from base.helpers.response import ServiceResponse
 from base.models import CashRegister
@@ -119,7 +120,8 @@ class CashTransactionService:
              per_page: int = 20,
              type: str = None,
              date_from=None,
-             date_to=None) -> Tuple[Dict[str, Any], int]:
+             date_to=None,
+             search: str = None) -> Tuple[Dict[str, Any], int]:
         queryset = CashTransaction.objects.filter(
             is_deleted=False
         ).select_related("performed_by")
@@ -132,6 +134,15 @@ class CashTransactionService:
 
         if date_to:
             queryset = queryset.filter(created_at__date__lte=date_to)
+
+        if search:
+            queryset = queryset.filter(
+                Q(description__icontains=search)
+                | Q(reference_type__icontains=search)
+                | Q(notes__icontains=search)
+                | Q(performed_by__first_name__icontains=search)
+                | Q(performed_by__last_name__icontains=search)
+            )
 
         queryset = queryset.order_by("-created_at")
 

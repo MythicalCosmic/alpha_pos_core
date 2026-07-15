@@ -5,7 +5,7 @@ from django.views.decorators.http import require_http_methods, require_GET, requ
 
 from base.helpers.request import parse_json_body
 from base.helpers.response import json_response
-from base.security.permissions import pos_staff_required, admin_required
+from base.security.permissions import pos_staff_required
 from cashbox.services.expense_service import CashboxExpenseService, CashboxCategoryService
 
 
@@ -36,11 +36,18 @@ def cashbox_expenses(request, shift_id):
 
 @csrf_exempt
 @require_http_methods(["GET", "POST"])
-@admin_required
+@pos_staff_required
 def cashbox_categories(request):
     if request.method == "GET":
         result, status_code = CashboxCategoryService.list()
         return JsonResponse(result, status=status_code)
+    # Reading the configured choices is part of the cashier expense form;
+    # changing that global catalog remains a back-office-only operation.
+    if request.user.role not in {'ADMIN', 'MANAGER'}:
+        return JsonResponse(
+            {"success": False, "message": "Manager access required"},
+            status=403,
+        )
     data, error = parse_json_body(request)
     if error:
         return json_response(error)

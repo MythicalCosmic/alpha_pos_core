@@ -40,11 +40,17 @@ class ExpenseCategoryService:
     def list(cls,
              page: int = 1,
              per_page: int = 20,
-             is_active: bool = None) -> Tuple[Dict[str, Any], int]:
+             is_active: bool = None,
+             search: str = None) -> Tuple[Dict[str, Any], int]:
         queryset = ExpenseCategoryRepository.get_all()
 
         if is_active is not None:
             queryset = queryset.filter(is_active=is_active)
+
+        if search:
+            queryset = queryset.filter(
+                Q(name__icontains=search) | Q(description__icontains=search)
+            )
 
         queryset = queryset.annotate(
             expense_count=Count("expenses", filter=Q(expenses__is_deleted=False))

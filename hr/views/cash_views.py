@@ -5,6 +5,7 @@ from base.helpers.request import parse_json_body, safe_page, safe_per_page
 from base.helpers.response import json_response
 from base.security.permissions import admin_required
 from hr.services import CashTransactionService
+from hr.views.filters import query_date_range, query_enum, query_value
 
 
 @csrf_exempt
@@ -13,7 +14,15 @@ from hr.services import CashTransactionService
 def cash_transactions(request):
     page = safe_page(request)
     per_page = safe_per_page(request, 20)
-    result, status = CashTransactionService.list(page=page, per_page=per_page)
+    date_from, date_to = query_date_range(request)
+    result, status = CashTransactionService.list(
+        page=page,
+        per_page=per_page,
+        type=query_enum(request, "type"),
+        date_from=date_from,
+        date_to=date_to,
+        search=query_value(request, "search"),
+    )
     return JsonResponse(result, status=status)
 
 

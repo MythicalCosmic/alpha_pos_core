@@ -8,11 +8,11 @@ from django.utils import timezone
 pytestmark = pytest.mark.django_db
 
 
-def _user(email='cashier@t.local'):
+def _user(email='cashier@t.local', *, role='CASHIER'):
     from base.models import User
     return User.objects.create(
         first_name='Cash', last_name='Ier', email=email, password='x',
-        role='CASHIER', status='ACTIVE')
+        role=role, status='ACTIVE')
 
 
 def _shift(user):
@@ -57,6 +57,73 @@ class TestDrawer:
             s.id, Decimal('30000'), comment='napkins', created_by=u)
         assert st == 201, res
         assert drawer_cash(s) == Decimal('70000.00')
+
+
+def _authenticated_client(user):
+    import secrets
+    from datetime import timedelta
+
+    from django.test import Client
+    from base.models import Session
+    from base.repositories import SessionRepository
+
+    token = secrets.token_hex(32)
+    Session.objects.create(
+        user_id=user,
+        ip_address='127.0.0.1',
+        user_agent='cashbox-contract-test',
+        payload=SessionRepository.hash_token(token),
+        expires_at=timezone.now() + timedelta(hours=1),
+    )
+    client = Client(HTTP_USER_AGENT='cashbox-contract-test')
+    client.cookies['session_key'] = token
+    return client
+
+
+def test_cashier_can_list_cashbox_categories_but_cannot_create_them():
+    import json
+    from cashbox.models import CashboxExpenseCategory
+
+    CashboxExpenseCategory.objects.create(name='Supplies', sort_order=1)
+    cashier = _authenticated_client(_user(role='CASHIER'))
+
+    listed = cashier.get('/api/admins/cashbox/categories/')
+    denied = cashier.post(
+        '/api/admins/cashbox/categories/',
+        data=json.dumps({'name': 'Unauthorized'}),
+        content_type='application/json',
+    )
+
+    assert listed.status_code == 200
+    assert any(row['name'] == 'Supplies' for row in listed.json()['data'])
+    assert denied.status_code == 403
+    assert not CashboxExpenseCategory.objects.filter(name='Unauthorized').exists()
+
+
+def test_admin_can_create_cashbox_category():
+    import json
+
+    admin = _authenticated_client(_user(role='ADMIN'))
+    response = admin.post(
+        '/api/admins/cashbox/categories/',
+        data=json.dumps({'name': 'Maintenance', 'sort_order': 2}),
+        content_type='application/json',
+    )
+
+    assert response.status_code == 201, response.content
+
+
+def test_manager_can_create_cashbox_category():
+    import json
+
+    manager = _authenticated_client(_user(role='MANAGER'))
+    response = manager.post(
+        '/api/admins/cashbox/categories/',
+        data=json.dumps({'name': 'Manager maintenance', 'sort_order': 3}),
+        content_type='application/json',
+    )
+
+    assert response.status_code == 201, response.content
 
 
 class TestCashboxExpenseRecipients:

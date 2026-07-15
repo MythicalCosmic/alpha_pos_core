@@ -46,12 +46,16 @@ class DepartmentService:
     def list(cls,
              page: int = 1,
              per_page: int = 20,
-             search: str = None) -> Tuple[Dict[str, Any], int]:
+             search: str = None,
+             is_active: bool = None) -> Tuple[Dict[str, Any], int]:
         queryset = DepartmentRepository.get_all().select_related("manager")
         queryset = DepartmentRepository.with_employee_count(queryset)
 
         if search:
             queryset = DepartmentRepository.search(queryset, search)
+
+        if is_active is not None:
+            queryset = queryset.filter(is_active=is_active)
 
         queryset = queryset.order_by("name")
 

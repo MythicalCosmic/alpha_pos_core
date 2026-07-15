@@ -5,6 +5,13 @@ from base.helpers.request import parse_json_body, safe_page, safe_per_page
 from base.helpers.response import json_response
 from base.security.permissions import admin_required, pos_staff_required
 from hr.services import ExpenseCategoryService, ExpenseService
+from hr.views.filters import (
+    query_bool,
+    query_date_range,
+    query_enum,
+    query_int,
+    query_value,
+)
 
 
 @csrf_exempt
@@ -15,7 +22,12 @@ def expense_categories(request):
         # Cashiers need to read categories to file an expense.
         page = safe_page(request)
         per_page = safe_per_page(request, 20)
-        result, status = ExpenseCategoryService.list(page=page, per_page=per_page)
+        result, status = ExpenseCategoryService.list(
+            page=page,
+            per_page=per_page,
+            search=query_value(request, "search"),
+            is_active=query_bool(request, "is_active", "status"),
+        )
         return JsonResponse(result, status=status)
 
     # Creating categories stays a manager/admin job.
@@ -60,7 +72,16 @@ def expenses(request):
     if request.method == "GET":
         page = safe_page(request)
         per_page = safe_per_page(request, 20)
-        result, status = ExpenseService.list(page=page, per_page=per_page)
+        date_from, date_to = query_date_range(request)
+        result, status = ExpenseService.list(
+            page=page,
+            per_page=per_page,
+            status=query_enum(request, "status"),
+            category_id=query_int(request, "category_id", "category", "type"),
+            date_from=date_from,
+            date_to=date_to,
+            search=query_value(request, "search"),
+        )
         return JsonResponse(result, status=status)
 
     data, error = parse_json_body(request)

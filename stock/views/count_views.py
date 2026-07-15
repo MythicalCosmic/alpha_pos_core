@@ -99,6 +99,26 @@ def variance_codes(request):
 
 
 @csrf_exempt
+@require_http_methods(["GET", "PUT", "DELETE"])
+@admin_required
+def variance_code_detail(request, code_id):
+    if request.method == "GET":
+        result, status = VarianceReasonCodeService.get(code_id)
+        return JsonResponse(result, status=status)
+
+    if request.method == "DELETE":
+        result, status = VarianceReasonCodeService.delete(code_id)
+        return JsonResponse(result, status=status)
+
+    data, error = parse_json_body(request)
+    if error:
+        return json_response(error)
+
+    result, status = VarianceReasonCodeService.update(code_id, **data)
+    return JsonResponse(result, status=status)
+
+
+@csrf_exempt
 @require_POST
 @admin_required
 def variance_codes_seed(request):

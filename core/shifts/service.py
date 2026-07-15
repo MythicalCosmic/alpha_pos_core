@@ -1155,6 +1155,14 @@ class ShiftService:
         # `now` is threaded from list() so a live row's total_revenue window and
         # the batched payment_mix window share the SAME instant (they must match).
         now = now or timezone.now()
+        # List/active callers already pass the O(1) batched map. Standalone
+        # detail/current/end responses used to omit it and therefore emitted
+        # card_collected=0/payme_collected=0 even when authoritative payment
+        # rows existed (the production shift-47 symptom). Compute the same
+        # canonical map for the one row instead of falling back to the rolled-up
+        # Order.payment_method or a duplicate tender implementation.
+        if extras is None and shift.start_time:
+            extras = ShiftService._batch_list_extras([shift], now=now).get(shift.id)
         is_live = shift.status == 'ACTIVE' and not shift.end_time
         effective_end = shift.end_time or now
         if is_live:

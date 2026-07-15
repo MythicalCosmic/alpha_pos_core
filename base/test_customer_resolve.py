@@ -11,7 +11,24 @@ pytestmark = pytest.mark.django_db
 def test_normalize_phone_variants_collapse():
     n = Customer.normalize_phone
     assert n('+998 90 123-45-67') == n('998901234567') == n('901234567') == '998901234567'
+    assert n('0 (90) 123-45-67') == n('00998 90 123-45-67') == '998901234567'
     assert n('') == '' and n(None) == ''
+
+
+def test_direct_save_and_resolve_persist_the_same_canonical_phone():
+    direct = Customer.objects.create(
+        phone_number='0 (90) 111-22-33', name='',
+    )
+    assert direct.phone_number == '998901112233'
+
+    same, created = Customer.resolve(
+        phone='+998 90 111 22 33', name='Canonical Name',
+    )
+    direct.refresh_from_db()
+    assert created is False
+    assert same.pk == direct.pk
+    assert direct.phone_number == '998901112233'
+    assert direct.name == 'Canonical Name'
 
 
 def test_resolve_creates_when_new():

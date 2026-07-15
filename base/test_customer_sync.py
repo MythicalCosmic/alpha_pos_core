@@ -30,13 +30,19 @@ def test_order_carries_customer_and_syncs():
                                    branch_id='branch1')
     o = Order.objects.create(user=u, customer=cust, order_type='DELIVERY',
                              status='PREPARING', branch_id='branch1',
-                             total_amount=Decimal('100'))
+                             total_amount=Decimal('100'),
+                             phone_number='+998 (90) 777-66-55',
+                             delivery_address='Tashkent, Amir Temur 47, apt. 12')
+    assert o.phone_number == '998907776655'
     # to_sync_dict emits the client link
     payload = o.to_sync_dict()
     assert payload['customer_uuid'] == str(cust.uuid)
+    assert payload['delivery_address'] == 'Tashkent, Amir Temur 47, apt. 12'
 
     # a peer receives a NEW order referencing the (already-synced) customer
     payload['uuid'] = str(uuidlib.uuid4())
     inst, action = Order.from_sync_dict(payload, branch_id='branch1')
     assert action == 'created'
     assert inst.customer_id == cust.id   # FK resolved + linked on the peer
+    assert inst.phone_number == '998907776655'
+    assert inst.delivery_address == 'Tashkent, Amir Temur 47, apt. 12'

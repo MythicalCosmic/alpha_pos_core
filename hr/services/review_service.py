@@ -1,6 +1,7 @@
 from typing import Dict, Any, Tuple
 from django.db import transaction
 from django.core.paginator import Paginator
+from django.db.models import Q
 from django.utils import timezone
 
 from base.helpers.response import ServiceResponse
@@ -109,7 +110,10 @@ class ReviewService:
                      page: int = 1,
                      per_page: int = 20,
                      employee_id: int = None,
-                     status: str = None) -> Tuple[Dict[str, Any], int]:
+                     status: str = None,
+                     date_from=None,
+                     date_to=None,
+                     search: str = None) -> Tuple[Dict[str, Any], int]:
         queryset = PerformanceReview.objects.filter(
             is_deleted=False
         ).select_related('employee__user', 'reviewer')
@@ -119,6 +123,22 @@ class ReviewService:
 
         if status:
             queryset = queryset.filter(status=status)
+
+        if date_from:
+            queryset = queryset.filter(review_period_end__gte=date_from)
+
+        if date_to:
+            queryset = queryset.filter(review_period_start__lte=date_to)
+
+        if search:
+            queryset = queryset.filter(
+                Q(employee__user__first_name__icontains=search)
+                | Q(employee__user__last_name__icontains=search)
+                | Q(employee__position__icontains=search)
+                | Q(strengths__icontains=search)
+                | Q(improvements__icontains=search)
+                | Q(goals__icontains=search)
+            )
 
         queryset = queryset.order_by('-review_period_end')
 

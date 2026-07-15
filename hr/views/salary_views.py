@@ -5,6 +5,7 @@ from base.helpers.request import parse_json_body, safe_page, safe_per_page
 from base.helpers.response import json_response
 from base.security.permissions import admin_required
 from hr.services import SalaryService
+from hr.views.filters import query_enum, query_int, query_value
 
 
 @csrf_exempt
@@ -14,7 +15,15 @@ def salaries(request):
     if request.method == "GET":
         page = safe_page(request)
         per_page = safe_per_page(request, 20)
-        result, status = SalaryService.list(page=page, per_page=per_page)
+        result, status = SalaryService.list(
+            page=page,
+            per_page=per_page,
+            employee_id=query_int(request, "employee_id", "employee"),
+            year=query_int(request, "year"),
+            month=query_int(request, "month"),
+            status=query_enum(request, "status"),
+            search=query_value(request, "search"),
+        )
         return JsonResponse(result, status=status)
 
     data, error = parse_json_body(request)

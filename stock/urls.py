@@ -18,6 +18,7 @@ urlpatterns = [
     # Locations
     path('locations/', location_views.locations, name='location-list'),
     path('locations/<int:location_id>/', location_views.location_detail, name='location-detail'),
+    path('locations/<int:location_id>/activate/', location_views.location_activate, name='location-activate'),
     path('locations/<int:location_id>/set-default/', location_views.location_set_default, name='location-set-default'),
 
     # Units
@@ -103,6 +104,7 @@ urlpatterns = [
     path('counts/<int:count_id>/<str:action>/', count_views.stock_count_action, name='count-action'),
     path('variance-codes/', count_views.variance_codes, name='variance-codes'),
     path('variance-codes/seed/', count_views.variance_codes_seed, name='variance-codes-seed'),
+    path('variance-codes/<int:code_id>/', count_views.variance_code_detail, name='variance-code-detail'),
 
     # Product Links
     path('product-links/', product_link_views.product_links, name='product-link-list'),

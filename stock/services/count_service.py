@@ -59,12 +59,26 @@ class VarianceReasonCodeService:
         })
 
     @classmethod
+    def get(cls, code_id: int) -> Tuple[Dict[str, Any], int]:
+        reason_code = VarianceReasonCodeRepository.get_by_id(code_id)
+        if not reason_code:
+            return ServiceResponse.not_found(
+                f"Variance code with id {code_id} not found"
+            )
+        return ServiceResponse.success(data={
+            "code": cls.serialize(reason_code),
+        })
+
+    @classmethod
     @transaction.atomic
     def create(cls,
                code: str,
                name: str,
                description: str = "",
-               requires_approval: bool = False) -> Tuple[Dict[str, Any], int]:
+               requires_approval: bool = False,
+               is_active: bool = True) -> Tuple[Dict[str, Any], int]:
+
+        code = str(code).strip().upper()
 
         if VarianceReasonCodeRepository.code_exists(code):
             return ServiceResponse.validation_error(
@@ -76,6 +90,7 @@ class VarianceReasonCodeService:
             name=name,
             description=description,
             requires_approval=requires_approval,
+            is_active=is_active,
         )
 
         return ServiceResponse.created(data={
@@ -90,6 +105,14 @@ class VarianceReasonCodeService:
         if not reason_code:
             return ServiceResponse.not_found(f"Variance code with id {code_id} not found")
 
+        if "code" in kwargs:
+            code = str(kwargs["code"]).strip().upper()
+            if VarianceReasonCodeRepository.code_exists(code, exclude_id=code_id):
+                return ServiceResponse.validation_error(
+                    errors={"code": f"Code '{code}' already exists"}
+                )
+            reason_code.code = code
+
         for field in ["name", "description", "requires_approval", "is_active"]:
             if field in kwargs:
                 setattr(reason_code, field, kwargs[field])
@@ -99,6 +122,23 @@ class VarianceReasonCodeService:
         return ServiceResponse.success(data={
             "code": cls.serialize(reason_code)
         }, message="Variance code updated")
+
+    @classmethod
+    @transaction.atomic
+    def delete(cls, code_id: int) -> Tuple[Dict[str, Any], int]:
+        reason_code = VarianceReasonCodeRepository.get_by_id(code_id)
+        if not reason_code:
+            return ServiceResponse.not_found(
+                f"Variance code with id {code_id} not found"
+            )
+
+        reason_code.is_active = False
+        reason_code.is_deleted = True
+        reason_code.save(update_fields=["is_active", "is_deleted"])
+
+        return ServiceResponse.success(data={
+            "id": code_id,
+        }, message="Variance code deleted")
 
     @classmethod
     def get_default_codes(cls) -> List[Dict]:

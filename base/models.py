@@ -1074,12 +1074,19 @@ class Customer(SyncMixin, models.Model):
         """Reduce a phone to a comparable key: digits only, with the UZ country
         code. '+998 90 123-45-67', '998901234567', and '901234567' all collapse
         to '998901234567', so the same human matches across desktop + Telegram."""
-        if not phone:
-            return ''
-        digits = ''.join(ch for ch in str(phone) if ch.isdigit())
-        if len(digits) == 9:            # bare national number -> add the UZ code
-            digits = '998' + digits
-        return digits
+        from base.services.phone import normalize_uz_phone
+        return normalize_uz_phone(phone)
+
+    def save(self, *args, **kwargs):
+        """Persist a stable digits-only identity regardless of write path."""
+        normalized = self.normalize_phone(self.phone_number)
+        changed = normalized != (self.phone_number or '')
+        self.phone_number = normalized
+        if changed and kwargs.get('update_fields') is not None:
+            kwargs['update_fields'] = list(
+                set(kwargs['update_fields']) | {'phone_number'}
+            )
+        return super().save(*args, **kwargs)
 
     @classmethod
     def resolve(
@@ -1103,8 +1110,10 @@ class Customer(SyncMixin, models.Model):
         ``create`` is false.
         """
         name = (name or '').strip()[:120]
-        phone = (str(phone).strip()[:20] if phone else '')
-        norm = cls.normalize_phone(phone)
+        # Use the canonical key for exact indexed lookup AND persistence. The
+        # normalized scan remains for legacy rows written before this contract.
+        phone = cls.normalize_phone(phone)
+        norm = phone
         requested_branch = (
             None if branch_id is None else str(branch_id or '').strip()
         )
@@ -1170,7 +1179,10 @@ class Customer(SyncMixin, models.Model):
         if telegram_id and not customer.telegram_id:
             customer.telegram_id = telegram_id
             changed = True
-        if phone and not customer.phone_number:
+        if phone and (
+            not customer.phone_number
+            or cls.normalize_phone(customer.phone_number) == norm
+        ) and customer.phone_number != phone:
             customer.phone_number = phone
             changed = True
         if name and not customer.name:
@@ -1257,6 +1269,10 @@ class Order(SyncMixin, models.Model):
     )
 
     phone_number = models.CharField(max_length=20, null=True, blank=True)
+    # Dedicated destination shared by POS, customer history, courier, and sync.
+    # The UI sends a clean human-readable address string; keep the empty wire
+    # value stable as '' for hall/pickup orders and legacy rows.
+    delivery_address = models.TextField(default='', blank=True)
     description = models.TextField(null=True, blank=True)
 
     status = models.CharField(
@@ -1349,6 +1365,7 @@ class Order(SyncMixin, models.Model):
         data['place_uuid'] = str(self.place.uuid) if self.place else None
         data['table_uuid'] = str(self.table.uuid) if self.table else None
         data['customer_uuid'] = str(self.customer.uuid) if self.customer else None
+        data['delivery_address'] = self.delivery_address or ''
         return data
 
     @classmethod
@@ -1367,6 +1384,16 @@ class Order(SyncMixin, models.Model):
 
     def save(self, *args, **kwargs):
         """Stamp the first paid accounting cursor under the branch owner lock."""
+        from base.services.phone import normalize_uz_phone
+
+        normalized_phone = normalize_uz_phone(self.phone_number)
+        canonical_phone = normalized_phone or None
+        phone_changed = canonical_phone != self.phone_number
+        self.phone_number = canonical_phone
+        if phone_changed and kwargs.get('update_fields') is not None:
+            kwargs['update_fields'] = list(
+                set(kwargs['update_fields']) | {'phone_number'}
+            )
         if not (
             self.is_paid
             and self.paid_at is not None

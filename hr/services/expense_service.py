@@ -1,7 +1,7 @@
 from typing import Dict, Any, Tuple
 from decimal import Decimal
 from django.db import transaction
-from django.db.models import Sum
+from django.db.models import Q, Sum
 
 from base.helpers.response import ServiceResponse
 from hr.models import Expense
@@ -83,7 +83,8 @@ class ExpenseService:
              status: str = None,
              category_id: int = None,
              date_from=None,
-             date_to=None) -> Tuple[Dict[str, Any], int]:
+             date_to=None,
+             search: str = None) -> Tuple[Dict[str, Any], int]:
         queryset = Expense.objects.filter(
             is_deleted=False
         ).select_related("category", "created_by", "approved_by", "paid_by")
@@ -99,6 +100,14 @@ class ExpenseService:
 
         if date_to:
             queryset = queryset.filter(expense_date__lte=date_to)
+
+        if search:
+            queryset = queryset.filter(
+                Q(description__icontains=search)
+                | Q(receipt_number__icontains=search)
+                | Q(category__name__icontains=search)
+                | Q(notes__icontains=search)
+            )
 
         queryset = queryset.order_by("-expense_date", "-created_at")
 
