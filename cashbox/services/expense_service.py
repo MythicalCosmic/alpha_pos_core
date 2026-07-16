@@ -157,11 +157,23 @@ class CashboxExpenseService:
                 )
         if recipient_supplier_id:
             from stock.models import Supplier
-            supplier = Supplier.objects.filter(
-                pk=recipient_supplier_id,
-                is_deleted=False,
-                branch_id=branch,
-            ).first()
+            # Suppliers are branch-owned because their balance is branch money,
+            # but installations upgraded from the pre-branch schema can still
+            # contain an unclaimed (blank branch) supplier.  Claim that legacy
+            # row atomically for this shift's branch; never allow a supplier
+            # already owned by a different branch to cross the boundary.
+            supplier = (
+                Supplier.objects.select_for_update()
+                .filter(pk=recipient_supplier_id, is_deleted=False)
+                .first()
+            )
+            if supplier is not None and not str(supplier.branch_id or '').strip():
+                supplier.branch_id = branch
+                supplier.save(update_fields=[
+                    'branch_id', 'updated_at', 'synced_at', 'sync_version',
+                ])
+            if supplier is not None and str(supplier.branch_id) != branch:
+                supplier = None
             if supplier is None:
                 return ServiceResponse.validation_error(
                     errors={
