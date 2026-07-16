@@ -53,6 +53,8 @@ def test_blank_branch_legacy_supplier_is_claimed_by_expense_branch():
     supplier.refresh_from_db()
     assert supplier.branch_id == shift.branch_id
     assert supplier.current_balance == Decimal('30000.00')
+    ledger = supplier.ledger.get(reference_type='CashboxExpense')
+    assert ledger.branch_id == shift.branch_id
 
 
 def test_supplier_owned_by_another_branch_is_still_rejected():

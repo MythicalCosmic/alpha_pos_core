@@ -47,6 +47,11 @@ class SupplierLedgerService:
             source_account=source_account or '', fee=_to_dec(fee) or Decimal('0'),
             reference_type=reference_type or '', reference_id=reference_id,
             note=note or '', performed_by=performed_by,
+            # The supplier row is the authoritative owner.  Passing the branch
+            # explicitly is essential on the cloud aggregator: relying on a
+            # node-wide default either rejects multi-branch deployments or can
+            # attach a payment ledger row to the wrong restaurant.
+            branch_id=supplier.branch_id,
         )
         supplier.current_balance = after
         supplier.save(update_fields=['current_balance', 'updated_at',
