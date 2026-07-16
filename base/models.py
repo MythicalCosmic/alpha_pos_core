@@ -1947,20 +1947,20 @@ class TreasuryTransaction(SyncMixin, models.Model):
 
 
 def _default_business_day_start():
-    """Operating-day cutover default (03:00). A callable keeps the migration
+    """Operating-day opening default (07:00). A callable keeps the migration
     serialization stable and avoids a module-level datetime import."""
     from datetime import time
-    return time(3, 0)
+    return time(7, 0)
 
 
 def _default_business_open():
     from datetime import time
-    return time(9, 0)
+    return time(7, 0)
 
 
 def _default_business_close():
     from datetime import time
-    return time(23, 0)
+    return time(3, 0)
 
 
 class AppSettings(models.Model):
