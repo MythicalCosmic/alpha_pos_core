@@ -3,6 +3,8 @@ from django.db import transaction
 from django.db.models import Sum, Q, Count, Avg, DecimalField
 from django.db.models.functions import Coalesce, TruncDate, TruncMonth, TruncYear
 from django.core.paginator import Paginator
+from django.utils import timezone
+from datetime import datetime, timedelta
 from decimal import Decimal
 from base.repositories.base import BaseSyncRepository
 from base.models import (
@@ -17,6 +19,45 @@ from base.models import (
 DISPLAY_ID_WRAP_AT = 100
 
 
+def _reporting_window_from_bounds(date_from, date_to):
+    """Recover a canonical operating-date window from legacy datetime bounds.
+
+    The repository API predates ``ReportingWindow`` and receives inclusive
+    datetimes from the admin service.  Recognize only the canonical 07:00 start
+    plus 03:00 (or its inclusive microsecond predecessor) end; arbitrary custom
+    timestamp pairs remain exact continuous ranges.
+    """
+    if not isinstance(date_from, datetime) or not isinstance(date_to, datetime):
+        return None
+    if timezone.is_naive(date_from) or timezone.is_naive(date_to):
+        return None
+
+    from base.services.business_day import (
+        business_day_end, business_day_start, resolve_reporting_window,
+    )
+
+    tz = timezone.get_current_timezone()
+    local_start = timezone.localtime(date_from, tz)
+    local_end = timezone.localtime(date_to, tz)
+    if local_start.time() != business_day_start():
+        return None
+
+    if local_end.time() == business_day_end():
+        exclusive_end = local_end
+    else:
+        exclusive_end = local_end + timedelta(microseconds=1)
+        if exclusive_end.time() != business_day_end():
+            return None
+
+    final_date = exclusive_end.date() - timedelta(days=1)
+    if final_date < local_start.date():
+        return None
+    window = resolve_reporting_window(local_start.date(), final_date)
+    if window.start_at != date_from or window.end_at != exclusive_end:
+        return None
+    return window
+
+
 def _window_queryset(qs, field, date_from=None, date_to=None,
                      tod_from=None, tod_to=None):
     """Window a metric by the event that actually owns it.
@@ -25,6 +66,12 @@ def _window_queryset(qs, field, date_from=None, date_to=None,
     ``paid_at``. Keeping the field explicit prevents a ticket opened before a
     cutover but paid afterwards from moving cash into the wrong business day.
     """
+    # Legacy tod_* is a separate compatibility contract; don't reinterpret it
+    # here. Canonical request handlers use ReportingWindow directly.
+    if tod_from is None and tod_to is None:
+        window = _reporting_window_from_bounds(date_from, date_to)
+        if window is not None:
+            return window.filter(qs, field)
     if date_from:
         qs = qs.filter(**{f'{field}__gte': date_from})
     if date_to:
@@ -683,13 +730,12 @@ class OrderRepository(BaseSyncRepository):
         # tens of thousands of orders that's a long table scan and a lot of
         # round-trips.
         from django.db.models import F, Avg, ExpressionWrapper, DurationField
-        qs = cls.model.objects.filter(
-            is_deleted=False, status='READY', ready_at__isnull=False
+        qs = _window_queryset(
+            cls.model.objects.filter(
+                is_deleted=False, status='READY', ready_at__isnull=False,
+            ),
+            'created_at', date_from, date_to,
         )
-        if date_from:
-            qs = qs.filter(created_at__gte=date_from)
-        if date_to:
-            qs = qs.filter(created_at__lte=date_to)
 
         result = qs.aggregate(
             avg_duration=Avg(

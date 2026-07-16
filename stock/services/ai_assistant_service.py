@@ -20,8 +20,8 @@ from base.models import (
 from base.services.business_day import business_day_date_expr
 from base.services.revenue import net_line_revenue
 from base.services.refund_lines import (
-    REFUND_EVENT_ALIAS, refund_item_events, refund_line_quantity,
-    refund_line_revenue,
+    REFUND_EVENT_ALIAS, refund_item_events, refund_item_events_in_window,
+    refund_line_quantity, refund_line_revenue,
 )
 from stock.services.ai_context import (
     current_cash_register, resolve_ai_context, scope_branch,
@@ -241,26 +241,29 @@ class AIStockAssistant:
         context, context_error = resolve_ai_context(location_id)
         if context_error:
             return {"error": context_error}
-        # Business-day windows (03:00 cutover) so the AI's today/week/month match
-        # the admin dashboard instead of a plain calendar day. Operational volume
-        # is attributed by created_at; settled money and product sales by paid_at.
-        from base.services.business_day import business_date, range_window, today_window
+        # Canonical operating windows (07:00 -> next-day 03:00) keep the AI's
+        # today/week/month aligned with the dashboard.  A multi-day selection is
+        # a union of operating days, so every intermediate 03:00-07:00 quiet gap
+        # must be excluded rather than treating the outer bounds as continuous.
+        from base.services.business_day import (
+            business_date, resolve_reporting_window, today_window,
+        )
         bd = business_date()
         today_lo, today_hi = today_window()
-        week_lo, week_hi = range_window(bd - timedelta(days=6), bd)
-        month_lo, month_hi = range_window(bd - timedelta(days=29), bd)
+        week_window = resolve_reporting_window(bd - timedelta(days=6), bd)
+        month_window = resolve_reporting_window(bd - timedelta(days=29), bd)
         # ── Orders summary ──
         all_orders = scope_branch(
             Order.objects.filter(is_deleted=False), context.branch_id,
         )
         today_orders = all_orders.filter(created_at__gte=today_lo, created_at__lt=today_hi)
-        week_orders = all_orders.filter(created_at__gte=week_lo, created_at__lt=week_hi)
-        month_orders = all_orders.filter(created_at__gte=month_lo, created_at__lt=month_hi)
+        week_orders = week_window.filter(all_orders, 'created_at')
+        month_orders = month_window.filter(all_orders, 'created_at')
 
         settled_orders = all_orders.filter(is_paid=True, paid_at__isnull=False)
         today_sales = settled_orders.filter(paid_at__gte=today_lo, paid_at__lt=today_hi)
-        week_sales = settled_orders.filter(paid_at__gte=week_lo, paid_at__lt=week_hi)
-        month_sales = settled_orders.filter(paid_at__gte=month_lo, paid_at__lt=month_hi)
+        week_sales = week_window.filter(settled_orders, 'paid_at')
+        month_sales = month_window.filter(settled_orders, 'paid_at')
 
         all_refunds = scope_branch(
             OrderRefund.objects.filter(is_deleted=False), context.branch_id,
@@ -268,12 +271,8 @@ class AIStockAssistant:
         today_refunds = all_refunds.filter(
             refunded_at__gte=today_lo, refunded_at__lt=today_hi,
         )
-        week_refunds = all_refunds.filter(
-            refunded_at__gte=week_lo, refunded_at__lt=week_hi,
-        )
-        month_refunds = all_refunds.filter(
-            refunded_at__gte=month_lo, refunded_at__lt=month_hi,
-        )
+        week_refunds = week_window.filter(all_refunds, 'refunded_at')
+        month_refunds = month_window.filter(all_refunds, 'refunded_at')
 
         def order_stats(volume_qs, sales_qs, refund_qs):
             volume = volume_qs.aggregate(
@@ -311,18 +310,15 @@ class AIStockAssistant:
         # ── Top products (30 days) ──
         month_items = OrderItem.objects.filter(
             is_deleted=False, order__is_deleted=False, order__is_paid=True,
-            order__paid_at__gte=month_lo, order__paid_at__lt=month_hi,
         )
+        month_items = month_window.filter(month_items, 'order__paid_at')
         month_items = scope_branch(month_items, context.branch_id, 'order__branch_id')
         today_items = OrderItem.objects.filter(
             is_deleted=False, order__is_deleted=False, order__is_paid=True,
             order__paid_at__gte=today_lo, order__paid_at__lt=today_hi,
         )
         today_items = scope_branch(today_items, context.branch_id, 'order__branch_id')
-        month_refund_items = refund_item_events(
-            refunded_at__gte=month_lo,
-            refunded_at__lt=month_hi,
-        )
+        month_refund_items = refund_item_events_in_window(month_window)
         month_refund_items = scope_branch(
             month_refund_items, context.branch_id, 'order__branch_id',
         )
@@ -377,9 +373,8 @@ class AIStockAssistant:
 
         # ── Cashier performance (30 days) ──
         cashier_volume = list(
-            all_orders.filter(
+            month_window.filter(all_orders, 'created_at').filter(
                 cashier__isnull=False,
-                created_at__gte=month_lo, created_at__lt=month_hi,
             ).values(
                 'cashier__id', 'cashier__first_name', 'cashier__last_name'
             ).annotate(
@@ -1052,26 +1047,23 @@ class AIStockAssistant:
         Dogs: low popularity + low margin
         """
         from stock.models import ProductStockLink
-        from base.services.business_day import business_date, range_window
+        from base.services.business_day import business_date, resolve_reporting_window
         context, context_error = resolve_ai_context(location_id)
         if context_error:
             return {"error": context_error, "items": [], "summary": {}}
         days = max(int(days or 30), 1)
         end_date = business_date()
         start_date = end_date - timedelta(days=days - 1)
-        lo, hi = range_window(start_date, end_date)
+        window = resolve_reporting_window(start_date, end_date)
 
         sale_items = OrderItem.objects.filter(
             is_deleted=False, order__is_deleted=False, order__is_paid=True,
-            order__paid_at__gte=lo, order__paid_at__lt=hi,
         )
+        sale_items = window.filter(sale_items, 'order__paid_at')
         sale_items = scope_branch(
             sale_items, context.branch_id, 'order__branch_id',
         )
-        refund_items = refund_item_events(
-            refunded_at__gte=lo,
-            refunded_at__lt=hi,
-        )
+        refund_items = refund_item_events_in_window(window)
         refund_items = scope_branch(
             refund_items, context.branch_id, 'order__branch_id',
         )
@@ -1382,24 +1374,23 @@ class AIStockAssistant:
     def _get_sales_velocity(cls, days: int = 30, location_id=None) -> Dict:
         """Sales velocity: per-product revenue trend over time."""
         from django.db.models import DateTimeField, ExpressionWrapper
-        from base.services.business_day import business_date, business_day_start, range_window
+        from base.services.business_day import (
+            business_date, business_day_start, resolve_reporting_window,
+        )
         context, context_error = resolve_ai_context(location_id)
         if context_error:
             return {"error": context_error, "products": [], "summary": {}}
         days = max(int(days or 30), 1)
         end_date = business_date()
         start_date = end_date - timedelta(days=days - 1)
-        lo, hi = range_window(start_date, end_date)
+        window = resolve_reporting_window(start_date, end_date)
 
         sales = OrderItem.objects.filter(
             is_deleted=False, order__is_deleted=False, order__is_paid=True,
-            order__paid_at__gte=lo, order__paid_at__lt=hi,
         )
+        sales = window.filter(sales, 'order__paid_at')
         sales = scope_branch(sales, context.branch_id, 'order__branch_id')
-        refunds = refund_item_events(
-            refunded_at__gte=lo,
-            refunded_at__lt=hi,
-        )
+        refunds = refund_item_events_in_window(window)
         refunds = scope_branch(
             refunds, context.branch_id, 'order__branch_id',
         )
