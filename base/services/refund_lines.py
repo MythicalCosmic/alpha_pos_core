@@ -51,6 +51,22 @@ def refund_item_events(item_queryset=None, **refund_filters):
     )
 
 
+def refund_item_events_in_window(window, item_queryset=None):
+    """Refund-line events scoped by a ReportingWindow without duplicate joins.
+
+    Applying a time predicate after ``refund_item_events`` can make Django add a
+    second reverse-refund JOIN. Multiple refund events would then multiply line
+    quantities/revenue. Filter event PKs first and feed that subquery into the
+    existing single ``FilteredRelation`` instead.
+    """
+    from base.models import OrderRefund
+
+    events = window.filter(
+        OrderRefund.objects.filter(is_deleted=False), 'refunded_at',
+    )
+    return refund_item_events(item_queryset, pk__in=events)
+
+
 def refund_line_revenue(refund_path='order__refund'):
     """Proportionally allocate a refund's money over its original order lines."""
     money = DecimalField(max_digits=24, decimal_places=6)

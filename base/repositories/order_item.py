@@ -6,11 +6,12 @@ from django.db.models.functions import Coalesce
 from django.utils import timezone
 from decimal import Decimal
 from base.repositories.base import BaseSyncRepository
+from base.repositories.order import _reporting_window_from_bounds, _window_queryset
 from base.models import OrderItem
 from base.services.revenue import net_line_revenue
 from base.services.refund_lines import (
-    REFUND_EVENT_ALIAS, refund_item_events, refund_line_quantity,
-    refund_line_revenue,
+    REFUND_EVENT_ALIAS, refund_item_events, refund_item_events_in_window,
+    refund_line_quantity, refund_line_revenue,
 )
 
 # How far back "top selling / popular" looks when ranking products.
@@ -69,10 +70,7 @@ class OrderItemRepository(BaseSyncRepository):
             is_deleted=False, order__is_deleted=False, order__is_paid=True,
             order__paid_at__isnull=False,
         )
-        if date_from:
-            qs = qs.filter(order__paid_at__gte=date_from)
-        if date_to:
-            qs = qs.filter(order__paid_at__lte=date_to)
+        qs = _window_queryset(qs, 'order__paid_at', date_from, date_to)
 
         sales = list(qs.values(
             'product_id', 'product__name', 'product__category__name'
@@ -123,10 +121,7 @@ class OrderItemRepository(BaseSyncRepository):
             is_deleted=False, order__is_deleted=False, order__is_paid=True,
             order__paid_at__isnull=False,
         )
-        if date_from:
-            qs = qs.filter(order__paid_at__gte=date_from)
-        if date_to:
-            qs = qs.filter(order__paid_at__lte=date_to)
+        qs = _window_queryset(qs, 'order__paid_at', date_from, date_to)
 
         sales = list(qs.values(
             'product_id', 'product__name', 'product__category__name'
@@ -152,10 +147,7 @@ class OrderItemRepository(BaseSyncRepository):
             is_deleted=False, order__is_deleted=False, order__is_paid=True,
             order__paid_at__isnull=False,
         )
-        if date_from:
-            qs = qs.filter(order__paid_at__gte=date_from)
-        if date_to:
-            qs = qs.filter(order__paid_at__lte=date_to)
+        qs = _window_queryset(qs, 'order__paid_at', date_from, date_to)
 
         sales = list(qs.values(
             'product__category_id', 'product__category__name'
@@ -176,12 +168,16 @@ class OrderItemRepository(BaseSyncRepository):
     def _net_refunded_item_rows(cls, sales, group_fields, date_from, date_to,
                                 *, sort_key, reverse, limit=None):
         """Merge refund-date negative line events into grouped product sales."""
-        refund_filters = {}
-        if date_from:
-            refund_filters['refunded_at__gte'] = date_from
-        if date_to:
-            refund_filters['refunded_at__lte'] = date_to
-        refund_items = refund_item_events(**refund_filters)
+        window = _reporting_window_from_bounds(date_from, date_to)
+        if window is not None:
+            refund_items = refund_item_events_in_window(window)
+        else:
+            refund_filters = {}
+            if date_from:
+                refund_filters['refunded_at__gte'] = date_from
+            if date_to:
+                refund_filters['refunded_at__lte'] = date_to
+            refund_items = refund_item_events(**refund_filters)
         refunds = list(refund_items.values(*group_fields).annotate(
             refund_qty=Sum(refund_line_quantity(REFUND_EVENT_ALIAS)),
             refund_revenue=Coalesce(

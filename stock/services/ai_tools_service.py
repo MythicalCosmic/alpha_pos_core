@@ -30,8 +30,8 @@ from stock.models import StockLevel, StockBatch, StockLocation
 from base.services.business_day import business_day_date_expr
 from base.services.revenue import net_line_revenue
 from base.services.refund_lines import (
-    REFUND_EVENT_ALIAS, refund_item_events, refund_line_quantity,
-    refund_line_revenue,
+    REFUND_EVENT_ALIAS, refund_item_events, refund_item_events_in_window,
+    refund_line_quantity, refund_line_revenue,
 )
 from stock.services.ai_context import (
     AIDataContext, current_cash_register, resolve_ai_context, scope_branch,
@@ -154,8 +154,9 @@ def _parse_uuid(value):
         return None
 
 
-# BUSINESS-DAY reporting uses a 03:00 cutover. Operational volume is attributed
-# by created_at; settled money and product sales are attributed by paid_at.
+# BUSINESS-DAY reporting uses the 07:00 -> next-day 03:00 operating window.
+# Operational volume is attributed by created_at; settled money and product
+# sales are attributed by paid_at.
 
 
 def _bd_today_window():
@@ -165,9 +166,15 @@ def _bd_today_window():
 
 
 def _bd_range_window(d_from, d_to):
-    """Aware [d_from@cutover, (d_to+1)@cutover) business-day window (inclusive)."""
+    """Outer bounds for a business-date range (single-day callers only)."""
     from base.services.business_day import range_window
     return range_window(d_from, d_to)
+
+
+def _bd_reporting_window(d_from, d_to):
+    """Canonical window that also removes intermediate quiet-time gaps."""
+    from base.services.business_day import resolve_reporting_window
+    return resolve_reporting_window(d_from, d_to)
 
 
 def _bd_today():
@@ -980,16 +987,19 @@ class AIToolbox:
               .select_related("cashier", "customer", "table", "place")
               .prefetch_related("items__product"))
         qs = _scope_orders(qs, args)
-        # Business-day window (03:00 cutover) so "orders on date X" matches the
-        # dashboard's day for X (a 01:00 sale belongs to the previous business day).
+        # A complete range is a union of operating days, excluding each
+        # intermediate 03:00-07:00 quiet gap.  Preserve legacy one-sided bounds.
         d = _parse_date(args.get("date"))
         df, dt = _parse_date(args.get("date_from")), _parse_date(args.get("date_to"))
         if d:
             df = dt = d
-        if df:
-            qs = qs.filter(created_at__gte=_bd_range_window(df, df)[0])
-        if dt:
-            qs = qs.filter(created_at__lt=_bd_range_window(dt, dt)[1])
+        if df and dt:
+            qs = _bd_reporting_window(df, dt).filter(qs, 'created_at')
+        else:
+            if df:
+                qs = qs.filter(created_at__gte=_bd_range_window(df, df)[0])
+            if dt:
+                qs = qs.filter(created_at__lt=_bd_range_window(dt, dt)[1])
         if args.get("status"):
             qs = qs.filter(status=str(args["status"]).upper())
         if args.get("order_type"):
@@ -1096,15 +1106,18 @@ class AIToolbox:
             qs = qs.filter(status=str(args["status"]).upper())
         if args.get("cashier_id"):
             qs = qs.filter(user_id=args["cashier_id"])
-        # Business-day window on shift start (03:00 cutover) to match reporting.
+        # Window shift starts by the same operating-date contract as orders.
         d = _parse_date(args.get("date"))
         df, dt = _parse_date(args.get("date_from")), _parse_date(args.get("date_to"))
         if d:
             df = dt = d
-        if df:
-            qs = qs.filter(start_time__gte=_bd_range_window(df, df)[0])
-        if dt:
-            qs = qs.filter(start_time__lt=_bd_range_window(dt, dt)[1])
+        if df and dt:
+            qs = _bd_reporting_window(df, dt).filter(qs, 'start_time')
+        else:
+            if df:
+                qs = qs.filter(start_time__gte=_bd_range_window(df, df)[0])
+            if dt:
+                qs = qs.filter(start_time__lt=_bd_range_window(dt, dt)[1])
         total = qs.count()
         limit = _clamp(args.get("limit"), 50, 1, MAX_ORDERS)
         offset = _clamp(args.get("offset"), 0, 0, _OFFSET_MAX)
@@ -1153,10 +1166,13 @@ class AIToolbox:
         if u is None:
             return {"error": "cashier not found", "args": args}
         data = _cashier_dict(u, branch_id=context.branch_id)
-        _lo, _hi = _bd_range_window(_bd_today() - timedelta(days=29), _bd_today())
-        perf_orders = Order.objects.filter(
-            is_deleted=False, cashier=u, created_at__gte=_lo, created_at__lt=_hi,
+        performance_window = _bd_reporting_window(
+            _bd_today() - timedelta(days=29), _bd_today(),
         )
+        perf_orders = Order.objects.filter(
+            is_deleted=False, cashier=u,
+        )
+        perf_orders = performance_window.filter(perf_orders, 'created_at')
         perf = scope_branch(perf_orders, context.branch_id).aggregate(
             orders=Count("id"),
             completed=Count("id", filter=Q(status="COMPLETED")),
@@ -1164,15 +1180,15 @@ class AIToolbox:
         )
         sales = Order.objects.filter(
             is_deleted=False, cashier=u, is_paid=True,
-            paid_at__gte=_lo, paid_at__lt=_hi,
         )
+        sales = performance_window.filter(sales, 'paid_at')
         sales = scope_branch(sales, context.branch_id).aggregate(
             revenue=Sum("total_amount"), avg=Avg("total_amount"),
         )
         refunds = OrderRefund.objects.filter(
             is_deleted=False, cashier=u,
-            refunded_at__gte=_lo, refunded_at__lt=_hi,
         )
+        refunds = performance_window.filter(refunds, 'refunded_at')
         refund_total = scope_branch(refunds, context.branch_id).aggregate(
             revenue=Sum('amount'),
         )['revenue'] or Decimal('0.00')
@@ -1258,23 +1274,27 @@ class AIToolbox:
         elif dt and not df:
             df = dt
 
-        # Business-day window (03:00 cutover). Operational volume belongs to the
-        # creation day; settled money and product sales belong to the payment day.
-        _lo, _hi = _bd_range_window(df, dt)
-        volume_orders = _scope_orders(Order.objects.filter(
-            is_deleted=False, created_at__gte=_lo, created_at__lt=_hi,
-        ), args)
-        sales_orders = _paid_orders_in(_lo, _hi, args)
-        refund_events = _refunds_in(_lo, _hi, args)
+        # Operational volume belongs to the creation day; settled money and
+        # product sales belong to the payment day.  The canonical filter also
+        # removes every intermediate 03:00-07:00 quiet gap.
+        report_window = _bd_reporting_window(df, dt)
+        _lo, _hi = report_window.start_at, report_window.end_at
+        volume_orders = report_window.filter(
+            _scope_orders(Order.objects.filter(is_deleted=False), args),
+            'created_at',
+        )
+        sales_orders = report_window.filter(
+            _paid_orders_in(_lo, _hi, args), 'paid_at',
+        )
+        refund_events = report_window.filter(
+            _refunds_in(_lo, _hi, args), 'refunded_at',
+        )
         items = OrderItem.objects.filter(
             is_deleted=False, order__is_deleted=False, order__is_paid=True,
-            order__paid_at__gte=_lo, order__paid_at__lt=_hi,
         )
+        items = report_window.filter(items, 'order__paid_at')
         items = scope_branch(items, context.branch_id, 'order__branch_id')
-        refund_items = refund_item_events(
-            refunded_at__gte=_lo,
-            refunded_at__lt=_hi,
-        )
+        refund_items = refund_item_events_in_window(report_window)
         refund_items = scope_branch(
             refund_items, context.branch_id, 'order__branch_id',
         )

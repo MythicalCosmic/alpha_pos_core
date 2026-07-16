@@ -12,7 +12,9 @@ from base.models import (
     CashRegister, Category, Customer, Order, OrderItem, OrderPayment,
     OrderRefund, Product, Shift, User,
 )
-from base.services.business_day import business_date
+from base.repositories.order import OrderRepository
+from base.repositories.order_item import OrderItemRepository
+from base.services.business_day import business_date, resolve_reporting_window
 from stock.models import (
     AIBriefing, ProductComponentStock, ProductStockLink, PurchaseOrder, Recipe,
     RecipeIngredient, StockItem, StockLevel, StockLocation, StockTransaction,
@@ -114,6 +116,90 @@ def _stock_units():
         is_base_unit=True, decimal_places=4,
     )
     return gram, kilogram, piece
+
+
+@override_settings(DEPLOYMENT_MODE='cloud', BRANCH_ID='cloud')
+def test_multiday_ai_and_repository_reports_exclude_quiet_gap_boundaries():
+    """04:00 between selected business dates is not reportable; 07:00 is."""
+    user = _user('operating-window@test.local')
+    location = StockLocation.objects.create(
+        name='Operating window', type=StockLocation.LocationType.KITCHEN,
+        branch_id='branch-a',
+    )
+    category = Category.objects.create(name='Window food', branch_id='branch-a')
+    product = Product.objects.create(
+        name='Boundary burger', category=category, price='100',
+        branch_id='branch-a',
+    )
+    date_from = business_date() - timedelta(days=2)
+    date_to = date_from + timedelta(days=1)
+
+    quiet = _local_at(date_to, 4)
+    opened = _local_at(date_to, 7)
+    quiet_order = _order(
+        user, total='900', created_at=quiet, paid_at=quiet, display_id=20,
+    )
+    opened_order = _order(
+        user, total='100', created_at=opened, paid_at=opened, display_id=21,
+    )
+    OrderItem.objects.create(
+        order=quiet_order, product=product, quantity=9, price='100',
+        branch_id='branch-a',
+    )
+    OrderItem.objects.create(
+        order=opened_order, product=product, quantity=1, price='100',
+        branch_id='branch-a',
+    )
+    Shift.objects.create(
+        user=user, branch_id='branch-a', status=Shift.Status.ENDED,
+        start_time=quiet, end_time=quiet + timedelta(minutes=30),
+    )
+    opened_shift = Shift.objects.create(
+        user=user, branch_id='branch-a', status=Shift.Status.ENDED,
+        start_time=opened, end_time=opened + timedelta(minutes=30),
+    )
+
+    args = {
+        'date_from': date_from.isoformat(),
+        'date_to': date_to.isoformat(),
+    }
+    listed = json.loads(AIToolbox.execute('list_orders', args, location.id))
+    listed_shifts = json.loads(AIToolbox.execute('list_shifts', args, location.id))
+    report = json.loads(AIToolbox.execute('sales_report', args, location.id))
+    snapshot = AIStockAssistant._get_sales_data(location.id)
+    menu = AIStockAssistant._get_menu_engineering(3, location.id)
+    velocity = AIStockAssistant._get_sales_velocity(3, location.id)
+
+    assert listed['total_matching'] == 1
+    assert [row['uuid'] for row in listed['orders']] == [str(opened_order.uuid)]
+    assert listed_shifts['total_matching'] == 1
+    assert [row['id'] for row in listed_shifts['shifts']] == [opened_shift.id]
+    assert report['totals']['orders'] == 1
+    assert report['totals']['paid_orders'] == 1
+    assert report['totals']['paid_revenue_uzs'] == 100.0
+    assert report['top_products'][0]['qty'] == 1
+    assert snapshot['this_week']['count'] == 1
+    assert snapshot['this_week']['total_revenue_uzs'] == 100.0
+    assert snapshot['this_month']['count'] == 1
+    assert menu['items'][0]['qty_sold'] == 1
+    assert velocity['products'][0]['total_qty'] == 1
+
+    # The legacy repository APIs receive inclusive bounds. They must recover
+    # the same canonical window without changing their response shapes.
+    window = resolve_reporting_window(date_from, date_to)
+    inclusive_end = window.end_at - timedelta(microseconds=1)
+    aggregate = OrderRepository.get_stats_aggregate(
+        window.start_at, inclusive_end,
+    )
+    ranked = OrderItemRepository.get_top_products(
+        window.start_at, inclusive_end,
+    )
+
+    assert aggregate['total'] == 1
+    assert aggregate['paid'] == 1
+    assert aggregate['total_revenue'] == Decimal('100.00')
+    assert ranked[0]['total_qty'] == 1
+    assert ranked[0]['total_revenue'] == Decimal('100.00')
 
 
 @override_settings(DEPLOYMENT_MODE='cloud', BRANCH_ID='cloud')
