@@ -1,4 +1,3 @@
-from django.conf import settings
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_POST, require_http_methods
@@ -6,7 +5,10 @@ from base.helpers.request import parse_json_body
 from base.helpers.response import json_response, ServiceResponse
 from base.security.rate_limit import rate_limit
 from base.security.permissions import admin_required
-from stock.services.ai_assistant_service import AIStockAssistant
+from stock.services.ai_assistant_service import (
+    AI_NOT_CONFIGURED_MESSAGE,
+    AI_REQUEST_RATE_LIMIT_MESSAGE,
+)
 from stock.services.ai_chat_service import AIChatService
 
 
@@ -16,7 +18,13 @@ from stock.services.ai_chat_service import AIChatService
 # allows. Cap to 10/min per IP; normal interactive use is far below that.
 @csrf_exempt
 @require_POST
-@rate_limit('ai_query', 10, 60)
+@rate_limit('ai_query', 10, 60, error_payload={
+    'error': 'rate_limited',
+    'error_source': 'alpha_pos',
+    'retryable': True,
+    'response': AI_REQUEST_RATE_LIMIT_MESSAGE,
+    'message': AI_REQUEST_RATE_LIMIT_MESSAGE,
+})
 @admin_required
 def ai_query(request):
     # The assistant calls the configured LLM provider (Claude by default, or
@@ -28,7 +36,11 @@ def ai_query(request):
     if key_missing():
         return JsonResponse({
             'success': False,
-            'message': 'AI assistant is not configured (LLM API key missing).',
+            'error': 'no_api_key',
+            'error_source': 'configuration',
+            'retryable': False,
+            'response': AI_NOT_CONFIGURED_MESSAGE,
+            'message': AI_NOT_CONFIGURED_MESSAGE,
         }, status=503)
 
     data, error = parse_json_body(request)
@@ -56,6 +68,14 @@ def ai_query(request):
     )
     if isinstance(result, dict) and result.get('chat_id') is not None:
         result.setdefault('conversation_id', result['chat_id'])
+    if isinstance(result, dict) and not result.get('success'):
+        # ``response`` is consumed by the chat bubble while ``message`` is used
+        # by the shared non-2xx handler. Keep them identical so a 429/503 never
+        # degrades into a translated generic error in the frontend.
+        user_message = result.get('response') or result.get('message')
+        if user_message:
+            result['response'] = user_message
+            result['message'] = user_message
     # Map service-layer error codes to real HTTP status codes so clients can
     # switch on response.status instead of having to parse the body. Without
     # this every failure (rate limit, invalid query, quota exhausted) comes

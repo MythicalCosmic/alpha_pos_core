@@ -72,12 +72,36 @@ _HARD_MARKERS = (
     'invalid api key', 'incorrect api key', 'invalid_api_key',
 )
 
+# Provider errors that should be explained to the operator specifically as a
+# provider-side capacity/rate-limit problem. Keep this narrower than
+# ``_TRANSIENT_MARKERS``: a plain network timeout or generic 503 is retryable but
+# is not necessarily a rate limit. SDKs spell the same condition in several
+# ways (OpenAI/Anthropic use 429/529; Gemini commonly uses RESOURCE_EXHAUSTED or
+# "high demand").
+_PROVIDER_RATE_LIMIT_MARKERS = (
+    '429', '529', 'rate_limit', 'rate limit', 'too many requests',
+    'resource_exhausted', 'overloaded', 'high demand',
+)
+
 
 def _is_transient(err) -> bool:
     e = (err or '').lower()
     if any(m in e for m in _HARD_MARKERS):
         return False
     return any(m in e for m in _TRANSIENT_MARKERS)
+
+
+def is_provider_rate_limited(err) -> bool:
+    """Return whether *err* is a provider-side rate/capacity limit.
+
+    Billing, quota-credit and invalid-key failures sometimes include HTTP 429,
+    but are configuration problems rather than a temporary rate limit, so hard
+    markers take precedence. Raw provider errors stay server-side.
+    """
+    error = (err or '').lower()
+    if any(marker in error for marker in _HARD_MARKERS):
+        return False
+    return any(marker in error for marker in _PROVIDER_RATE_LIMIT_MARKERS)
 
 
 def _timeout_seconds():

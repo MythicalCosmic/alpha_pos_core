@@ -4,7 +4,6 @@ import math
 from django.db.models import Sum, Count, F, Q, Avg, Max
 from django.db.models.functions import Abs, TruncHour, TruncWeek
 from django.utils import timezone
-from django.conf import settings
 import json
 
 from stock.models import (
@@ -27,6 +26,47 @@ from stock.services.ai_context import (
     current_cash_register, resolve_ai_context, scope_branch,
     scope_location_owned, scope_optional_location_owned,
 )
+
+
+# Public AI-chat error messages. Provider exception details remain in server
+# logs because they can contain request IDs, model/account data, URLs or SDK
+# internals. Every AI failure returns the chosen text under both ``response``
+# (chat bubble) and ``message`` (standard HTTP error handler).
+AI_PROVIDER_RATE_LIMIT_MESSAGE = (
+    "The AI provider is temporarily rate-limiting requests. "
+    "Please wait a moment and try again."
+)
+AI_PROVIDER_ERROR_MESSAGE = (
+    "The AI provider could not process your request right now. "
+    "Please try again in a moment. If the problem continues, contact an administrator."
+)
+AI_ASSISTANT_ERROR_MESSAGE = (
+    "The AI assistant could not complete your request right now. "
+    "Please try again. If the problem continues, contact an administrator."
+)
+AI_NOT_CONFIGURED_MESSAGE = (
+    "The AI assistant is not configured. Please ask an administrator to configure "
+    "the AI provider."
+)
+AI_REQUEST_RATE_LIMIT_MESSAGE = (
+    "Too many AI requests were sent in a short period. "
+    "Please wait one minute and try again."
+)
+
+
+def _ai_error_payload(error, message, *, source, retryable, suggestions=None):
+    """Build the stable, user-ready failure shape for AI chat responses."""
+    payload = {
+        "success": False,
+        "error": error,
+        "error_source": source,
+        "retryable": retryable,
+        "response": message,
+        "message": message,
+    }
+    if suggestions:
+        payload["suggestions"] = suggestions
+    return payload
 
 
 SYSTEM_PROMPT = """You are an expert AI business analyst and assistant for a restaurant/retail POS system in Uzbekistan.
@@ -1616,24 +1656,23 @@ class AIStockAssistant:
                       location_id: int = None, history=None,
                       repeat_count: int = 0) -> Dict[str, Any]:
         if not isinstance(query, str) or not query.strip():
-            return {
-                "success": False,
-                "error": "invalid_query",
-                "response": "Query must be a non-empty string.",
-            }
+            return _ai_error_payload(
+                "invalid_query", "Query must be a non-empty string.",
+                source="request", retryable=False,
+            )
         if len(query) > cls.MAX_QUERY_LENGTH:
-            return {
-                "success": False,
-                "error": "query_too_long",
-                "response": f"Query exceeds {cls.MAX_QUERY_LENGTH}-character limit.",
-            }
+            return _ai_error_payload(
+                "query_too_long",
+                f"Query exceeds {cls.MAX_QUERY_LENGTH}-character limit.",
+                source="request", retryable=False,
+            )
         ok, quota = cls._check_rate_limit(user_id)
         if not ok:
-            return {
-                "success": False,
-                "error": "rate_limited",
-                "response": f"Daily AI query quota exceeded ({quota} per day).",
-            }
+            return _ai_error_payload(
+                "rate_limited",
+                f"Daily AI query quota exceeded ({quota} per day).",
+                source="alpha_pos", retryable=False,
+            )
         try:
             from base.services.llm import call_ai, call_ai_tools, can_use_tools
 
@@ -1699,36 +1738,32 @@ Respond to the user's query based on this data. Follow all language and formatti
 
                 text, err = call_ai(prompt, system=SYSTEM_PROMPT, max_tokens=2048, history=history)
             if err == 'llm_key_missing':
-                return {
-                    "success": False,
-                    "error": "no_api_key",
-                    "response": "AI API key not configured. Add it in the desktop panel (AI section).",
-                    "suggestions": ["Add the AI API key"],
-                }
+                return _ai_error_payload(
+                    "no_api_key", AI_NOT_CONFIGURED_MESSAGE,
+                    source="configuration", retryable=False,
+                    suggestions=["Configure the AI provider"],
+                )
             if err == 'llm_sdk_missing':
-                return {
-                    "success": False,
-                    "error": "internal_error",
-                    "response": "The AI assistant is temporarily unavailable.",
-                    "suggestions": ["Try again"],
-                }
+                return _ai_error_payload(
+                    "internal_error", AI_ASSISTANT_ERROR_MESSAGE,
+                    source="alpha_pos", retryable=True,
+                    suggestions=["Try again"],
+                )
             if err:
-                low = err.lower()
-                if "429" in err or "rate_limit" in low or "overloaded" in low:
-                    return {
-                        "success": False,
-                        "error": "quota_exceeded",
-                        "response": "AI rate limit reached. Please wait a moment and try again.",
-                        "suggestions": ["Try again later"],
-                    }
+                from base.services.llm import is_provider_rate_limited
+                if is_provider_rate_limited(err):
+                    return _ai_error_payload(
+                        "quota_exceeded", AI_PROVIDER_RATE_LIMIT_MESSAGE,
+                        source="ai_provider", retryable=True,
+                        suggestions=["Try again later"],
+                    )
                 # Don't echo raw exception text — it leaks internals. Full trace
                 # is logged inside call_claude().
-                return {
-                    "success": False,
-                    "error": "internal_error",
-                    "response": "The AI assistant is temporarily unavailable.",
-                    "suggestions": ["Try again", "Stock overview"],
-                }
+                return _ai_error_payload(
+                    "internal_error", AI_PROVIDER_ERROR_MESSAGE,
+                    source="ai_provider", retryable=True,
+                    suggestions=["Try again", "Stock overview"],
+                )
 
             return {
                 "success": True,
@@ -1742,12 +1777,11 @@ Respond to the user's query based on this data. Follow all language and formatti
             # Don't echo raw exception text — it leaks ORM model names, file
             # paths, and SDK-internal details to the client. The full trace
             # is in the server log via the .exception() call above.
-            return {
-                "success": False,
-                "error": "internal_error",
-                "response": "The AI assistant is temporarily unavailable.",
-                "suggestions": ["Try again", "Stock overview"]
-            }
+            return _ai_error_payload(
+                "internal_error", AI_ASSISTANT_ERROR_MESSAGE,
+                source="alpha_pos", retryable=True,
+                suggestions=["Try again", "Stock overview"],
+            )
 
     @classmethod
     def _get_suggestions(cls, query: str) -> List[str]:
@@ -1763,4 +1797,11 @@ Respond to the user's query based on this data. Follow all language and formatti
         return ["ABC-XYZ analysis", "Menu engineering", "Today's sales", "Business recommendations"]
 
 
-__all__ = ['AIStockAssistant']
+__all__ = [
+    'AIStockAssistant',
+    'AI_PROVIDER_RATE_LIMIT_MESSAGE',
+    'AI_PROVIDER_ERROR_MESSAGE',
+    'AI_ASSISTANT_ERROR_MESSAGE',
+    'AI_NOT_CONFIGURED_MESSAGE',
+    'AI_REQUEST_RATE_LIMIT_MESSAGE',
+]

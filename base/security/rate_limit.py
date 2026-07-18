@@ -38,7 +38,12 @@ def _check_and_incr(key, max_attempts, window):
     return None
 
 
-def rate_limit(key_prefix, max_attempts, window):
+def rate_limit(key_prefix, max_attempts, window, error_payload=None):
+    """Rate-limit a view by source IP.
+
+    ``error_payload`` lets an endpoint provide its own user-ready error contract
+    while preserving the historical response everywhere else.
+    """
     def decorator(view_func):
         @wraps(view_func)
         def wrapper(request, *args, **kwargs):
@@ -47,8 +52,11 @@ def rate_limit(key_prefix, max_attempts, window):
                 f"rl:{key_prefix}:{ip}", max_attempts, window,
             )
             if retry_after is not None:
+                body = {"success": False, "message": "Too many requests"}
+                if error_payload:
+                    body.update(dict(error_payload))
                 return JsonResponse(
-                    {"success": False, "message": "Too many requests"},
+                    body,
                     status=429,
                     headers={"Retry-After": str(retry_after)},
                 )
