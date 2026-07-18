@@ -52,4 +52,6 @@ def test_tod_filter_supports_overnight_windows():
         time(2, 0),
     ).values_list('id', flat=True))
 
-    assert matched == {rows['late'], rows['early'], rows['end']}
+    # Reporting windows are uniformly half-open [start, end): the exact end
+    # boundary belongs to the next/non-operating window.
+    assert matched == {rows['late'], rows['early']}
