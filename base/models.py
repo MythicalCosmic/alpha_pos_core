@@ -1530,6 +1530,7 @@ class Inkassa(SyncMixin, models.Model):
         CASH = "CASH", "Cash"
         UZCARD = "UZCARD", "Uzcard"
         HUMO = "HUMO", "Humo"
+        CARD = "CARD", "Card"
         PAYME = "PAYME", "Payme"
 
     amount = models.DecimalField(max_digits=12, decimal_places=2)
@@ -1549,10 +1550,30 @@ class Inkassa(SyncMixin, models.Model):
     # from the owning branch register. Historical inkassa rows default False,
     # so deploying this protocol never re-applies old collections.
     register_command = models.BooleanField(default=False)
+    # Treasury allocation under the reconciliation-first lifecycle:
+    #   settlement_offset_amount = this collection already recognized in SAFE
+    #     by per-shift manager reconciliation (audit/physical movement only)
+    #   legacy_treasury_amount = provably unrecognized excess posted to SAFE now
+    # Their sum equals amount for rows allocated by upgraded code. Historical
+    # rows remain unstamped because they were processed by the legacy lifecycle.
+    settlement_offset_amount = models.DecimalField(
+        max_digits=12, decimal_places=2, default=0,
+    )
+    legacy_treasury_amount = models.DecimalField(
+        max_digits=12, decimal_places=2, default=0,
+    )
+    treasury_allocated_at = models.DateTimeField(null=True, blank=True)
+    # Shared by every tender row created by one manager collection request.
+    # Non-cash collection requires a client-supplied key; the conditional
+    # unique constraint below makes service-level retries idempotent even when
+    # they bypass the HTTP response cache.
+    collection_batch_key = models.CharField(max_length=128, blank=True, default='')
+    collection_payload_hash = models.CharField(max_length=64, blank=True, default='')
     notes = models.TextField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     objects = SyncManager()
+    _sync_append_only = True
 
     # Inkassa is a cash-history record. The amounts, balances, and
     # collected-revenue numbers must never be set from a peer push — they
@@ -1561,10 +1582,45 @@ class Inkassa(SyncMixin, models.Model):
     # its financial figures.
     SYNC_WRITE_DENYLIST = frozenset({
         'amount', 'balance_before', 'balance_after', 'total_revenue',
+        'settlement_offset_amount', 'legacy_treasury_amount',
+        'treasury_allocated_at',
     })
     # A branch may create ordinary local history, but only the cloud admin path
     # may turn a row into an authoritative cash-removal command.
-    SYNC_DENY_FROM_BRANCH = frozenset({'register_command'})
+    SYNC_DENY_FROM_BRANCH = frozenset({
+        'amount', 'inkass_type', 'register_command',
+        'settlement_offset_amount',
+        'legacy_treasury_amount', 'treasury_allocated_at',
+        'collection_batch_key', 'collection_payload_hash',
+    })
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['branch_id', 'collection_batch_key', 'inkass_type'],
+                condition=~models.Q(collection_batch_key=''),
+                name='uniq_inkassa_branch_batch_tender',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(treasury_allocated_at__isnull=True)
+                    | models.Q(
+                        amount=(
+                            models.F('settlement_offset_amount')
+                            + models.F('legacy_treasury_amount')
+                        ),
+                    )
+                ),
+                name='inkassa_allocated_amount_reconciles',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(settlement_offset_amount__gte=0)
+                    & models.Q(legacy_treasury_amount__gte=0)
+                ),
+                name='inkassa_allocations_nonnegative',
+            ),
+        ]
 
     def to_sync_dict(self):
         data = super().to_sync_dict()
@@ -1767,8 +1823,10 @@ class Inkassa(SyncMixin, models.Model):
 class TreasuryAccount(SyncMixin, models.Model):
     """A money pot the business holds outside the till drawer.
 
-    SAFE = physical cash moved out of the registers by inkassa.
-    BANK = electronic money (card / Payme settlements).
+    SAFE = manager-confirmed shift proceeds. Every confirmed tender is posted
+    here at reconciliation; a later inkassa is only the physical register
+    movement/audit trail and must not recognize the proceeds a second time.
+    BANK = explicit transfers and bank-funded expenses outside shift handover.
     One (soft-undeleted) row per kind; read/created via get_or_create.
     """
     class Kind(models.TextChoices):
@@ -1846,12 +1904,46 @@ class TreasuryTransaction(SyncMixin, models.Model):
     # coherently either. Per-branch state — never sync it. See TreasuryAccount.
     _sync_local_only = True
     _sync_ingest_disabled = True
+    _sync_append_only = True
 
     class Meta:
         ordering = ['-created_at']
+        constraints = [
+            # One authoritative SAFE recognition per shift+tender.  The
+            # reconciliation service also row-locks the Shift, but this keeps
+            # the append-only ledger safe from any future writer that bypasses
+            # that service.
+            models.UniqueConstraint(
+                fields=['reference_id', 'category'],
+                condition=(
+                    models.Q(type='SHIFT_DEPOSIT')
+                    & models.Q(reference_type='ShiftSettlement')
+                ),
+                name='uniq_shift_tender_safe_post',
+            ),
+            models.UniqueConstraint(
+                fields=['reference_id'],
+                condition=(
+                    models.Q(type='INKASSA')
+                    & models.Q(reference_type='InkassaLegacy')
+                ),
+                name='uniq_legacy_inkassa_safe_post',
+            ),
+        ]
 
     def __str__(self):
         return f"{self.type} {self.delta} ({self.account_id})"
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            raise TypeError('TreasuryTransaction is append-only and cannot be updated')
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise TypeError('TreasuryTransaction is append-only and cannot be deleted')
+
+    def hard_delete(self, *args, **kwargs):
+        raise TypeError('TreasuryTransaction is append-only and cannot be deleted')
 
 
 def _default_business_day_start():
@@ -1955,10 +2047,32 @@ class Shift(SyncMixin, models.Model):
     total_revenue = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     cash_collected = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     notes = models.TextField(blank=True, default='')
+    # Rollout eligibility for the reconciliation->SAFE lifecycle. Migration
+    # 0048 leaves every already-ended historical shift false because its money
+    # may already have reached treasury through legacy Inkassa and cannot be
+    # linked safely. Upgraded ShiftService.start_shift explicitly sets true.
+    # Fail-closed default=False is intentional: a pre-upgrade offline branch
+    # can sync an old shift after rollout without this new field, and that row
+    # must never become eligible merely because it arrived late.
+    treasury_settlement_eligible = models.BooleanField(default=False)
+    # Local close handshake. The Shift row intentionally syncs before its
+    # child ShiftPaymentTotal/CashboxExpense rows; cloud reconciliation must
+    # compare those children with this frozen manifest and refuse to post until
+    # the complete bundle has arrived.
+    settlement_manifest = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     objects = SyncManager()
+    SYNC_IMMUTABLE_FROM_BRANCH_AFTER_SET = frozenset({'settlement_manifest'})
+    SYNC_CREATE_ONLY_FROM_BRANCH = frozenset({'treasury_settlement_eligible'})
+    # Once the close handshake exists, the branch cannot move the economic
+    # window/owner/totals or revert cloud COMPLETED back to ENDED. The first
+    # close update is still accepted while the current manifest is empty.
+    SYNC_IMMUTABLE_FROM_BRANCH_AFTER_MANIFEST = frozenset({
+        'user', 'start_time', 'end_time', 'status', 'total_orders',
+        'total_revenue', 'cash_collected',
+    })
 
     class Meta:
         ordering = ['-start_time']
@@ -1993,9 +2107,18 @@ class CashReconciliation(SyncMixin, models.Model):
     reconciled_by = models.ForeignKey(
         User, on_delete=models.SET_NULL, null=True, related_name='reconciliations',
     )
+    # Rollout boundary for the manager-confirmation treasury lifecycle. Legacy
+    # reconciliations remain null because their proceeds may already have been
+    # credited by the old Inkassa path; retrying one must never backfill and
+    # double-credit SAFE. New reconciliations stamp this atomically with their
+    # per-tender SHIFT_DEPOSIT rows (including a zero-total settlement).
+    treasury_posted_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     objects = SyncManager()
+    _sync_append_only = True
+    _sync_ingest_disabled = True
+    SYNC_DENY_FROM_BRANCH = frozenset({'treasury_posted_at'})
 
     class Meta:
         ordering = ['-created_at']

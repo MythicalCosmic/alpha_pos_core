@@ -22,6 +22,7 @@ def _shift(user):
         start_time=timezone.now(),
         status='ACTIVE',
         branch_id=user.branch_id,
+        treasury_settlement_eligible=True,
     )
 
 
@@ -154,11 +155,11 @@ class TestCashboxExpenseRecipients:
 
 
 class TestShiftSettlement:
-    def test_close_and_confirm_freezes_without_double_posting_treasury(self):
-        from base.models import TreasuryTransaction
+    def test_close_and_confirm_freezes_and_posts_all_tenders_to_safe(self):
+        from base.models import TreasuryAccount, TreasuryTransaction
         from core.shifts.service import ShiftService
         from cashbox.models import ShiftPaymentTotal
-        u = _user(); s = _shift(u)
+        u = _user(role='MANAGER'); s = _shift(u)
         _paid_cash_order(u, Decimal('100000'), 'CASH')
         _paid_cash_order(u, Decimal('40000'), 'UZCARD')
         res, st = ShiftService.end_shift(
@@ -178,18 +179,25 @@ class TestShiftSettlement:
         assert st == 201, res
         s.refresh_from_db()
         assert s.status == 'COMPLETED'
-        # Reconcile is an audit boundary. Inkassa remains the one and only
-        # drawer/bank -> treasury movement, so these sales are not pre-booked.
-        assert TreasuryTransaction.objects.count() == 0
+        assert TreasuryAccount.objects.get(kind='SAFE').balance == Decimal('140000.00')
+        assert not TreasuryAccount.objects.filter(kind='BANK').exists()
+        assert TreasuryTransaction.objects.filter(
+            type='SHIFT_DEPOSIT', reference_type='ShiftSettlement',
+        ).count() == 2
+        assert res['data']['treasury_posting']['total'] == '140000.00'
 
 
 class TestShiftPaymentTotalSync:
-    """ShiftPaymentTotal is identified by (shift, method); sync must reconcile a
-    new-uuid record onto the existing row instead of an INSERT that trips
-    uniq_shift_method_active. And a tombstone whose shift is gone is skipped."""
+    """ShiftPaymentTotal is immutable close evidence.
+
+    A natural-key collision under another UUID is not permission to rewrite the
+    first event; it is acknowledged as a safe no-op and later manifest
+    verification fails closed if the branch committed the conflicting UUID.
+    A tombstone whose shift is gone is likewise skipped.
+    """
 
     @override_settings(DEPLOYMENT_MODE='cloud')
-    def test_collision_reconciles_not_duplicates(self):
+    def test_collision_preserves_first_immutable_event_without_duplicate(self):
         import uuid as _uuid
         from cashbox.models import ShiftPaymentTotal
         from base.services.sync.receiver import CloudReceiver
@@ -209,10 +217,11 @@ class TestShiftPaymentTotalSync:
             'confirmed_amount': '0', 'difference': '0',
         }])
         assert result['errors'] == [], result['errors']
+        assert result['skipped'] == 1
         assert ShiftPaymentTotal.objects.filter(shift=s, method='CASH').count() == 1
         row = ShiftPaymentTotal.objects.get(shift=s, method='CASH')
-        assert str(row.uuid) == incoming                 # reconciled onto existing
-        assert row.expected_amount == Decimal('250.00')  # cloud accepts branch money
+        assert str(row.uuid) != incoming
+        assert row.expected_amount == Decimal('100.00')
 
     def test_tombstone_with_missing_shift_is_skipped(self):
         import uuid as _uuid

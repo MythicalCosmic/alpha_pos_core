@@ -6,13 +6,16 @@ Design (see the Money & Shift Logic spec):
     since shift start), so there is no stored running-balance column to drift.
   * At shift close the cashier counts each tender type; ShiftPaymentTotal
     freezes expected/counted/difference per method and manager reconciliation
-    confirms that evidence. Inkassa is the sole later SAFE/BANK movement.
+    confirms that evidence and posts every confirmed tender to SAFE exactly
+    once. Later inkassa is physical register movement/audit only.
   * CashboxExpense is money paid OUT of the drawer (its own model, not hr.Expense).
 
 Money fields carry SYNC_WRITE_DENYLIST so a branch only ever owns its own
 drawer figures — a pulled peer/cloud copy can't rewrite them (the cloud, the
 trusted aggregator, still accepts them). Mirrors base.Order.
 """
+from decimal import Decimal, InvalidOperation
+
 from django.db import models
 
 from base.models import SyncMixin, SyncManager
@@ -52,13 +55,27 @@ class ShiftPaymentTotal(SyncMixin, models.Model):
 
     # Branch-owned money — never let a pulled peer copy overwrite a till's
     # own settlement figures (the cloud aggregator still accepts them).
-    SYNC_WRITE_DENYLIST = frozenset({
-        'expected_amount', 'counted_amount', 'confirmed_amount', 'difference',
-    })
+    # A close row is immutable evidence once created. Cloud receive may create
+    # it once from the owning branch, but a later branch push cannot rewrite or
+    # tombstone it after the manager has posted the shift. The one trusted
+    # cloud->branch update is manager ``confirmed_amount`` (see receiver).
+    _sync_append_only = True
+    SYNC_APPEND_ONLY_TRUSTED_UPDATE_FIELDS = frozenset({'confirmed_amount'})
 
-    # (shift, method) is the real identity: reconcile an incoming row onto the
-    # existing one for the same shift+tender instead of INSERTing a duplicate
-    # that trips uniq_shift_method_active. 'shift' is resolved from shift_uuid.
+    # On cloud->branch pull preserve locally frozen close figures, while still
+    # delivering the cloud manager's confirmation.
+    SYNC_WRITE_DENYLIST = frozenset({
+        'expected_amount', 'counted_amount', 'difference',
+    })
+    # On branch->cloud create confirmed defaults to zero; only the manager API
+    # is authoritative for this field. Updates are refused wholesale by the
+    # append-only policy.
+    SYNC_DENY_FROM_BRANCH = frozenset({'confirmed_amount'})
+
+    # (shift, method) prevents duplicate active tender rows. A same-natural-key
+    # event under another UUID is a conflict, not an overwrite opportunity: the
+    # receiver preserves the first immutable row and manifest verification
+    # fails closed when the branch committed a different UUID.
     SYNC_NATURAL_KEYS = ('shift', 'method')
 
     objects = SyncManager()
@@ -77,6 +94,35 @@ class ShiftPaymentTotal(SyncMixin, models.Model):
         data = super().to_sync_dict()
         data['shift_uuid'] = str(self.shift.uuid) if self.shift else None
         return data
+
+    @classmethod
+    def branch_sync_create_allowed(cls, *, uuid_val, values, resolved_fks):
+        """After close, accept only the exact SPT committed by the manifest.
+
+        Append-only protects existing rows, but without this guard a branch
+        could add a brand-new tender UUID/method after manager posting and make
+        shift analytics disagree with the immutable treasury ledger.
+        """
+        shift = resolved_fks.get('shift')
+        manifest = getattr(shift, 'settlement_manifest', None) if shift else None
+        if not manifest:
+            return True
+
+        def money(value):
+            try:
+                amount = Decimal(str(value)).quantize(Decimal('0.01'))
+            except (InvalidOperation, TypeError, ValueError):
+                return None
+            return str(amount) if amount.is_finite() else None
+
+        candidate = {
+            'uuid': str(uuid_val),
+            'method': str(values.get('method') or ''),
+            'expected': money(values.get('expected_amount')),
+            'counted': money(values.get('counted_amount')),
+            'difference': money(values.get('difference')),
+        }
+        return candidate in (manifest.get('tenders') or [])
 
     def __str__(self):
         return f"{self.shift_id}:{self.method} exp={self.expected_amount}"

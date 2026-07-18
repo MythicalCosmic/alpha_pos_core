@@ -1,3 +1,5 @@
+import hashlib
+import json
 import logging
 from decimal import Decimal, InvalidOperation
 from django.conf import settings
@@ -29,6 +31,267 @@ def _money(value):
 def _nonnegative_money(value):
     amount = _money(value)
     return amount if amount is not None and amount >= 0 else None
+
+
+def _is_global_admin(actor):
+    role = str(getattr(actor, 'role', '') or '').upper()
+    branch = str(getattr(actor, 'branch_id', '') or '').strip().lower()
+    return role == 'ADMIN' and branch in ('', 'cloud')
+
+
+def _effective_actor_branch(actor):
+    branch = str(getattr(actor, 'branch_id', '') or '').strip()
+    if not branch and getattr(settings, 'DEPLOYMENT_MODE', 'local') != 'cloud':
+        branch = str(getattr(settings, 'BRANCH_ID', '') or '').strip()
+    return branch
+
+
+def _actor_can_access_shift(actor, shift):
+    """Branch-aware shift access shared by detail/end operations."""
+    if actor is None or _is_global_admin(actor):
+        return True
+    role = str(getattr(actor, 'role', '') or '').upper()
+    actor_branch = _effective_actor_branch(actor)
+    shift_branch = str(getattr(shift, 'branch_id', '') or '').strip()
+    if role in ('ADMIN', 'MANAGER'):
+        return bool(actor_branch) and actor_branch == shift_branch
+    return (
+        bool(actor_branch)
+        and actor_branch == shift_branch
+        and getattr(actor, 'id', None) == getattr(shift, 'user_id', None)
+    )
+
+
+def _scope_shift_queryset(qs, actor):
+    """Apply actor ownership before pagination or global summary aggregation."""
+    if actor is None or _is_global_admin(actor):
+        return qs
+    role = str(getattr(actor, 'role', '') or '').upper()
+    actor_branch = _effective_actor_branch(actor)
+    if not actor_branch:
+        return qs.none()
+    qs = qs.filter(branch_id=actor_branch)
+    if role not in ('ADMIN', 'MANAGER'):
+        qs = qs.filter(user_id=getattr(actor, 'id', None))
+    return qs
+
+
+def _manifest_money(value):
+    amount = _money(value)
+    if amount is None:
+        raise ValueError('invalid settlement manifest amount')
+    return str(amount)
+
+
+def _manifest_time(value):
+    """Stable JSON timestamp used only as immutable evidence."""
+    return value.isoformat() if value is not None else None
+
+
+def _compact_manifest(rows, total):
+    """Commit to row identity/content without copying sale data onto Shift.
+
+    Count and total make support inspection useful; the digest detects a row
+    substitution that preserves both aggregates, which is the exact class of
+    sync loss that otherwise leaves settlement money looking correct while
+    product/order analytics are incomplete.
+    """
+    encoded = json.dumps(
+        rows, sort_keys=True, separators=(',', ':'), ensure_ascii=True,
+    ).encode('utf-8')
+    return {
+        'count': len(rows),
+        'total': _manifest_money(total),
+        'sha256': hashlib.sha256(encoded).hexdigest(),
+    }
+
+
+def _expense_manifest(shift):
+    from cashbox.models import CashboxExpense
+
+    rows = [{
+        'uuid': str(expense.uuid),
+        'amount': _manifest_money(expense.amount),
+    } for expense in CashboxExpense.objects.filter(
+        shift=shift,
+        branch_id=shift.branch_id,
+        is_deleted=False,
+    ).order_by('uuid')]
+    encoded = json.dumps(
+        rows, sort_keys=True, separators=(',', ':'), ensure_ascii=True,
+    ).encode('utf-8')
+    total = sum((Decimal(row['amount']) for row in rows), Decimal('0.00'))
+    return {
+        'count': len(rows),
+        'total': _manifest_money(total),
+        'rows': rows,
+        'sha256': hashlib.sha256(encoded).hexdigest(),
+    }
+
+
+def _money_evidence_manifest(shift):
+    """Commit every row used by settlement and shift product analytics.
+
+    The close header can arrive at cloud before its children. Recomputing only
+    tender totals catches ordinary gaps but not a missing row replaced by a
+    compensating row of the same value. These compact commitments make that
+    reordering fail closed until the exact paid orders, till/courier payments,
+    refunds, and order items present at close have arrived. CourierPayment is
+    intentionally excluded: that edition-specific table is not row-synced, so
+    a branch and cloud cannot make a meaningful identity-level commitment for
+    it. Its money still participates in the canonical tender recomputation.
+    """
+    from base.models import OrderItem, OrderPayment, OrderRefund
+    from cashbox.services.drawer import _shift_orders
+
+    orders = list(
+        _shift_orders(shift).select_related('cashier').order_by('uuid')
+    )
+    order_ids = [row.id for row in orders]
+    order_rows = [{
+        'uuid': str(row.uuid),
+        'paid_at': _manifest_time(row.paid_at),
+        'payment_method': str(row.payment_method or ''),
+        'total_amount': _manifest_money(row.total_amount),
+    } for row in orders]
+
+    payments = list(
+        OrderPayment.objects.filter(
+            order_id__in=order_ids, is_deleted=False,
+        ).select_related('order').order_by('uuid')
+    )
+    payment_rows = [{
+        'uuid': str(row.uuid),
+        'order_uuid': str(row.order.uuid),
+        'method': str(row.method or ''),
+        'amount': _manifest_money(row.amount),
+    } for row in payments]
+
+    refunds = list(
+        OrderRefund.objects.filter(
+            shift=shift, branch_id=shift.branch_id, is_deleted=False,
+        ).select_related('order').order_by('uuid')
+    )
+    refund_rows = []
+    for row in refunds:
+        card_detail = {
+            str(method or '').upper(): _manifest_money(amount)
+            for method, amount in sorted((row.card_detail or {}).items())
+        }
+        refund_rows.append({
+            'uuid': str(row.uuid),
+            'order_uuid': str(row.order.uuid),
+            'amount': _manifest_money(row.amount),
+            'cash_amount': _manifest_money(row.cash_amount),
+            'drawer_cash_amount': _manifest_money(row.drawer_cash_amount),
+            'card_amount': _manifest_money(row.card_amount),
+            'payme_amount': _manifest_money(row.payme_amount),
+            'unknown_amount': _manifest_money(row.unknown_amount),
+            'card_detail': card_detail,
+            'refunded_at': _manifest_time(row.refunded_at),
+            'source': row.source,
+            'source_id': row.source_id,
+        })
+
+    # Refund analytics reverse the original product lines, so referenced
+    # orders are evidence even when their sale belonged to an earlier shift.
+    item_order_ids = set(order_ids)
+    item_order_ids.update(row.order_id for row in refunds)
+    items = list(
+        OrderItem.objects.filter(
+            order_id__in=item_order_ids, is_deleted=False,
+        ).select_related('order', 'product').order_by('uuid')
+    )
+    item_rows = [{
+        'uuid': str(row.uuid),
+        'order_uuid': str(row.order.uuid),
+        'product_uuid': str(row.product.uuid),
+        'quantity': row.quantity,
+        'price': _manifest_money(row.price),
+        'original_price': _manifest_money(row.original_price),
+        'discount_amount': _manifest_money(row.discount_amount),
+    } for row in items]
+    item_total = sum(
+        (Decimal(row['price']) * row['quantity'] for row in item_rows),
+        Decimal('0.00'),
+    )
+
+    return {
+        'orders': _compact_manifest(
+            order_rows,
+            sum((Decimal(row['total_amount']) for row in order_rows),
+                Decimal('0.00')),
+        ),
+        'order_payments': _compact_manifest(
+            payment_rows,
+            sum((Decimal(row['amount']) for row in payment_rows),
+                Decimal('0.00')),
+        ),
+        'order_refunds': _compact_manifest(
+            refund_rows,
+            sum((Decimal(row['amount']) for row in refund_rows),
+                Decimal('0.00')),
+        ),
+        'order_items': _compact_manifest(item_rows, item_total),
+    }
+
+
+def _build_settlement_manifest(shift, settlement_rows):
+    tenders = [{
+        'uuid': str(row.uuid),
+        'method': row.method,
+        'expected': _manifest_money(row.expected_amount),
+        'counted': _manifest_money(row.counted_amount),
+        'difference': _manifest_money(row.difference),
+    } for row in sorted(settlement_rows, key=lambda item: item.method)]
+    return {
+        'version': 2,
+        'branch_id': shift.branch_id,
+        'tenders': tenders,
+        'expenses': _expense_manifest(shift),
+        'money_evidence': _money_evidence_manifest(shift),
+    }
+
+
+def _settlement_bundle_error(shift, settlement_rows):
+    """Return a fail-closed reason until the full local close bundle arrived."""
+    manifest = shift.settlement_manifest or {}
+    if manifest.get('version') != 2 or manifest.get('branch_id') != shift.branch_id:
+        return 'Close manifest is missing or invalid'
+    try:
+        current = _build_settlement_manifest(shift, settlement_rows)
+    except Exception as exc:  # noqa: BLE001 - fail closed on malformed evidence
+        return f'Unable to verify settlement evidence: {exc}'
+    if current != manifest:
+        return (
+            'Shift payment, expense, order, payment, refund, or item '
+            'evidence does not match the close manifest'
+        )
+
+    # SPT fields and the manifest originate at the branch. Recompute expected
+    # tenders from the cloud's order/payment/refund/expense evidence before any
+    # signed reversal or positive SAFE movement is trusted.
+    try:
+        from cashbox.services.drawer import expected_payment_totals
+        canonical = expected_payment_totals(shift)
+    except Exception as exc:  # noqa: BLE001
+        return f'Unable to recompute authoritative settlement: {exc}'
+    frozen = {
+        row.method: _money(row.expected_amount) for row in settlement_rows
+    }
+    canonical = {
+        str(method).upper(): _money(amount)
+        for method, amount in canonical.items()
+    }
+    if any(value is None for value in frozen.values()) or any(
+        value is None for value in canonical.values()
+    ):
+        return 'Settlement contains an invalid money amount'
+    # Exact method set is intentional: it detects OrderPayment/refund children
+    # that are still behind the Shift/SPT rows in the sync queue.
+    if frozen != canonical:
+        return 'Cloud order/refund evidence does not match frozen expected tenders'
+    return None
 
 
 class ShiftTemplateService:
@@ -109,7 +372,7 @@ class ShiftTemplateService:
 class ShiftService:
     @staticmethod
     def list(page=1, per_page=20, user_id=None, status=None, date_from=None,
-             date_to=None, live_only=False):
+             date_to=None, live_only=False, actor=None):
         # Join the optional one-to-one and its actor in the page query. Django
         # caches both presence and absence from this outer join, so normal
         # unreconciled shifts neither query per-row nor emit exception logs.
@@ -118,6 +381,8 @@ class ShiftService:
                   'user', 'shift_template',
                   'reconciliation', 'reconciliation__reconciled_by',
               ))
+
+        qs = _scope_shift_queryset(qs, actor)
 
         if user_id:
             qs = qs.filter(user_id=user_id)
@@ -157,10 +422,10 @@ class ShiftService:
         if not shift:
             return ServiceResponse.not_found("Shift not found")
 
-        # A plain cashier may only see their own shift; managers/admins see any.
-        if actor is not None and getattr(actor, 'role', None) not in ('ADMIN', 'MANAGER') \
-                and shift.user_id != actor.id:
-            return ServiceResponse.forbidden("You can only view your own shift")
+        if not _actor_can_access_shift(actor, shift):
+            return ServiceResponse.forbidden(
+                'You cannot view another branch shift'
+            )
 
         data = ShiftService._serialize_shift(shift, detail=True)
 
@@ -177,6 +442,10 @@ class ShiftService:
                     'name': f"{reconciliation.reconciled_by.first_name} {reconciliation.reconciled_by.last_name}".strip(),
                 } if reconciliation.reconciled_by else None,
                 'created_at': reconciliation.created_at.isoformat() if reconciliation.created_at else None,
+                'treasury_posted_at': (
+                    reconciliation.treasury_posted_at.isoformat()
+                    if reconciliation.treasury_posted_at else None
+                ),
             }
 
         return ServiceResponse.success(data=data)
@@ -243,6 +512,18 @@ class ShiftService:
                 'User belongs to a different branch',
             )
 
+        if actor is not None and not _is_global_admin(actor):
+            actor_role = str(getattr(actor, 'role', '') or '').upper()
+            actor_branch = _effective_actor_branch(actor)
+            if actor_branch != operational_branch:
+                return ServiceResponse.forbidden(
+                    'You cannot start a shift for another branch'
+                )
+            if actor_role not in ('ADMIN', 'MANAGER') and actor.id != user.id:
+                return ServiceResponse.forbidden(
+                    'You can only start your own shift'
+                )
+
         active = Shift.objects.filter(
             is_deleted=False,
             user=user,
@@ -257,6 +538,10 @@ class ShiftService:
             'start_time': timezone.now(),
             'status': 'ACTIVE',
             'branch_id': operational_branch,
+            # Explicit opt-in proves this shift began under the reconciliation
+            # -> SAFE lifecycle. Model default stays fail-closed for late syncs
+            # from pre-upgrade/offline clients that do not send this field.
+            'treasury_settlement_eligible': True,
         }
         if shift_template_id:
             template = ShiftTemplateRepository.get_by_id(shift_template_id)
@@ -286,11 +571,10 @@ class ShiftService:
         shift = ShiftRepository.get_with_relations(shift_id)
         if not shift:
             return ServiceResponse.not_found("Shift not found")
-        # Ownership: a cashier may only end their own shift; a manager/admin may
-        # close anyone's (e.g. a till a cashier walked away from).
-        if actor is not None and getattr(actor, 'role', None) not in ('ADMIN', 'MANAGER') \
-                and shift.user_id != actor.id:
-            return ServiceResponse.forbidden("You can only end your own shift")
+        if not _actor_can_access_shift(actor, shift):
+            return ServiceResponse.forbidden(
+                'You cannot end another branch shift'
+            )
         if shift.status != 'ACTIVE':
             return ServiceResponse.error("Shift is not active")
 
@@ -403,18 +687,29 @@ class ShiftService:
                 from cashbox.services.drawer import expected_payment_totals
                 from cashbox.models import ShiftPaymentTotal
                 counted = counted or {}
+                frozen_rows = []
                 for method, exp in expected_payment_totals(shift).items():
                     raw = counted.get(method)
                     try:
                         cnt = Decimal(str(raw)) if raw is not None else Decimal('0')
                     except (InvalidOperation, TypeError, ValueError):
                         cnt = Decimal('0')
-                    ShiftPaymentTotal.objects.update_or_create(
+                    row, _ = ShiftPaymentTotal.objects.update_or_create(
                         shift=shift, method=method,
                         defaults={'expected_amount': exp, 'counted_amount': cnt,
                                   'difference': cnt - exp,
                                   'branch_id': shift.branch_id},
                     )
+                    frozen_rows.append(row)
+                # Publish the close handshake only after every tender row was
+                # persisted successfully in this savepoint. If any write above
+                # fails, rows + manifest roll back together while ENDED remains.
+                shift.settlement_manifest = _build_settlement_manifest(
+                    shift, frozen_rows,
+                )
+                shift.save(update_fields=[
+                    'settlement_manifest', 'synced_at', 'sync_version',
+                ])
         except Exception:
             logger.exception(
                 'shift settlement write failed (shift=%s); closing the shift anyway',
@@ -437,7 +732,8 @@ class ShiftService:
 
     @staticmethod
     @transaction.atomic
-    def reconcile(shift_id, actual_cash, notes, reconciled_by_id, confirmed=None):
+    def reconcile(shift_id, actual_cash, notes, reconciled_by_id, confirmed=None,
+                  actor=None):
         # Row-lock the shift first (same pattern as end_shift) so two concurrent
         # reconcile calls can't both pass the "no existing reconciliation" guard
         # and each create a CashReconciliation for the same shift.
@@ -450,14 +746,30 @@ class ShiftService:
         if not shift:
             return ServiceResponse.not_found("Shift not found")
 
-        if shift.status != 'ENDED':
-            return ServiceResponse.error("Shift must be ended before reconciling")
+        if actor is None:
+            actor = User.objects.filter(
+                pk=reconciled_by_id, is_deleted=False,
+            ).first()
+        if actor is None or actor.id != reconciled_by_id:
+            return ServiceResponse.forbidden('Invalid reconciliation actor')
+        actor_role = str(getattr(actor, 'role', '') or '').upper()
+        actor_branch = str(getattr(actor, 'branch_id', '') or '').strip()
+        is_global_admin = (
+            actor_role == 'ADMIN' and actor_branch.lower() in ('', 'cloud')
+        )
+        if actor_role not in ('ADMIN', 'MANAGER') or (
+            not is_global_admin and actor_branch != str(shift.branch_id or '')
+        ):
+            return ServiceResponse.forbidden(
+                'You cannot reconcile another branch shift'
+            )
 
-        # Re-checked AFTER acquiring the lock: the loser of a concurrent race
-        # sees the winner's row here and bails instead of double-creating.
+        # Re-checked AFTER acquiring the lock. An exact retry is deliberately
+        # idempotent: it returns the frozen audit plus the original treasury
+        # entry ids instead of failing or crediting SAFE twice.
         existing = CashReconciliationRepository.get_for_shift(shift_id)
-        if existing:
-            return ServiceResponse.error("Reconciliation already exists for this shift")
+        if existing is None and shift.status != 'ENDED':
+            return ServiceResponse.error("Shift must be ended before reconciling")
 
         # Expected DRAWER cash must be NET of cash paid OUT of the drawer (cashbox
         # expenses), matching the per-tender ShiftPaymentTotal the cashier counted
@@ -473,10 +785,25 @@ class ShiftService:
                 shift=shift, is_deleted=False,
             ).order_by('method')
         )
+        if existing is None and shift.treasury_settlement_eligible:
+            bundle_error = _settlement_bundle_error(shift, settlement_rows)
+            if bundle_error:
+                return ServiceResponse.validation_error(
+                    errors={
+                        'code': 'SETTLEMENT_SYNC_INCOMPLETE',
+                        'settlement': bundle_error,
+                    },
+                    message=(
+                        'Shift settlement evidence is not ready; sync every '
+                        'payment, refund, expense, and tender row before retrying'
+                    ),
+                )
         _spt_cash = next(
             (row for row in settlement_rows if row.method == 'CASH'), None,
         )
-        if _spt_cash is not None:
+        if existing is not None:
+            expected_cash = existing.expected_cash
+        elif _spt_cash is not None:
             expected_cash = _spt_cash.expected_amount
         else:
             try:
@@ -553,16 +880,47 @@ class ShiftService:
                 message='Invalid confirmation totals',
             )
 
+        if existing is None and shift.treasury_settlement_eligible:
+            missing = sorted(
+                row.method for row in settlement_rows
+                if row.method != 'CASH'
+                and (
+                    _money(row.expected_amount) != Decimal('0.00')
+                    or _money(row.counted_amount) != Decimal('0.00')
+                )
+                and row.method not in normalized_confirmed
+            )
+            if missing:
+                return ServiceResponse.validation_error(
+                    errors={
+                        'confirmed': (
+                            'Explicit manager confirmation required for: '
+                            + ', '.join(missing)
+                        ),
+                        'missing_methods': missing,
+                    },
+                    message='Confirmation is incomplete',
+                )
+
         confirmation_amounts = {}
         for row in settlement_rows:
             # actual_cash is the manager's physical CASH count and therefore is
-            # canonical for CASH. Other tenders keep the copy-cashier-count
-            # default for backwards-compatible calls that omit `confirmed`.
-            raw = (
-                normalized_confirmed.get(row.method, actual)
-                if row.method == 'CASH'
-                else normalized_confirmed.get(row.method, row.counted_amount)
-            )
+            # canonical for CASH. Other tenders keep the cashier-count default
+            # for a first reconciliation. An idempotent retry defaults to the
+            # already-frozen manager values, never to mutable counted figures.
+            if existing is not None:
+                default = (
+                    existing.actual_cash
+                    if row.method == 'CASH' and not row.pk
+                    else row.confirmed_amount
+                )
+                raw = normalized_confirmed.get(row.method, default)
+            else:
+                raw = (
+                    normalized_confirmed.get(row.method, actual)
+                    if row.method == 'CASH'
+                    else normalized_confirmed.get(row.method, row.counted_amount)
+                )
             amount = _nonnegative_money(raw)
             if amount is None:
                 return ServiceResponse.validation_error(
@@ -583,6 +941,94 @@ class ShiftService:
                 message='Contradictory cash confirmation',
             )
 
+        # Manager confirmations describe what is physically handed over and
+        # therefore remain non-negative. A refund-only/net-negative tender is a
+        # signed economic movement, however: posting the manager's zero count
+        # would leave the earlier sale permanently overstated in SAFE. Preserve
+        # the exact negative expected movement as an explicit ledger reversal;
+        # positive/zero expected tenders post the manager-confirmed amount.
+        treasury_amounts = {
+            row.method: (
+                row.expected_amount
+                if row.expected_amount < 0
+                else confirmation_amounts[row.method]
+            )
+            for row in settlement_rows
+        }
+
+        if existing is not None:
+            if actual != existing.actual_cash:
+                return ServiceResponse.validation_error(
+                    errors={
+                        'actual_cash':
+                            'Does not match the completed reconciliation',
+                    },
+                    message='Conflicting reconciliation retry',
+                )
+            conflicts = [
+                row.method for row in settlement_rows
+                if row.pk and confirmation_amounts[row.method] != row.confirmed_amount
+            ]
+            if conflicts:
+                return ServiceResponse.validation_error(
+                    errors={
+                        'confirmed': (
+                            'Does not match the completed reconciliation for: '
+                            + ', '.join(sorted(conflicts))
+                        ),
+                    },
+                    message='Conflicting reconciliation retry',
+                )
+
+            if existing.treasury_posted_at:
+                # This reconciliation was created under the new lifecycle. An
+                # exact retry can safely recover/return the database-protected
+                # shift+tender postings.
+                for spt in settlement_rows:
+                    spt.confirmed_amount = confirmation_amounts[spt.method]
+                    spt.branch_id = shift.branch_id
+                    if spt.pk:
+                        spt.save(update_fields=[
+                            'confirmed_amount', 'branch_id', 'synced_at',
+                            'sync_version',
+                        ])
+                    else:
+                        spt.save()
+
+                from base.services.treasury_service import TreasuryService
+                treasury_posting = TreasuryService.post_shift_settlement(
+                    shift.id,
+                    treasury_amounts,
+                    performed_by=existing.reconciled_by,
+                    branch_id=shift.branch_id,
+                )
+            else:
+                # Historical reconciliations may already have reached treasury
+                # through the old Inkassa recognition path. There is no safe
+                # shift-level linkage to prove otherwise, so never auto-backfill
+                # them on a retry (that could double-credit real money).
+                treasury_posting = ShiftService._shift_treasury_posting(shift)
+                treasury_posting['reason'] = 'LEGACY_RECONCILIATION_NOT_REPOSTED'
+            return ServiceResponse.success(data={
+                'id': existing.id,
+                'shift_id': shift.id,
+                'expected_cash': str(existing.expected_cash),
+                'actual_cash': str(existing.actual_cash),
+                'difference': str(existing.difference),
+                'notes': existing.notes,
+                'reconciled_by_id': existing.reconciled_by_id,
+                'created_at': (
+                    existing.created_at.isoformat()
+                    if existing.created_at else None
+                ),
+                'treasury_posted_at': (
+                    existing.treasury_posted_at.isoformat()
+                    if existing.treasury_posted_at else None
+                ),
+                'settlement': ShiftService._shift_settlement(shift),
+                'treasury_posting': treasury_posting,
+            }, message='Reconciliation already completed')
+
         difference = actual - expected_cash
 
         reconciliation = CashReconciliationRepository.create(
@@ -595,11 +1041,10 @@ class ShiftService:
             branch_id=shift.branch_id,
         )
 
-        # Freeze the manager's per-tender confirmations. Reconciliation is an
-        # audit/finalisation boundary, not a money movement: cash still lives in
-        # the branch-owned CashRegister until inkassa removes it, and inkassa is
-        # the sole path that credits treasury. Posting here as well booked every
-        # sale twice (SHIFT_DEPOSIT followed by INKASSA).
+        # Freeze the manager's per-tender confirmations. This is now the one
+        # authoritative treasury-recognition boundary: ALL tenders go to SAFE.
+        # A later inkassa may physically remove drawer cash, but is audit/
+        # transport only and must not create another treasury credit.
         for spt in settlement_rows:
             spt.confirmed_amount = confirmation_amounts[spt.method]
             # The shift is the authoritative ownership boundary. Repair legacy
@@ -614,6 +1059,26 @@ class ShiftService:
             else:
                 spt.save()
 
+        if shift.treasury_settlement_eligible:
+            from base.services.treasury_service import TreasuryService
+            treasury_posting = TreasuryService.post_shift_settlement(
+                shift.id,
+                treasury_amounts,
+                performed_by=reconciliation.reconciled_by,
+                branch_id=shift.branch_id,
+            )
+            reconciliation.treasury_posted_at = timezone.now()
+            reconciliation.save(update_fields=[
+                'treasury_posted_at', 'synced_at', 'sync_version',
+            ])
+        else:
+            # This shift was already closed before the lifecycle rollout. Its
+            # receipts may have been recognized by legacy Inkassa and there is
+            # no shift-level link that can prove otherwise. Preserve the audit
+            # confirmation, but never risk a second treasury credit.
+            treasury_posting = ShiftService._shift_treasury_posting(shift)
+            treasury_posting['reason'] = 'LEGACY_SHIFT_NOT_ELIGIBLE'
+
         # Manager confirmed the cash: ENDED -> COMPLETED.
         ShiftRepository.update(shift, status='COMPLETED')
 
@@ -626,8 +1091,13 @@ class ShiftService:
             'notes': reconciliation.notes,
             'reconciled_by_id': reconciled_by_id,
             'created_at': reconciliation.created_at.isoformat() if reconciliation.created_at else None,
+            'treasury_posted_at': (
+                reconciliation.treasury_posted_at.isoformat()
+                if reconciliation.treasury_posted_at else None
+            ),
             # Per-tender cashier-vs-manager audit comparison.
             'settlement': ShiftService._shift_settlement(shift),
+            'treasury_posting': treasury_posting,
         })
 
     @staticmethod
@@ -652,8 +1122,11 @@ class ShiftService:
         return ShiftService.end_shift(shift.id, user_id, notes, actor=actor, counted=counted)
 
     @staticmethod
-    def get_active_shifts():
-        shifts = list(ShiftRepository.filter_by_status('ACTIVE')
+    def get_active_shifts(actor=None):
+        qs = _scope_shift_queryset(
+            ShiftRepository.filter_by_status('ACTIVE'), actor,
+        )
+        shifts = list(qs
                       .select_related(
                           'user', 'shift_template',
                           'reconciliation', 'reconciliation__reconciled_by',
@@ -712,13 +1185,98 @@ class ShiftService:
         rows = ShiftPaymentTotal.objects.filter(
             shift=shift, branch_id=shift.branch_id, is_deleted=False,
         ).order_by('method')
+        reconciled = CashReconciliation.objects.filter(
+            shift=shift, is_deleted=False,
+        ).exists()
+        status = (
+            'CONFIRMED' if reconciled
+            else 'COUNTED' if shift.status in ('ENDED', 'COMPLETED')
+            else 'OPEN'
+        )
         return [{
             'method': r.method,
             'expected': str(r.expected_amount),
             'counted': str(r.counted_amount),      # cashier
             'confirmed': str(r.confirmed_amount),  # manager
             'difference': str(r.difference),
+            'status': status,
+            'reconciled': reconciled,
         } for r in rows]
+
+    @staticmethod
+    def _serialize_cashbox_expense(expense):
+        """Stable shift/detail expense contract over CashboxExpense evidence."""
+        from cashbox.models import CashboxExpense
+        created_at = (
+            expense.created_at.isoformat() if expense.created_at else None
+        )
+        paid_by = None
+        if expense.created_by:
+            paid_by = {
+                'id': expense.created_by.id,
+                'name': (
+                    f'{expense.created_by.first_name} '
+                    f'{expense.created_by.last_name}'
+                ).strip(),
+            }
+        description = CashboxExpense.visible_comment(expense.comment)
+        return {
+            'id': expense.id,
+            'shift_id': expense.shift_id,
+            'amount': str(expense.amount),
+            'category': expense.category.name if expense.category else None,
+            'category_id': expense.category_id,
+            # Both names are kept because cashbox endpoints historically use
+            # comment while the manager handover contract calls it description.
+            'description': description,
+            'comment': description,
+            'paid_at': created_at,
+            'created_at': created_at,
+            'paid_by': paid_by,
+            # The model is durable evidence, not an approval workflow. Remote
+            # drawer application is tracked cumulatively and cannot provide an
+            # honest per-row pending flag, so RECORDED is the precise status.
+            'status': 'RECORDED',
+        }
+
+    @staticmethod
+    def _shift_treasury_posting(shift):
+        """Read-only authoritative posting state for a shift detail response."""
+        from base.models import TreasuryTransaction
+        rows = list(
+            TreasuryTransaction.objects.filter(
+                type=TreasuryTransaction.Type.SHIFT_DEPOSIT,
+                reference_type='ShiftSettlement',
+                reference_id=shift.id,
+                account__kind='SAFE',
+                account__is_deleted=False,
+            ).order_by('category', 'id')
+        )
+        total = sum((row.delta for row in rows), Decimal('0.00'))
+        zero_posted = (
+            not rows
+            and CashReconciliation.objects.filter(
+                shift=shift,
+                is_deleted=False,
+                treasury_posted_at__isnull=False,
+            ).exists()
+        )
+        posting = {
+            'status': 'posted' if rows or zero_posted else 'not_posted',
+            'account': 'SAFE',
+            'total': str(total.quantize(_MONEY_QUANTUM)),
+            'tenders': [
+                {'method': row.category, 'amount': str(row.delta)}
+                for row in rows
+            ],
+            'entry_ids': [row.id for row in rows],
+        }
+        if not rows:
+            if not shift.treasury_settlement_eligible:
+                posting['reason'] = 'LEGACY_SHIFT_NOT_ELIGIBLE'
+            elif zero_posted:
+                posting['reason'] = 'ZERO_SETTLEMENT'
+        return posting
 
     @staticmethod
     def _shift_stats(shift, end):
@@ -881,7 +1439,9 @@ class ShiftService:
         """
         from collections import defaultdict
         from base.models import OrderItem, OrderRefund
-        from cashbox.models import CashboxExpense
+        from cashbox.models import (
+            CashboxExpense, PAYMENT_METHODS, ShiftPaymentTotal,
+        )
 
         zero = Decimal('0.00')
 
@@ -896,6 +1456,11 @@ class ShiftService:
                 'items_sold': 0,
                 'avg_prep_seconds': None,
                 'peak_hour': None,
+                'expected_by_tender': {},
+                'total_expected_to_receive': '0.00',
+                'settlement': [],
+                'reconciled_count': 0,
+                'cashbox_expenses': [],
             }
 
         out = {s.id: _empty() for s in shifts}
@@ -954,11 +1519,13 @@ class ShiftService:
             # card, so it can no longer vanish into a `MIXED` bucket.
             from base.models import OrderPayment
             from base.services.tender import (
+                _drawer_cash_from_sources,
                 _courier_rows_by_order,
                 split_from_rows,
             )
             mix_acc = defaultdict(
                 lambda: {'cash': zero, 'card': zero, 'payme': zero, 'unknown': zero})
+            tender_acc = defaultdict(lambda: defaultdict(lambda: zero))
             paid_cnt = defaultdict(int)
             money_rows = list(Order.objects.filter(
                 is_deleted=False, cashier_id__in=cashier_ids, is_paid=True,
@@ -978,27 +1545,41 @@ class ShiftService:
                 sid = bucket(branch_id, cid, paid_at)
                 if sid is None:
                     continue
-                _s, _ = split_from_rows(
+                order_payments = _ops.get(oid, ())
+                courier_payments = _courier.get(oid, ())
+                _s, _detail = split_from_rows(
                     amt,
                     method,
-                    _ops.get(oid, ()),
-                    _courier.get(oid, ()),
+                    order_payments,
+                    courier_payments,
                     order_id=oid,
                 )
                 acc = mix_acc[sid]
                 for _k in ('cash', 'card', 'payme', 'unknown'):
                     acc[_k] += _s[_k]
+                tender = tender_acc[sid]
+                tender['CASH'] += _drawer_cash_from_sources(
+                    amt, _s, order_payments, courier_payments,
+                )
+                tender['PAYME'] += _s['payme']
+                for tender_method, tender_amount in _detail.items():
+                    tender[tender_method] += tender_amount
+                tender['UNKNOWN'] += _s['unknown']
                 paid_cnt[sid] += 1
 
             refund_cnt = defaultdict(int)
             refund_total = defaultdict(lambda: Decimal('0.00'))
-            for sid, row_branch, amount, cash, card, payme, unknown in OrderRefund.objects.filter(
+            for (
+                sid, row_branch, amount, cash, drawer_cash, card, payme,
+                unknown, card_detail,
+            ) in OrderRefund.objects.filter(
                 is_deleted=False,
                 shift_id__in=list(out.keys()),
                 branch_id__in=branch_ids,
             ).values_list(
-                'shift_id', 'branch_id', 'amount', 'cash_amount', 'card_amount',
-                'payme_amount', 'unknown_amount',
+                'shift_id', 'branch_id', 'amount', 'cash_amount',
+                'drawer_cash_amount', 'card_amount', 'payme_amount',
+                'unknown_amount', 'card_detail',
             ):
                 if shift_branches.get(sid) != row_branch:
                     continue
@@ -1007,6 +1588,14 @@ class ShiftService:
                 acc['card'] -= card or zero
                 acc['payme'] -= payme or zero
                 acc['unknown'] -= unknown or zero
+                tender = tender_acc[sid]
+                tender['CASH'] -= drawer_cash or zero
+                tender['PAYME'] -= payme or zero
+                tender['UNKNOWN'] -= unknown or zero
+                for tender_method, tender_amount in (card_detail or {}).items():
+                    tender[str(tender_method).upper()] -= Decimal(
+                        str(tender_amount or 0)
+                    )
                 refund_cnt[sid] += 1
                 refund_total[sid] += amount or zero
 
@@ -1112,6 +1701,40 @@ class ShiftService:
                     continue
                 exp_total[r['shift_id']] = r['t'] or zero
 
+            expense_items = defaultdict(list)
+            for expense in (
+                CashboxExpense.objects.filter(
+                    shift_id__in=list(out.keys()),
+                    branch_id__in=branch_ids,
+                    is_deleted=False,
+                )
+                .select_related('category', 'created_by')
+                .order_by('shift_id', '-created_at', '-id')
+            ):
+                if shift_branches.get(expense.shift_id) != expense.branch_id:
+                    continue
+                expense_items[expense.shift_id].append(
+                    ShiftService._serialize_cashbox_expense(expense)
+                )
+
+            settlement_rows = defaultdict(list)
+            for row in ShiftPaymentTotal.objects.filter(
+                shift_id__in=list(out.keys()),
+                branch_id__in=branch_ids,
+                is_deleted=False,
+            ).order_by('shift_id', 'method'):
+                if shift_branches.get(row.shift_id) != row.branch_id:
+                    continue
+                settlement_rows[row.shift_id].append(row)
+
+            reconciled_shift_ids = set(
+                CashReconciliation.objects.filter(
+                    shift_id__in=list(out.keys()),
+                    is_deleted=False,
+                ).values_list('shift_id', flat=True)
+            )
+            shift_status = {shift.id: shift.status for shift in valid}
+
             def money(d):
                 return str((d or zero).quantize(zero))   # always 2dp, e.g. "100.00"
 
@@ -1128,6 +1751,43 @@ class ShiftService:
                 else:
                     peak_hour = None
                 n = prep_n.get(sid)
+                frozen = settlement_rows.get(sid, [])
+                reconciled = sid in reconciled_shift_ids
+                settlement_status = (
+                    'CONFIRMED' if reconciled
+                    else 'COUNTED' if shift_status.get(sid) in ('ENDED', 'COMPLETED')
+                    else 'OPEN'
+                )
+                settlement = [{
+                    'method': row.method,
+                    'expected': money(row.expected_amount),
+                    'counted': money(row.counted_amount),
+                    'confirmed': money(row.confirmed_amount),
+                    'difference': money(row.difference),
+                    'status': settlement_status,
+                    'reconciled': reconciled,
+                } for row in frozen]
+                expected_by_tender = {
+                    row.method: money(row.expected_amount) for row in frozen
+                }
+                if not expected_by_tender:
+                    # Active/legacy fallback from the same source rows as the
+                    # canonical drawer engine. Keep acquirer identities instead
+                    # of collapsing HUMO/UZCARD/CARD into a generic card bucket.
+                    exact = tender_acc.get(sid, {})
+                    expected_by_tender = {
+                        method: money(
+                            exact.get(method, zero)
+                            - (exp_total.get(sid, zero) if method == 'CASH' else zero)
+                        )
+                        for method in PAYMENT_METHODS
+                    }
+                    if exact.get('UNKNOWN'):
+                        expected_by_tender['UNKNOWN'] = money(exact['UNKNOWN'])
+                total_expected = sum(
+                    (Decimal(value) for value in expected_by_tender.values()),
+                    zero,
+                )
                 out[sid] = {
                     'expenses_total': money(exp_total.get(sid)),
                     'cancelled_orders_count': int(canc_cnt.get(sid, 0)),
@@ -1139,6 +1799,11 @@ class ShiftService:
                     'items_sold': int(units.get(sid, 0)),
                     'avg_prep_seconds': int(round(prep_sum.get(sid, 0.0) / n)) if n else None,
                     'peak_hour': peak_hour,
+                    'expected_by_tender': expected_by_tender,
+                    'total_expected_to_receive': money(total_expected),
+                    'settlement': settlement,
+                    'reconciled_count': len(settlement) if reconciled else 0,
+                    'cashbox_expenses': expense_items.get(sid, []),
                 }
         except Exception:
             logger.exception('shift list extras batch failed (%s shifts)', len(shifts))
@@ -1204,6 +1869,10 @@ class ShiftService:
                         'name': f"{rec.reconciled_by.first_name} {rec.reconciled_by.last_name}".strip(),
                     } if rec.reconciled_by else None,
                     'created_at': rec.created_at.isoformat() if rec.created_at else None,
+                    'treasury_posted_at': (
+                        rec.treasury_posted_at.isoformat()
+                        if rec.treasury_posted_at else None
+                    ),
                 }
         except CashReconciliation.DoesNotExist:
             # Expected state until the manager reconciles an ENDED shift.
@@ -1227,6 +1896,7 @@ class ShiftService:
             'start_time': shift.start_time.isoformat() if shift.start_time else None,
             'end_time': shift.end_time.isoformat() if shift.end_time else None,
             'status': shift.status,
+            'treasury_settlement_eligible': shift.treasury_settlement_eligible,
             'total_orders': total_orders,
             'total_revenue': _q2(total_revenue),
             'cash_collected': _q2(cash_collected),
@@ -1294,4 +1964,5 @@ class ShiftService:
         if detail:
             result['stats'] = ShiftService._shift_stats(shift, effective_end)
             result['settlement'] = ShiftService._shift_settlement(shift)
+            result['treasury_posting'] = ShiftService._shift_treasury_posting(shift)
         return result

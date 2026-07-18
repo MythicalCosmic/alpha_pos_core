@@ -24,7 +24,8 @@ def _user(email=None, *, branch='main', role='CASHIER'):
     )
 
 
-def _shift(user, *, status='ACTIVE', start=None, end=None, branch='main'):
+def _shift(user, *, status='ACTIVE', start=None, end=None, branch='main',
+           treasury_eligible=True):
     from base.models import Shift
 
     return Shift.objects.create(
@@ -33,10 +34,12 @@ def _shift(user, *, status='ACTIVE', start=None, end=None, branch='main'):
         start_time=start or timezone.now() - timedelta(hours=1),
         end_time=end,
         branch_id=branch,
+        treasury_settlement_eligible=treasury_eligible,
     )
 
 
-def _paid_order(user, amount, *, paid_at=None, created_at=None, branch='main'):
+def _paid_order(user, amount, *, paid_at=None, created_at=None, branch='main',
+                method='CASH'):
     from base.models import Order, OrderPayment
     from base.services.inkassa_service import InkassaService
 
@@ -46,7 +49,7 @@ def _paid_order(user, amount, *, paid_at=None, created_at=None, branch='main'):
         cashier=user,
         status='COMPLETED',
         is_paid=True,
-        payment_method='CASH',
+        payment_method=method,
         paid_at=paid_at,
         subtotal=amount,
         total_amount=amount,
@@ -56,36 +59,107 @@ def _paid_order(user, amount, *, paid_at=None, created_at=None, branch='main'):
         Order.objects.filter(pk=order.pk).update(created_at=created_at)
         order.refresh_from_db()
     OrderPayment.objects.create(
-        order=order, method='CASH', amount=amount, branch_id=branch,
+        order=order, method=method, amount=amount, branch_id=branch,
     )
-    InkassaService.add_to_register(Decimal(amount), branch)
+    if method == 'CASH':
+        InkassaService.add_to_register(Decimal(amount), branch)
     return order
 
 
-class TestReconciliationInvariants:
-    def _ended(self):
-        from cashbox.models import ShiftPaymentTotal
+def _freeze_settlement(shift, counted=None):
+    from cashbox.models import ShiftPaymentTotal
+    from cashbox.services.drawer import expected_payment_totals
+    from core.shifts.service import _build_settlement_manifest
 
-        user = _user()
+    counted = counted or {}
+    rows = []
+    for method, expected in expected_payment_totals(shift).items():
+        count = Decimal(str(counted.get(method, max(expected, Decimal('0.00')))))
+        row = ShiftPaymentTotal.objects.create(
+            shift=shift,
+            method=method,
+            expected_amount=expected,
+            counted_amount=count,
+            difference=count - expected,
+            branch_id=shift.branch_id,
+        )
+        rows.append(row)
+    shift.settlement_manifest = _build_settlement_manifest(shift, rows)
+    shift.save(update_fields=['settlement_manifest'])
+    return rows
+
+
+def _tender_evidence(shift, user, amounts):
+    from base.models import OrderRefund
+
+    paid_at = shift.start_time + timedelta(minutes=5)
+    for method, raw in amounts.items():
+        amount = Decimal(str(raw))
+        if amount > 0:
+            _paid_order(
+                user, amount, paid_at=paid_at, created_at=paid_at,
+                branch=shift.branch_id, method=method,
+            )
+            continue
+        if amount >= 0:
+            continue
+        original = _paid_order(
+            user,
+            -amount,
+            paid_at=shift.start_time - timedelta(hours=1),
+            created_at=shift.start_time - timedelta(hours=1),
+            branch=shift.branch_id,
+            method=method,
+        )
+        kwargs = {
+            'cash_amount': '0.00',
+            'drawer_cash_amount': '0.00',
+            'card_amount': '0.00',
+            'payme_amount': '0.00',
+            'unknown_amount': '0.00',
+            'card_detail': {},
+        }
+        if method == 'CASH':
+            kwargs['cash_amount'] = -amount
+            kwargs['drawer_cash_amount'] = -amount
+        elif method == 'PAYME':
+            kwargs['payme_amount'] = -amount
+        elif method in ('UZCARD', 'HUMO', 'CARD'):
+            kwargs['card_amount'] = -amount
+            kwargs['card_detail'] = {method: str(-amount)}
+        else:
+            kwargs['unknown_amount'] = -amount
+        OrderRefund.objects.create(
+            order=original,
+            shift=shift,
+            cashier=user,
+            amount=-amount,
+            refunded_at=paid_at,
+            source=OrderRefund.Source.ORDER_CANCEL,
+            source_id=f'test-{shift.id}-{method}-{uuid4().hex}',
+            branch_id=shift.branch_id,
+            **kwargs,
+        )
+
+
+class TestReconciliationInvariants:
+    def _ended(self, amounts=None):
+        user = _user(role='MANAGER')
         shift = _shift(
             user,
             status='ENDED',
-            end=timezone.now(),
+            end=timezone.now() + timedelta(minutes=1),
         )
-        ShiftPaymentTotal.objects.create(
-            shift=shift,
-            method='CASH',
-            expected_amount='100.00',
-            counted_amount='90.00',
-            difference='-10.00',
+        amounts = amounts or {'CASH': '100.00', 'UZCARD': '50.00'}
+        _tender_evidence(shift, user, amounts)
+        rows = _freeze_settlement(
+            shift,
+            counted={
+                method: ('90.00' if method == 'CASH' else max(Decimal(str(value)), 0))
+                for method, value in amounts.items()
+            },
         )
-        ShiftPaymentTotal.objects.create(
-            shift=shift,
-            method='UZCARD',
-            expected_amount='50.00',
-            counted_amount='50.00',
-            difference='0.00',
-        )
+        from cashbox.models import ShiftPaymentTotal
         ShiftPaymentTotal.objects.create(
             shift=shift,
             method='PAYME',
@@ -96,8 +170,10 @@ class TestReconciliationInvariants:
         )
         return user, shift
 
-    def test_actual_cash_is_the_cash_confirmation_and_no_treasury_post(self):
-        from base.models import CashReconciliation, TreasuryTransaction
+    def test_actual_cash_and_every_confirmed_tender_post_to_safe_once(self):
+        from base.models import (
+            CashReconciliation, TreasuryAccount, TreasuryTransaction,
+        )
         from cashbox.models import ShiftPaymentTotal
         from core.shifts.service import ShiftService
 
@@ -125,7 +201,241 @@ class TestReconciliationInvariants:
         assert ShiftPaymentTotal.objects.get(
             shift=shift, method='PAYME', is_deleted=True,
         ).confirmed_amount == Decimal('0.00')
-        assert TreasuryTransaction.objects.count() == 0
+        posting = result['data']['treasury_posting']
+        assert posting == {
+            'status': 'posted',
+            'account': 'SAFE',
+            'total': '143.00',
+            'tenders': [
+                {'method': 'CASH', 'amount': '95.00'},
+                {'method': 'UZCARD', 'amount': '48.00'},
+            ],
+            'entry_ids': posting['entry_ids'],
+        }
+        assert len(posting['entry_ids']) == 2
+        assert TreasuryAccount.objects.get(kind='SAFE').balance == Decimal('143.00')
+        assert not TreasuryAccount.objects.filter(kind='BANK').exists()
+        assert set(TreasuryTransaction.objects.values_list('category', flat=True)) == {
+            'CASH', 'UZCARD',
+        }
+
+        # Same request is an idempotent read/recovery path. It returns the same
+        # authoritative entry ids and cannot credit SAFE twice.
+        retry, retry_status = ShiftService.reconcile(
+            shift.id,
+            actual_cash='95.00',
+            notes='safe retry',
+            reconciled_by_id=user.id,
+            confirmed={'CASH': '95.00', 'UZCARD': '48.00'},
+        )
+        assert retry_status == 200, retry
+        assert retry['data']['treasury_posting']['entry_ids'] == posting['entry_ids']
+        assert TreasuryAccount.objects.get(kind='SAFE').balance == Decimal('143.00')
+        assert TreasuryTransaction.objects.count() == 2
+
+        conflict, conflict_status = ShiftService.reconcile(
+            shift.id,
+            actual_cash='95.00',
+            notes='',
+            reconciled_by_id=user.id,
+            confirmed={'CASH': '95.00', 'UZCARD': '49.00'},
+        )
+        assert conflict_status == 422, conflict
+        assert TreasuryAccount.objects.get(kind='SAFE').balance == Decimal('143.00')
+        assert TreasuryTransaction.objects.count() == 2
+
+    def test_mixed_all_tenders_post_to_safe_and_zero_is_ledger_noop(self):
+        from base.models import TreasuryAccount, TreasuryTransaction
+        from core.shifts.service import ShiftService
+
+        amounts = {
+            'CASH': '100.00',
+            'HUMO': '20.00',
+            'UZCARD': '30.00',
+            'CARD': '40.00',
+            'PAYME': '50.00',
+        }
+        user, shift = self._ended(amounts)
+
+        result, status = ShiftService.reconcile(
+            shift.id,
+            actual_cash='100.00',
+            notes='all tenders',
+            reconciled_by_id=user.id,
+            confirmed=amounts,
+        )
+        assert status == 201, result
+        posting = result['data']['treasury_posting']
+        assert posting['account'] == 'SAFE'
+        assert posting['total'] == '240.00'
+        assert len(posting['entry_ids']) == 5
+        assert {row['method'] for row in posting['tenders']} == set(amounts)
+        assert TreasuryAccount.objects.get(kind='SAFE').balance == Decimal('240.00')
+        assert not TreasuryAccount.objects.filter(kind='BANK').exists()
+        assert TreasuryTransaction.objects.count() == 5
+
+    def test_net_negative_mixed_tenders_credit_and_reverse_safe_atomically(self):
+        from base.models import TreasuryAccount, TreasuryTransaction
+        from core.shifts.service import ShiftService
+
+        user, shift = self._ended({'CASH': '20.00', 'PAYME': '-30.00'})
+
+        result, status = ShiftService.reconcile(
+            shift.id,
+            actual_cash='20.00',
+            notes='cash sale plus provider refund',
+            reconciled_by_id=user.id,
+            confirmed={'CASH': '20.00', 'PAYME': '0.00'},
+        )
+        assert status == 201, result
+        posting = result['data']['treasury_posting']
+        assert posting['total'] == '-10.00'
+        assert posting['tenders'] == [
+            {'method': 'CASH', 'amount': '20.00'},
+            {'method': 'PAYME', 'amount': '-30.00'},
+        ]
+        assert TreasuryAccount.objects.get(kind='SAFE').balance == Decimal('-10.00')
+        assert not TreasuryAccount.objects.filter(kind='BANK').exists()
+        assert {
+            row.category: row.delta
+            for row in TreasuryTransaction.objects.filter(
+                type=TreasuryTransaction.Type.SHIFT_DEPOSIT,
+            )
+        } == {'CASH': Decimal('20.00'), 'PAYME': Decimal('-30.00')}
+
+    def test_legacy_reconciliation_retry_never_backfills_safe(self):
+        from base.models import (
+            CashReconciliation, TreasuryAccount, TreasuryTransaction,
+        )
+        from cashbox.models import ShiftPaymentTotal
+        from core.shifts.service import ShiftService
+
+        user, shift = self._ended()
+        ShiftPaymentTotal.objects.filter(
+            shift=shift, method='CASH', is_deleted=False,
+        ).update(confirmed_amount='95.00')
+        ShiftPaymentTotal.objects.filter(
+            shift=shift, method='UZCARD', is_deleted=False,
+        ).update(confirmed_amount='48.00')
+        CashReconciliation.objects.create(
+            shift=shift,
+            expected_cash='100.00',
+            actual_cash='95.00',
+            difference='-5.00',
+            reconciled_by=user,
+            # Null is the migration default for pre-rollout reconciliations.
+            treasury_posted_at=None,
+        )
+        shift.status = 'COMPLETED'
+        shift.save(update_fields=['status'])
+        safe = TreasuryAccount.objects.create(kind='SAFE', balance='100.00')
+        TreasuryTransaction.objects.create(
+            account=safe,
+            type=TreasuryTransaction.Type.INKASSA,
+            delta='100.00',
+            balance_before='0.00',
+            balance_after='100.00',
+            description='Historical pre-rollout Inkassa credit',
+        )
+
+        result, status = ShiftService.reconcile(
+            shift.id,
+            actual_cash='95.00',
+            notes='',
+            reconciled_by_id=user.id,
+            confirmed={'CASH': '95.00', 'UZCARD': '48.00'},
+        )
+        assert status == 200, result
+        posting = result['data']['treasury_posting']
+        assert posting['status'] == 'not_posted'
+        assert posting['reason'] == 'LEGACY_RECONCILIATION_NOT_REPOSTED'
+        assert TreasuryAccount.objects.get(kind='SAFE').balance == Decimal('100.00')
+        assert not TreasuryTransaction.objects.filter(
+            type=TreasuryTransaction.Type.SHIFT_DEPOSIT,
+            reference_type='ShiftSettlement',
+        ).exists()
+
+    def test_pre_rollout_ended_unreconciled_shift_cannot_double_credit(self):
+        from base.models import TreasuryAccount, TreasuryTransaction
+        from cashbox.models import ShiftPaymentTotal
+        from core.shifts.service import ShiftService
+
+        user = _user(role='MANAGER')
+        shift = _shift(
+            user,
+            status='ENDED',
+            end=timezone.now(),
+            treasury_eligible=False,
+        )
+        for method, amount in {'CASH': '100.00', 'PAYME': '50.00'}.items():
+            ShiftPaymentTotal.objects.create(
+                shift=shift,
+                method=method,
+                expected_amount=amount,
+                counted_amount=amount,
+                difference='0.00',
+            )
+
+        # Represents proceeds already recognized by the legacy Inkassa
+        # lifecycle before 0048. There was no shift reference in that ledger.
+        safe = TreasuryAccount.objects.create(kind='SAFE', balance='150.00')
+        TreasuryTransaction.objects.create(
+            account=safe,
+            type=TreasuryTransaction.Type.INKASSA,
+            delta='150.00',
+            balance_before='0.00',
+            balance_after='150.00',
+            description='Historical mixed collection',
+        )
+
+        result, status = ShiftService.reconcile(
+            shift.id,
+            actual_cash='100.00',
+            notes='late manager audit',
+            reconciled_by_id=user.id,
+            confirmed={'CASH': '100.00', 'PAYME': '50.00'},
+        )
+        assert status == 201, result
+        assert result['data']['treasury_posted_at'] is None
+        assert result['data']['treasury_posting']['status'] == 'not_posted'
+        assert (
+            result['data']['treasury_posting']['reason']
+            == 'LEGACY_SHIFT_NOT_ELIGIBLE'
+        )
+        assert TreasuryAccount.objects.get(kind='SAFE').balance == Decimal('150.00')
+        assert TreasuryTransaction.objects.count() == 1
+        assert not TreasuryTransaction.objects.filter(
+            type=TreasuryTransaction.Type.SHIFT_DEPOSIT,
+        ).exists()
+
+    def test_pre_upgrade_offline_shift_sync_defaults_fail_closed(self):
+        from base.models import Shift
+
+        user = _user(branch='branch-a')
+        incoming_uuid = uuid4()
+        payload = {
+            'uuid': str(incoming_uuid),
+            'sync_version': 3,
+            'is_deleted': False,
+            'branch_id': 'branch-a',
+            'user_uuid': str(user.uuid),
+            'shift_template_uuid': None,
+            'start_time': (timezone.now() - timedelta(hours=2)).isoformat(),
+            'end_time': (timezone.now() - timedelta(hours=1)).isoformat(),
+            'status': 'ENDED',
+            'total_orders': 2,
+            'total_revenue': '150.00',
+            'cash_collected': '100.00',
+            'notes': 'old desktop payload has no eligibility field',
+            # Deliberately no treasury_settlement_eligible key.
+        }
+
+        shift, action = Shift.from_sync_dict(payload, branch_id='branch-a')
+
+        assert action == 'created'
+        assert str(shift.uuid) == str(incoming_uuid)
+        assert shift.status == 'ENDED'
+        assert shift.treasury_settlement_eligible is False
 
     @pytest.mark.parametrize(
         ('actual', 'confirmed'),
@@ -174,9 +484,10 @@ class TestReconciliationInvariants:
         from cashbox.models import ShiftPaymentTotal
         from core.shifts.service import ShiftService
 
-        user = _user(branch='branch-a')
+        user = _user(branch='branch-a', role='MANAGER')
         shift = _shift(
             user, status='ENDED', end=timezone.now(), branch='branch-a',
+            treasury_eligible=False,
         )
         legacy = ShiftPaymentTotal.objects.create(
             shift=shift,
@@ -228,6 +539,20 @@ def test_end_shift_settlement_rows_inherit_shift_branch():
     rows = ShiftPaymentTotal.objects.filter(shift=shift, is_deleted=False)
     assert rows.count() > 0
     assert set(rows.values_list('branch_id', flat=True)) == {'branch-a'}
+
+
+@override_settings(DEPLOYMENT_MODE='local', BRANCH_ID='main')
+def test_updated_start_shift_explicitly_opts_into_safe_settlement():
+    from base.models import Shift
+    from core.shifts.service import ShiftService
+
+    user = _user(branch='main')
+    result, status = ShiftService.start_shift(user.id, actor=user)
+
+    assert status == 201, result
+    shift = Shift.objects.get(pk=result['data']['id'])
+    assert shift.status == 'ACTIVE'
+    assert shift.treasury_settlement_eligible is True
 
 
 def test_shift_totals_are_branch_scoped_and_handoff_is_half_open():
@@ -297,7 +622,7 @@ def test_shift_detail_uses_paid_clock_and_net_active_lines():
     from base.models import Category, Order, OrderItem, Product
     from core.shifts.service import ShiftService
 
-    user = _user()
+    user = _user(role='MANAGER')
     now = timezone.now()
     shift = _shift(
         user,
@@ -361,13 +686,13 @@ def test_shift_detail_uses_paid_clock_and_net_active_lines():
 
 def test_sale_and_refund_are_distinct_shift_settlement_events():
     from base.models import (
-        Category, OrderItem, OrderRefund, Product,
+        Category, OrderItem, OrderRefund, Product, TreasuryAccount,
+        TreasuryTransaction,
     )
-    from cashbox.models import ShiftPaymentTotal
     from cashbox.services.drawer import expected_payment_totals
     from core.shifts.service import ShiftService
 
-    user = _user()
+    user = _user(role='MANAGER')
     now = timezone.now()
     sale_shift = _shift(
         user,
@@ -444,13 +769,7 @@ def test_sale_and_refund_are_distinct_shift_settlement_events():
 
     # Signed expected movement is legitimate; the physical manager count and
     # confirmation remain non-negative.
-    ShiftPaymentTotal.objects.create(
-        shift=refund_shift,
-        method='CASH',
-        expected_amount='-80.00',
-        counted_amount='0.00',
-        difference='80.00',
-    )
+    _freeze_settlement(refund_shift, counted={'CASH': '0.00'})
     result, status = ShiftService.reconcile(
         refund_shift.id,
         actual_cash='0.00',
@@ -461,6 +780,32 @@ def test_sale_and_refund_are_distinct_shift_settlement_events():
     assert status == 201, result
     assert result['data']['expected_cash'] == '-80.00'
     assert result['data']['difference'] == '80.00'
+    posting = result['data']['treasury_posting']
+    assert posting['status'] == 'posted'
+    assert posting['account'] == 'SAFE'
+    assert posting['total'] == '-80.00'
+    assert posting['tenders'] == [{'method': 'CASH', 'amount': '-80.00'}]
+    assert TreasuryAccount.objects.get(kind='SAFE').balance == Decimal('-80.00')
+    entry = TreasuryTransaction.objects.get(
+        type=TreasuryTransaction.Type.SHIFT_DEPOSIT,
+        reference_type='ShiftSettlement',
+        reference_id=refund_shift.id,
+        category='CASH',
+    )
+    assert entry.delta == Decimal('-80.00')
+    assert 'refund reversal' in entry.description
+
+    retry, retry_status = ShiftService.reconcile(
+        refund_shift.id,
+        actual_cash='0.00',
+        notes='',
+        reconciled_by_id=user.id,
+        confirmed={'CASH': '0.00'},
+    )
+    assert retry_status == 200, retry
+    assert retry['data']['treasury_posting']['entry_ids'] == posting['entry_ids']
+    assert TreasuryAccount.objects.get(kind='SAFE').balance == Decimal('-80.00')
+    assert TreasuryTransaction.objects.count() == 1
 
 
 class TestCashboxExpenseInvariants:

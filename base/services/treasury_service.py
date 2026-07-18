@@ -1,8 +1,12 @@
-"""SAFE + BANK treasury: balances, inkassa deposits, transfers, expenses.
+"""SAFE + BANK treasury: balances, shift settlement, transfers, expenses.
 
 Two accounts sit above the till drawer (CashRegister):
-  * SAFE — physical cash moved out of the registers by inkassa.
-  * BANK — electronic money (card / Payme), which never touches the drawer.
+  * SAFE — every tender accepted by a manager at shift reconciliation.
+  * BANK — explicit bank-side transfers and spending outside shift handover.
+
+Shift reconciliation is the sole recognition boundary for shift proceeds.
+Inkassa may still remove physical cash from a branch register, but that later
+movement is audit/transport only and must never recognize the sale again.
 
 Every balance change is row-locked and written to the TreasuryTransaction
 ledger (append-only) so the books always reconcile.
@@ -15,6 +19,7 @@ a 5,000 fee → BANK -1,000,000, SAFE +995,000, fee 5,000.
 from decimal import Decimal, InvalidOperation
 
 from django.db import transaction, IntegrityError
+from django.db.models import F, Sum
 from django.utils import timezone
 
 from base.models import TreasuryAccount, TreasuryTransaction
@@ -64,7 +69,7 @@ def _get_account_locked(kind):
 
 def _apply(acct, delta, txn_type, *, fee=Decimal('0'), counterparty=None,
            category='', description='', reference_type='', reference_id=None,
-           performed_by=None):
+           performed_by=None, branch_id=None):
     """Mutate a locked account by `delta` and write the ledger row."""
     before = acct.balance or Decimal('0')
     after = before + delta
@@ -84,6 +89,7 @@ def _apply(acct, delta, txn_type, *, fee=Decimal('0'), counterparty=None,
         reference_type=reference_type or '',
         reference_id=reference_id,
         performed_by=performed_by,
+        branch_id=branch_id or acct.branch_id,
     )
 
 
@@ -134,57 +140,252 @@ class TreasuryService:
     @staticmethod
     @transaction.atomic
     def deposit_inkassa(cash_amount, card_amount, performed_by=None, reference_id=None):
-        """Route an inkassa into the treasury: cash → SAFE, cards → BANK.
+        """Deprecated no-op retained for binary/API compatibility.
 
-        Amounts are non-negative Decimals already validated by the caller.
-        Returns (safe_txn, bank_txn) — either may be None when its amount is 0.
+        Inkassa is now physical register movement/audit only. Shift proceeds
+        are recognized exactly once by ``post_shift_settlement`` when the
+        manager reconciles them, so this legacy helper must never mutate SAFE
+        or BANK even if an older integration still calls it.
         """
-        safe_txn = bank_txn = None
-        cash_amount = cash_amount or Decimal('0')
-        card_amount = card_amount or Decimal('0')
-        if cash_amount > 0:
-            safe = _get_account_locked(TreasuryAccount.Kind.SAFE)
-            safe_txn = _apply(
-                safe, cash_amount, TreasuryTransaction.Type.INKASSA,
-                description='Inkassa cash collection',
-                reference_type='Inkassa', reference_id=reference_id,
-                performed_by=performed_by,
-            )
-        if card_amount > 0:
-            bank = _get_account_locked(TreasuryAccount.Kind.BANK)
-            bank_txn = _apply(
-                bank, card_amount, TreasuryTransaction.Type.INKASSA,
-                description='Inkassa card settlement',
-                reference_type='Inkassa', reference_id=reference_id,
-                performed_by=performed_by,
-            )
-        return safe_txn, bank_txn
+        return None, None
 
     @staticmethod
     @transaction.atomic
     def deposit_shift(cash_amount, card_amount, performed_by=None, reference_id=None):
-        """Post a shift's confirmed settlement into the treasury: cash → SAFE,
-        cards → BANK. Returns (safe_txn, bank_txn); either may be None."""
-        safe_txn = bank_txn = None
-        cash_amount = _to_decimal(cash_amount) or Decimal('0')
-        card_amount = _to_decimal(card_amount) or Decimal('0')
-        if cash_amount > 0:
+        """Deprecated no-op; use ``post_shift_settlement``.
+
+        The old cash/card signature cannot preserve a dynamic tender breakdown
+        and was not idempotent. Leaving it capable of changing balances would
+        create a second recognition path, so it remains callable only as a safe
+        compatibility shim.
+        """
+        return None, None
+
+    @staticmethod
+    @transaction.atomic
+    def post_shift_settlement(shift_id, tenders, performed_by=None,
+                              branch_id=None):
+        """Idempotently recognize one manager-confirmed shift into SAFE.
+
+        A separate append-only ``SHIFT_DEPOSIT`` row is written for each
+        positive tender. ``(shift_id, method)`` is protected both by the SAFE
+        account row lock and by a conditional database uniqueness constraint,
+        so an HTTP retry, concurrent request, or future alternate writer cannot
+        credit the same shift tender twice.
+
+        Zero tenders remain in the response for a complete audit payload but do
+        not create ledger noise. Signed negative amounts are deliberate refund
+        reversals and debit SAFE under the same shift+tender identity. A
+        persisted row whose amount differs from the requested manager
+        confirmation is a hard accounting conflict; history is never silently
+        rewritten.
+        """
+        if not shift_id:
+            raise ValueError('shift_id is required for treasury settlement')
+        branch_id = str(branch_id or '').strip()
+        if not branch_id:
+            raise ValueError('branch_id is required for treasury settlement')
+        if not isinstance(tenders, dict):
+            raise ValueError('tenders must be an object keyed by payment method')
+
+        normalized = {}
+        for raw_method, raw_amount in tenders.items():
+            method = str(raw_method or '').strip().upper()
+            if not method or len(method) > 50:
+                raise ValueError('invalid settlement payment method')
+            amount = _to_decimal(raw_amount)
+            if amount is None or not amount.is_finite():
+                raise ValueError(f'invalid settlement amount for {method}')
+            normalized[method] = amount
+
+        movements = {
+            method: amount for method, amount in normalized.items()
+            if amount != 0
+        }
+        entries = []
+        if movements:
+            # This lock serializes every balance mutation. Query idempotency
+            # rows only after it is held so a concurrent retry sees the first
+            # transaction once that writer releases the account.
             safe = _get_account_locked(TreasuryAccount.Kind.SAFE)
-            safe_txn = _apply(
-                safe, cash_amount, TreasuryTransaction.Type.SHIFT_DEPOSIT,
-                description='Shift cash settlement',
-                reference_type='Shift', reference_id=reference_id,
-                performed_by=performed_by,
+            for method in sorted(movements):
+                amount = movements[method]
+                existing = (
+                    TreasuryTransaction.objects.select_for_update()
+                    .filter(
+                        type=TreasuryTransaction.Type.SHIFT_DEPOSIT,
+                        reference_type='ShiftSettlement',
+                        reference_id=shift_id,
+                        category=method,
+                    )
+                    .select_related('account')
+                    .first()
+                )
+                if existing is not None:
+                    if (
+                        existing.account_id != safe.id
+                        or existing.account.kind != TreasuryAccount.Kind.SAFE
+                        or existing.branch_id != branch_id
+                        or existing.delta != amount
+                    ):
+                        raise ValueError(
+                            f'conflicting treasury posting for shift '
+                            f'{shift_id} tender {method}'
+                        )
+                    entries.append(existing)
+                    continue
+
+                entries.append(_apply(
+                    safe,
+                    amount,
+                    TreasuryTransaction.Type.SHIFT_DEPOSIT,
+                    category=method,
+                    description=(
+                        f'Shift {shift_id} manager settlement: {method}'
+                        if amount > 0 else
+                        f'Shift {shift_id} refund reversal: {method}'
+                    ),
+                    reference_type='ShiftSettlement',
+                    reference_id=shift_id,
+                    performed_by=performed_by,
+                    branch_id=branch_id,
+                ))
+
+        total = sum(normalized.values(), Decimal('0.00'))
+        return {
+            # A validated all-zero settlement is an atomically completed no-op,
+            # not a pending posting. CashReconciliation.treasury_posted_at is
+            # the durable marker when no ledger row is necessary.
+            'status': 'posted',
+            'account': TreasuryAccount.Kind.SAFE,
+            'total': str(total.quantize(CENTS)),
+            'tenders': [
+                {'method': method, 'amount': str(amount.quantize(CENTS))}
+                for method, amount in sorted(movements.items())
+            ],
+            'entry_ids': [entry.id for entry in entries],
+        }
+
+    @staticmethod
+    @transaction.atomic
+    def plan_inkassa_allocation(branch_id, method_amounts):
+        """Freeze a branch collection plan under the shared SAFE lock.
+
+        Reconciliation and this planner take the same account row lock before
+        reading/writing settlement recognition. This prevents Inkassa from
+        observing a stale pool while a manager confirmation commits.
+
+        ``matched_recognized`` consumes already-posted ShiftSettlement value
+        and therefore creates no second SAFE delta. Only unmatched physical
+        CASH can become a separately approved legacy opening; its caller holds
+        and caps against the branch CashRegister. Unmatched non-cash is always
+        rejected until an immutable provider cutover snapshot/manual adjustment
+        exists. Signed refund entries remain in the cumulative pool, so they
+        must be repaid by later positive settlements before any value becomes
+        matchable again.
+        """
+        branch_id = str(branch_id or '').strip()
+        if not branch_id:
+            raise ValueError('branch_id is required for Inkassa allocation')
+        if not isinstance(method_amounts, dict) or not method_amounts:
+            raise ValueError('method_amounts are required for Inkassa allocation')
+
+        # Lock first, query second. All ShiftSettlement writers use this lock.
+        _get_account_locked(TreasuryAccount.Kind.SAFE)
+
+        from base.models import Inkassa
+
+        refund_prefix = Inkassa.refund_command_prefix()
+        plans = {}
+        for method, amount in sorted(method_amounts.items()):
+            recognized_total = (
+                TreasuryTransaction.objects.filter(
+                    type=TreasuryTransaction.Type.SHIFT_DEPOSIT,
+                    reference_type='ShiftSettlement',
+                    category=method,
+                    branch_id=branch_id,
+                ).aggregate(total=Sum('delta'))['total']
+                or Decimal('0.00')
             )
-        if card_amount > 0:
-            bank = _get_account_locked(TreasuryAccount.Kind.BANK)
-            bank_txn = _apply(
-                bank, card_amount, TreasuryTransaction.Type.SHIFT_DEPOSIT,
-                description='Shift card settlement',
-                reference_type='Shift', reference_id=reference_id,
-                performed_by=performed_by,
+            recognized_consumed = (
+                Inkassa.objects.filter(
+                    branch_id=branch_id,
+                    inkass_type=method,
+                    treasury_allocated_at__isnull=False,
+                ).exclude(
+                    notes__startswith=refund_prefix,
+                ).aggregate(total=Sum('settlement_offset_amount'))['total']
+                or Decimal('0.00')
             )
-        return safe_txn, bank_txn
+            # Do not clamp before subtracting consumption: a signed refund may
+            # make this negative, and later positive settlements must first
+            # clear that debt before becoming available to match.
+            recognized_net = recognized_total - recognized_consumed
+            recognized_available = max(recognized_net, Decimal('0.00'))
+            matched = min(amount, recognized_available)
+
+            remainder = amount - matched
+            legacy = remainder if method == 'CASH' else Decimal('0.00')
+            unallocated = Decimal('0.00') if method == 'CASH' else remainder
+            plans[method] = {
+                'collected': amount,
+                'matched_recognized': matched,
+                'legacy_opening': legacy,
+                'safe_delta': legacy,
+                'unallocated': unallocated,
+                'recognized_net': recognized_net,
+            }
+        return plans
+
+    @staticmethod
+    @transaction.atomic
+    def post_legacy_inkassa(inkassa_id, amount, method, *, branch_id,
+                             performed_by=None):
+        """Idempotently post one evidence-bounded legacy opening to SAFE."""
+        amount = _to_decimal(amount)
+        if amount is None or not amount.is_finite() or amount < 0:
+            raise ValueError('invalid legacy Inkassa amount')
+        if amount == 0:
+            return None
+        branch_id = str(branch_id or '').strip()
+        method = str(method or '').strip().upper()
+        if not branch_id or not method:
+            raise ValueError('branch_id and method are required')
+
+        safe = _get_account_locked(TreasuryAccount.Kind.SAFE)
+        existing = (
+            TreasuryTransaction.objects.select_for_update()
+            .filter(
+                type=TreasuryTransaction.Type.INKASSA,
+                reference_type='InkassaLegacy',
+                reference_id=inkassa_id,
+            )
+            .select_related('account')
+            .first()
+        )
+        if existing is not None:
+            if (
+                existing.account_id != safe.id
+                or existing.account.kind != TreasuryAccount.Kind.SAFE
+                or existing.branch_id != branch_id
+                or existing.category != method
+                or existing.delta != amount
+            ):
+                raise ValueError(
+                    f'conflicting legacy Inkassa posting for row {inkassa_id}'
+                )
+            return existing
+        return _apply(
+            safe,
+            amount,
+            TreasuryTransaction.Type.INKASSA,
+            category=method,
+            description=f'Approved legacy opening via Inkassa {inkassa_id}: {method}',
+            reference_type='InkassaLegacy',
+            reference_id=inkassa_id,
+            performed_by=performed_by,
+            branch_id=branch_id,
+        )
 
     @staticmethod
     @transaction.atomic

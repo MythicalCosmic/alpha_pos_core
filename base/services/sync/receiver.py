@@ -1,6 +1,7 @@
 import logging
 from decimal import Decimal
 from django.apps import apps
+from django.conf import settings
 from django.db import transaction
 from base.services.sync.config import FK_UUID_MAPPINGS
 
@@ -168,6 +169,75 @@ def _strip_denied(model_class, cleaned, *, creating):
     if strip is None:
         return cleaned
     return strip(cleaned, creating=creating)
+
+
+def _strip_branch_rewrites(model_class, instance, values):
+    """Enforce create-only and write-once branch fields on cloud updates.
+
+    The receiver is the branch->cloud trust boundary. Model declarations alone
+    are intentionally not decorative: create-only rollout identity can never
+    flip later, while a non-empty close manifest may only be replayed exactly.
+    Direct cloud repair remains possible through explicit server code.
+    """
+    values = dict(values)
+    if getattr(settings, 'DEPLOYMENT_MODE', 'local') != 'cloud':
+        return values
+    create_only = set(getattr(
+        model_class, 'SYNC_CREATE_ONLY_FROM_BRANCH', frozenset(),
+    ))
+    immutable_after_set = set(getattr(
+        model_class, 'SYNC_IMMUTABLE_FROM_BRANCH_AFTER_SET', frozenset(),
+    ))
+    immutable_after_manifest = _branch_frozen_after_manifest_fields(
+        model_class, instance,
+    )
+    for field_name in create_only:
+        values.pop(field_name, None)
+    for field_name in immutable_after_set:
+        if field_name not in values:
+            continue
+        current = getattr(instance, field_name, None)
+        incoming = values[field_name]
+        if current not in (None, '', {}, []) and incoming != current:
+            logger.warning(
+                'sync receive: refused rewrite of immutable %s.%s uuid=%s',
+                model_class.__name__, field_name, getattr(instance, 'uuid', None),
+            )
+            values.pop(field_name, None)
+    for field_name in immutable_after_manifest:
+        values.pop(field_name, None)
+    return values
+
+
+def _branch_frozen_after_manifest_fields(model_class, instance):
+    """Concrete field names/attnames frozen after a branch close handshake."""
+    if getattr(settings, 'DEPLOYMENT_MODE', 'local') != 'cloud' or not (
+        getattr(instance, 'settlement_manifest', None)
+    ):
+        return frozenset()
+    frozen = set(getattr(
+        model_class,
+        'SYNC_IMMUTABLE_FROM_BRANCH_AFTER_MANIFEST',
+        frozenset(),
+    ))
+    expanded = set(frozen)
+    for name in frozen:
+        try:
+            field = model_class._meta.get_field(name)
+        except Exception:  # noqa: BLE001 - stale declarations stay scalar-safe
+            continue
+        expanded.add(field.name)
+        expanded.add(field.attname)
+    return frozenset(expanded)
+
+
+def _append_only_trusted_update_fields(model_class):
+    """Fields an append-only row may receive from trusted cloud on a branch."""
+    if getattr(settings, 'DEPLOYMENT_MODE', 'local') == 'cloud':
+        return frozenset()
+    return frozenset(getattr(
+        model_class, 'SYNC_APPEND_ONLY_TRUSTED_UPDATE_FIELDS', frozenset(),
+    ))
 
 
 def _pop_automatic_values(model_class, cleaned):
@@ -465,10 +535,23 @@ class CloudReceiver:
                     )
                     return instance, 'skipped'
 
+                trusted_append_fields = frozenset()
                 if getattr(model_class, '_sync_append_only', False):
-                    # UUID is the immutable event identity. A replay is an
-                    # idempotent no-op; a higher version cannot rewrite history.
-                    return instance, 'skipped'
+                    trusted_append_fields = _append_only_trusted_update_fields(
+                        model_class,
+                    )
+                    if not trusted_append_fields:
+                        # UUID is the immutable event identity. A replay is an
+                        # idempotent no-op; a higher version cannot rewrite history.
+                        return instance, 'skipped'
+                    # A branch pulling a cloud manager result may update only
+                    # the explicitly declared acknowledgement field(s). The
+                    # locally frozen financial evidence remains append-only.
+                    cleaned = {
+                        key: value for key, value in cleaned.items()
+                        if key in trusted_append_fields
+                    }
+                    resolved_fks = {}
 
                 # Route through SyncMixin._should_replace so the deterministic
                 # tiebreaker (updated_at then branch_id) applies on equal
@@ -492,13 +575,22 @@ class CloudReceiver:
                 # the receiver clock; restore them with QuerySet.update below.
                 automatic_values = _pop_automatic_values(model_class, cleaned)
 
-                for key, value in _strip_denied(model_class, cleaned, creating=False).items():
+                update_values = _strip_denied(
+                    model_class, cleaned, creating=False,
+                )
+                update_values = _strip_branch_rewrites(
+                    model_class, instance, update_values,
+                )
+                for key, value in update_values.items():
                     setattr(instance, key, value)
 
                 denied = model_class._effective_denylist() \
                     if hasattr(model_class, '_effective_denylist') else frozenset()
+                branch_frozen = _branch_frozen_after_manifest_fields(
+                    model_class, instance,
+                )
                 for fk_field, fk_instance in resolved_fks.items():
-                    if fk_field not in denied:
+                    if fk_field not in denied and fk_field not in branch_frozen:
                         setattr(instance, fk_field, fk_instance)
 
                 instance.sync_version = sync_version
@@ -547,12 +639,21 @@ class CloudReceiver:
                         return instance, 'skipped'
                     instance.uuid = uuid_val
                     # Reconcile = UPDATE of an existing row: protect denied fields.
-                    for key, value in _strip_denied(model_class, cleaned, creating=False).items():
+                    update_values = _strip_denied(
+                        model_class, cleaned, creating=False,
+                    )
+                    update_values = _strip_branch_rewrites(
+                        model_class, instance, update_values,
+                    )
+                    for key, value in update_values.items():
                         setattr(instance, key, value)
                     denied = model_class._effective_denylist() \
                         if hasattr(model_class, '_effective_denylist') else frozenset()
+                    branch_frozen = _branch_frozen_after_manifest_fields(
+                        model_class, instance,
+                    )
                     for fk_field, fk_instance in resolved_fks.items():
-                        if fk_field not in denied:
+                        if fk_field not in denied and fk_field not in branch_frozen:
                             setattr(instance, fk_field, fk_instance)
                     instance.sync_version = sync_version
                     if not _del_denied:       # SYNC_DENY_FROM_BRANCH guard (e.g. User.is_deleted)
@@ -568,6 +669,24 @@ class CloudReceiver:
                     )
                     instance._publish_synced_at_after_commit(using=instance._state.db)
                     return instance, 'updated'
+
+                branch_create_guard = getattr(
+                    model_class, 'branch_sync_create_allowed', None,
+                )
+                if (
+                    getattr(settings, 'DEPLOYMENT_MODE', 'local') == 'cloud'
+                    and branch_create_guard is not None
+                    and not branch_create_guard(
+                        uuid_val=uuid_val,
+                        values=cleaned,
+                        resolved_fks=resolved_fks,
+                    )
+                ):
+                    logger.warning(
+                        'sync receive: refused uncommitted %s create uuid=%s',
+                        model_class.__name__, uuid_val,
+                    )
+                    return None, 'skipped'
 
                 instance = model_class(
                     uuid=uuid_val,
