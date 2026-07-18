@@ -245,6 +245,28 @@ def test_openai_tool_loop_runs_function_calls(settings, monkeypatch):
     assert any(m.get('role') == 'tool' and m.get('content') == '{"orders": 3}'
                for m in calls[1]['messages'])
 
+    # A failing executor is logged locally, but OpenAI receives fixed safe text
+    # rather than an ORM/SDK exception that it could echo to the operator.
+    responses.extend([
+        _Resp(_Msg(tool_calls=[_TC('call_2', 'list_orders', '{}')])),
+        _Resp(_Msg(content='SAFE FINAL ANSWER')),
+    ])
+
+    def failing_executor(name, args):
+        raise RuntimeError('secret database table name')
+
+    text, err = llm.call_ai_tools(
+        'try again', tools=[{'name': 'list_orders'}],
+        tool_executor=failing_executor,
+    )
+    assert err is None and text == 'SAFE FINAL ANSWER'
+    tool_message = next(
+        message for message in calls[3]['messages']
+        if message.get('role') == 'tool'
+    )
+    assert tool_message['content'] == llm.SAFE_TOOL_ERROR_MESSAGE
+    assert 'secret database table name' not in tool_message['content']
+
 
 def test_call_ai_tools_surfaces_tool_errors_without_crashing(settings, monkeypatch):
     settings.AI_PROVIDER = 'claude'
@@ -262,8 +284,11 @@ def test_call_ai_tools_surfaces_tool_errors_without_crashing(settings, monkeypat
     text, err = llm.call_ai_tools(
         'q', tools=[{'name': 'boom'}], tool_executor=executor)
     assert err is None and text == 'handled'
-    # The error is reported back to the model as an is_error tool_result.
+    # The error is reported back to the model as an is_error tool_result, but
+    # raw exception details must never enter provider-visible context.
     second = msgs.calls[1]['messages']
     tr = next(m['content'][0] for m in second
               if m['role'] == 'user' and isinstance(m['content'], list))
-    assert tr.get('is_error') is True and 'kaboom' in tr['content']
+    assert tr.get('is_error') is True
+    assert tr['content'] == llm.SAFE_TOOL_ERROR_MESSAGE
+    assert 'kaboom' not in tr['content']

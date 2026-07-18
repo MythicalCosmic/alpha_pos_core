@@ -2,12 +2,14 @@ from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_POST, require_http_methods
 from base.helpers.request import parse_json_body
-from base.helpers.response import json_response, ServiceResponse
-from base.security.rate_limit import rate_limit
+from base.helpers.response import json_response
+from base.security.rate_limit import rate_limit_by
 from base.security.permissions import admin_required
 from stock.services.ai_assistant_service import (
+    AI_ASSISTANT_ERROR_MESSAGE,
     AI_NOT_CONFIGURED_MESSAGE,
     AI_REQUEST_RATE_LIMIT_MESSAGE,
+    build_ai_error,
 )
 from stock.services.ai_chat_service import AIChatService
 
@@ -15,17 +17,19 @@ from stock.services.ai_chat_service import AIChatService
 # Each query runs a batch of heavy aggregate ORM queries AND a billable Gemini
 # call. The in-service per-user daily quota caps total volume, but nothing
 # bounded the *rate* — a single session could fire them as fast as the network
-# allows. Cap to 10/min per IP; normal interactive use is far below that.
+# allows. Authenticate first, then cap each admin to 10/min. A shared restaurant
+# NAT must not let one operator consume every other operator's bucket.
 @csrf_exempt
 @require_POST
-@rate_limit('ai_query', 10, 60, error_payload={
+@admin_required
+@rate_limit_by('ai_query_user', 10, 60,
+               lambda request: getattr(request.user, 'id', None), error_payload={
     'error': 'rate_limited',
     'error_source': 'alpha_pos',
     'retryable': True,
     'response': AI_REQUEST_RATE_LIMIT_MESSAGE,
     'message': AI_REQUEST_RATE_LIMIT_MESSAGE,
 })
-@admin_required
 def ai_query(request):
     # The assistant calls the configured LLM provider (Claude by default, or
     # Gemini). Without that provider's key the SDK raises deep in the request,
@@ -45,27 +49,44 @@ def ai_query(request):
 
     data, error = parse_json_body(request)
     if error:
-        return json_response(error)
+        body, status = error
+        message = body.get('message') or 'Invalid request.'
+        return JsonResponse(build_ai_error(
+            'invalid_request', message, source='request', retryable=False,
+        ), status=status)
 
     query = (data.get('query') or '').strip()
     if not query:
-        return json_response(ServiceResponse.validation_error(
-            errors={'query': 'Query is required'},
-        ))
+        payload = build_ai_error(
+            'invalid_query', 'Query is required.',
+            source='request', retryable=False,
+        )
+        payload['errors'] = {'query': 'Query is required'}
+        return JsonResponse(payload, status=422)
 
     # Persisted, multi-turn: pass chat_id (alias: conversation_id) to continue a
     # conversation (history is replayed to the model), or omit it to start a new
     # chat. The response carries back BOTH chat_id and conversation_id so either
     # client naming works.
-    result = AIChatService.send(
-        user_id=request.user.id,
-        query=query,
-        chat_id=data.get('chat_id') or data.get('conversation_id'),
-        location_id=data.get('location_id'),
-        # Page context (route/range/filters the user is viewing) -> 'CURRENT VIEW:'
-        # preamble so the model resolves "this/now/these" against the open tab.
-        context=data.get('context'),
-    )
+    try:
+        result = AIChatService.send(
+            user_id=request.user.id,
+            query=query,
+            chat_id=data.get('chat_id') or data.get('conversation_id'),
+            location_id=data.get('location_id'),
+            # Page context (route/range/filters the user is viewing) ->
+            # 'CURRENT VIEW:' preamble so the model resolves "this/now/these"
+            # against the open tab.
+            context=data.get('context'),
+        )
+    except Exception:  # DB/history/persistence failures need the chat contract
+        import logging
+        logging.getLogger(__name__).exception('AI chat request failed')
+        result = build_ai_error(
+            'internal_error', AI_ASSISTANT_ERROR_MESSAGE,
+            source='alpha_pos', retryable=True,
+            suggestions=['Try again'],
+        )
     if isinstance(result, dict) and result.get('chat_id') is not None:
         result.setdefault('conversation_id', result['chat_id'])
     if isinstance(result, dict) and not result.get('success'):
@@ -86,7 +107,9 @@ def ai_query(request):
         'quota_exceeded': 429,
         'invalid_query': 422,
         'query_too_long': 422,
+        'invalid_request': 400,
         'no_api_key': 503,
+        'provider_configuration_error': 503,
         # Provider unavailable / SDK missing / unexpected error — a server-side
         # failure, so return 5xx (not a client 400) and the desktop panel + infra
         # alerting can tell an outage apart from a bad request.

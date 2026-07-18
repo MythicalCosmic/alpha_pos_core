@@ -48,6 +48,48 @@ def test_call_ai_does_not_retry_auth_error(settings, monkeypatch):
     assert err and 'not valid' in err and n['c'] == 1   # not retried
 
 
+def test_provider_sdk_retries_are_disabled(settings, monkeypatch):
+    """Only our bounded retry loop may retry; SDK defaults must not multiply it."""
+    constructor_kwargs = {}
+
+    claude_response = _types.SimpleNamespace(content=[
+        _types.SimpleNamespace(type='text', text='CLAUDE'),
+    ])
+    claude_client = _types.SimpleNamespace(
+        messages=_types.SimpleNamespace(create=lambda **kwargs: claude_response),
+    )
+
+    def anthropic_client(**kwargs):
+        constructor_kwargs['anthropic'] = kwargs
+        return claude_client
+
+    monkeypatch.setattr(
+        llm, 'anthropic', _types.SimpleNamespace(Anthropic=anthropic_client),
+    )
+    settings.ANTHROPIC_API_KEY = 'k'
+    assert llm._call_claude('hi', None, 256) == ('CLAUDE', None)
+
+    openai_response = _types.SimpleNamespace(choices=[
+        _types.SimpleNamespace(message=_types.SimpleNamespace(content='OPENAI')),
+    ])
+    openai_client = _types.SimpleNamespace(chat=_types.SimpleNamespace(
+        completions=_types.SimpleNamespace(create=lambda **kwargs: openai_response),
+    ))
+
+    def openai_factory(**kwargs):
+        constructor_kwargs['openai'] = kwargs
+        return openai_client
+
+    monkeypatch.setattr(
+        llm, 'openai', _types.SimpleNamespace(OpenAI=openai_factory),
+    )
+    settings.OPENAI_API_KEY = 'k'
+    assert llm._call_openai('hi', None, 256) == ('OPENAI', None)
+
+    assert constructor_kwargs['anthropic']['max_retries'] == 0
+    assert constructor_kwargs['openai']['max_retries'] == 0
+
+
 @pytest.mark.django_db
 def test_gemini_falls_back_to_second_model(settings, monkeypatch):
     settings.AI_PROVIDER = 'gemini'

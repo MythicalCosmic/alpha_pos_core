@@ -16,7 +16,7 @@ HISTORY_TURNS = 15
 # Error codes that mean no real exchange happened (validation, quota, missing key)
 # — never persist these, even into an existing chat; the model produced no answer.
 _NO_PERSIST = {'rate_limited', 'invalid_query', 'query_too_long',
-               'quota_exceeded', 'no_api_key'}
+               'quota_exceeded', 'no_api_key', 'provider_configuration_error'}
 
 
 class AIChatService:

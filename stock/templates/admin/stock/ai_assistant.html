@@ -859,7 +859,7 @@ async function send() {
     const t0 = Date.now();
 
     try {
-        const r = await fetch('/ai/query/', {
+        const r = await fetch('{% url "stock:ai-query" %}', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -872,7 +872,8 @@ async function send() {
         const elapsed = Date.now() - t0;
         setThinking(false);
 
-        const response = data?.data?.response || data?.response || data?.error || 'No response received.';
+        const response = data?.data?.response || data?.response || data?.message
+            || data?.error?.message || 'No response received.';
         addAI(response, elapsed);
     } catch (e) {
         setThinking(false);

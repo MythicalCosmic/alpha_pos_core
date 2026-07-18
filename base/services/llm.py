@@ -83,6 +83,16 @@ _PROVIDER_RATE_LIMIT_MARKERS = (
     'resource_exhausted', 'overloaded', 'high demand',
 )
 
+_PROVIDER_CONFIGURATION_MARKERS = _HARD_MARKERS + (
+    'authentication_error', 'authentication failed', 'unauthorized',
+    'permission_denied', 'permission denied', '401', '403',
+)
+
+# A tool exception is logged with its traceback, but only this fixed text is
+# returned to the model. Provider output is ultimately user-visible, so feeding
+# raw ORM/SDK exception strings into the tool loop could disclose internals.
+SAFE_TOOL_ERROR_MESSAGE = 'The requested data tool failed. Continue without this result.'
+
 
 def _is_transient(err) -> bool:
     e = (err or '').lower()
@@ -102,6 +112,12 @@ def is_provider_rate_limited(err) -> bool:
     if any(marker in error for marker in _HARD_MARKERS):
         return False
     return any(marker in error for marker in _PROVIDER_RATE_LIMIT_MARKERS)
+
+
+def is_provider_configuration_error(err) -> bool:
+    """Return whether the provider rejected credentials, account or billing."""
+    error = (err or '').lower()
+    return any(marker in error for marker in _PROVIDER_CONFIGURATION_MARKERS)
 
 
 def _timeout_seconds():
@@ -209,7 +225,9 @@ def call_ai_tools(prompt, system=None, tools=None, tool_executor=None,
     model = getattr(settings, 'ANTHROPIC_MODEL', '') or DEFAULT_CLAUDE_MODEL
 
     try:
-        client = anthropic.Anthropic(api_key=api_key, timeout=_timeout_seconds())
+        client = anthropic.Anthropic(
+            api_key=api_key, timeout=_timeout_seconds(), max_retries=0,
+        )
     except Exception as e:  # noqa: BLE001
         logger.exception('claude client init failed')
         return None, str(e)
@@ -266,11 +284,11 @@ def call_ai_tools(prompt, system=None, tools=None, tool_executor=None,
                         'type': 'tool_result', 'tool_use_id': block.id,
                         'content': out if isinstance(out, str) else str(out),
                     })
-                except Exception as e:  # noqa: BLE001
+                except Exception:  # noqa: BLE001
                     logger.exception('AI tool %s failed', getattr(block, 'name', '?'))
                     results.append({
                         'type': 'tool_result', 'tool_use_id': block.id,
-                        'content': f'Tool error: {e}', 'is_error': True,
+                        'content': SAFE_TOOL_ERROR_MESSAGE, 'is_error': True,
                     })
             messages.append({'role': 'user', 'content': results})
 
@@ -368,7 +386,9 @@ def _call_claude(prompt, system, max_tokens, history=None):
         return None, 'llm_key_missing'
     model = getattr(settings, 'ANTHROPIC_MODEL', '') or DEFAULT_CLAUDE_MODEL
     try:
-        client = anthropic.Anthropic(api_key=api_key, timeout=_timeout_seconds())
+        client = anthropic.Anthropic(
+            api_key=api_key, timeout=_timeout_seconds(), max_retries=0,
+        )
         kwargs = {
             'model': model,
             'max_tokens': max_tokens,
@@ -449,7 +469,9 @@ def _call_openai(prompt, system, max_tokens, history=None):
         return None, 'llm_key_missing'
     model = getattr(settings, 'OPENAI_MODEL', '') or DEFAULT_OPENAI_MODEL
     try:
-        client = openai.OpenAI(api_key=api_key, timeout=_timeout_seconds())
+        client = openai.OpenAI(
+            api_key=api_key, timeout=_timeout_seconds(), max_retries=0,
+        )
         messages = []
         if system:
             messages.append({'role': 'system', 'content': system})
@@ -486,7 +508,9 @@ def _openai_tool_loop(prompt, system, tools, tool_executor, max_tokens,
         return None, 'llm_key_missing'
     model = getattr(settings, 'OPENAI_MODEL', '') or DEFAULT_OPENAI_MODEL
     try:
-        client = openai.OpenAI(api_key=api_key, timeout=_timeout_seconds())
+        client = openai.OpenAI(
+            api_key=api_key, timeout=_timeout_seconds(), max_retries=0,
+        )
     except Exception as e:  # noqa: BLE001
         logger.exception('openai client init failed')
         return None, str(e)
@@ -565,9 +589,9 @@ def _openai_tool_loop(prompt, system, tools, tool_executor, max_tokens,
                     args = {}
                 try:
                     out = tool_executor(tc.function.name, args)
-                except Exception as e:  # noqa: BLE001
+                except Exception:  # noqa: BLE001
                     logger.exception('AI tool %s failed', tc.function.name)
-                    out = f'Tool error: {e}'
+                    out = SAFE_TOOL_ERROR_MESSAGE
                 messages.append({
                     'role': 'tool', 'tool_call_id': tc.id,
                     'content': out if isinstance(out, str) else str(out),

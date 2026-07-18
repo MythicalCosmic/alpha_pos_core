@@ -65,7 +65,7 @@ def rate_limit(key_prefix, max_attempts, window, error_payload=None):
     return decorator
 
 
-def rate_limit_by(key_prefix, max_attempts, window, extractor):
+def rate_limit_by(key_prefix, max_attempts, window, extractor, error_payload=None):
     """Rate-limit by a request-derived key (e.g. username, phone, target id)
     in addition to IP. Use on auth endpoints to defeat distributed
     credential-stuffing where the attacker rotates source IPs.
@@ -85,8 +85,11 @@ def rate_limit_by(key_prefix, max_attempts, window, extractor):
                     f"rl:{key_prefix}:by:{ident}", max_attempts, window,
                 )
                 if retry_after is not None:
+                    body = {"success": False, "message": "Too many requests"}
+                    if error_payload:
+                        body.update(dict(error_payload))
                     return JsonResponse(
-                        {"success": False, "message": "Too many requests"},
+                        body,
                         status=429,
                         headers={"Retry-After": str(retry_after)},
                     )

@@ -40,6 +40,10 @@ AI_PROVIDER_ERROR_MESSAGE = (
     "The AI provider could not process your request right now. "
     "Please try again in a moment. If the problem continues, contact an administrator."
 )
+AI_PROVIDER_CONFIGURATION_MESSAGE = (
+    "The AI provider account or credentials require attention. "
+    "Please contact an administrator."
+)
 AI_ASSISTANT_ERROR_MESSAGE = (
     "The AI assistant could not complete your request right now. "
     "Please try again. If the problem continues, contact an administrator."
@@ -54,7 +58,7 @@ AI_REQUEST_RATE_LIMIT_MESSAGE = (
 )
 
 
-def _ai_error_payload(error, message, *, source, retryable, suggestions=None):
+def build_ai_error(error, message, *, source, retryable, suggestions=None):
     """Build the stable, user-ready failure shape for AI chat responses."""
     payload = {
         "success": False,
@@ -1656,19 +1660,19 @@ class AIStockAssistant:
                       location_id: int = None, history=None,
                       repeat_count: int = 0) -> Dict[str, Any]:
         if not isinstance(query, str) or not query.strip():
-            return _ai_error_payload(
+            return build_ai_error(
                 "invalid_query", "Query must be a non-empty string.",
                 source="request", retryable=False,
             )
         if len(query) > cls.MAX_QUERY_LENGTH:
-            return _ai_error_payload(
+            return build_ai_error(
                 "query_too_long",
                 f"Query exceeds {cls.MAX_QUERY_LENGTH}-character limit.",
                 source="request", retryable=False,
             )
         ok, quota = cls._check_rate_limit(user_id)
         if not ok:
-            return _ai_error_payload(
+            return build_ai_error(
                 "rate_limited",
                 f"Daily AI query quota exceeded ({quota} per day).",
                 source="alpha_pos", retryable=False,
@@ -1738,28 +1742,38 @@ Respond to the user's query based on this data. Follow all language and formatti
 
                 text, err = call_ai(prompt, system=SYSTEM_PROMPT, max_tokens=2048, history=history)
             if err == 'llm_key_missing':
-                return _ai_error_payload(
+                return build_ai_error(
                     "no_api_key", AI_NOT_CONFIGURED_MESSAGE,
                     source="configuration", retryable=False,
                     suggestions=["Configure the AI provider"],
                 )
             if err == 'llm_sdk_missing':
-                return _ai_error_payload(
+                return build_ai_error(
                     "internal_error", AI_ASSISTANT_ERROR_MESSAGE,
                     source="alpha_pos", retryable=True,
                     suggestions=["Try again"],
                 )
             if err:
-                from base.services.llm import is_provider_rate_limited
+                from base.services.llm import (
+                    is_provider_configuration_error,
+                    is_provider_rate_limited,
+                )
+                if is_provider_configuration_error(err):
+                    return build_ai_error(
+                        "provider_configuration_error",
+                        AI_PROVIDER_CONFIGURATION_MESSAGE,
+                        source="configuration", retryable=False,
+                        suggestions=["Contact an administrator"],
+                    )
                 if is_provider_rate_limited(err):
-                    return _ai_error_payload(
+                    return build_ai_error(
                         "quota_exceeded", AI_PROVIDER_RATE_LIMIT_MESSAGE,
                         source="ai_provider", retryable=True,
                         suggestions=["Try again later"],
                     )
                 # Don't echo raw exception text — it leaks internals. Full trace
                 # is logged inside call_claude().
-                return _ai_error_payload(
+                return build_ai_error(
                     "internal_error", AI_PROVIDER_ERROR_MESSAGE,
                     source="ai_provider", retryable=True,
                     suggestions=["Try again", "Stock overview"],
@@ -1777,7 +1791,7 @@ Respond to the user's query based on this data. Follow all language and formatti
             # Don't echo raw exception text — it leaks ORM model names, file
             # paths, and SDK-internal details to the client. The full trace
             # is in the server log via the .exception() call above.
-            return _ai_error_payload(
+            return build_ai_error(
                 "internal_error", AI_ASSISTANT_ERROR_MESSAGE,
                 source="alpha_pos", retryable=True,
                 suggestions=["Try again", "Stock overview"],
@@ -1801,7 +1815,9 @@ __all__ = [
     'AIStockAssistant',
     'AI_PROVIDER_RATE_LIMIT_MESSAGE',
     'AI_PROVIDER_ERROR_MESSAGE',
+    'AI_PROVIDER_CONFIGURATION_MESSAGE',
     'AI_ASSISTANT_ERROR_MESSAGE',
     'AI_NOT_CONFIGURED_MESSAGE',
     'AI_REQUEST_RATE_LIMIT_MESSAGE',
+    'build_ai_error',
 ]
