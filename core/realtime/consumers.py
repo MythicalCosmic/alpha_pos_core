@@ -24,6 +24,11 @@ CASHIERS_GROUP = 'cashiers'
 _CLOSE_AUTH = 4401      # missing/invalid session
 _CLOSE_FORBIDDEN = 4403  # license blocked / insufficient role
 
+# These are the identities that operate a restaurant surface.  USER is a
+# generic/non-staff identity and COURIER belongs exclusively to the courier
+# mobile API; neither may subscribe to the order/KDS/control streams.
+_STAFF_ROLES = frozenset({'ADMIN', 'MANAGER', 'CASHIER', 'WAITER', 'CHEF'})
+
 
 class _GroupConsumer(JsonWebsocketConsumer):
     group = None
@@ -81,7 +86,27 @@ class _GroupConsumer(JsonWebsocketConsumer):
             return None
         if not session or not session.user_id or session.user_id.is_deleted:
             return None
+        if session.is_expired():
+            # A cached Session object must not extend a WebSocket credential
+            # beyond its database lifetime.  Remove both cache and row so a
+            # subsequent handshake cannot keep retrying the dead credential.
+            try:
+                SessionRepository.invalidate_cache(token)
+                SessionRepository.delete(session)
+            except Exception:
+                pass
+            return None
         if getattr(session.user_id, 'status', 'ACTIVE') != 'ACTIVE':
+            return None
+        if getattr(session.user_id, 'role', None) not in _STAFF_ROLES:
+            return None
+        # Defense in depth for legacy role drift.  Edition repos install the
+        # couriers app; the shared-only core safely falls back to the role path.
+        try:
+            from base.security.auth import is_courier_identity
+            if is_courier_identity(session.user_id):
+                return None
+        except Exception:
             return None
         return session.user_id
 

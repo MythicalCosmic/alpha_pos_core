@@ -1,4 +1,5 @@
 import json
+import hashlib
 import logging
 from functools import wraps
 
@@ -80,11 +81,26 @@ def idempotent(scope):
                 # fall through and execute the view; idempotency is opt-in
                 # for clients and only meaningful with a real actor.
                 return view_func(request, *args, **kwargs)
-            # Scope is qualified by the view module so the same logical
-            # name (e.g. "orders.pay") in admins/customers/waiters cannot
-            # collide. A client that reuses a UUID across surfaces should
-            # see distinct claims, not a cross-surface replay.
-            full_scope = f"{view_func.__module__}:{actor_id}:{scope}"
+            # Scope is qualified by the view module *and concrete resource
+            # path*.  The latter is money-critical: without it, a POS client
+            # that accidentally reuses one Idempotency-Key for order A and
+            # order B receives order A's cached 200 for order B even though
+            # order B's pay service never ran.  The UI can then print/confirm
+            # payment while the Order remains unpaid and has no OrderPayment
+            # rows.  Hash the method + path to keep the value comfortably
+            # within IdempotencyKey.scope's 100-character column.
+            resource = f'{request.method}:{request.path_info}'
+            resource_hash = hashlib.sha256(resource.encode('utf-8')).hexdigest()[:16]
+            full_scope = (
+                f"{view_func.__module__}:{actor_id}:{scope}:{resource_hash}"
+            )
+            fingerprint_input = b'\x00'.join((
+                request.method.encode('utf-8'),
+                request.path_info.encode('utf-8'),
+                (request.META.get('QUERY_STRING') or '').encode('utf-8'),
+                request.body or b'',
+            ))
+            request_fingerprint = hashlib.sha256(fingerprint_input).hexdigest()
 
             # Claim the (scope, key) row. Losing the unique-constraint race
             # means another request already owns it — fall through to the
@@ -96,6 +112,7 @@ def idempotent(scope):
                     record = IdempotencyKey.objects.create(
                         scope=full_scope,
                         key=key,
+                        request_fingerprint=request_fingerprint,
                         response_status=0,
                         response_body={},
                     )
@@ -111,6 +128,23 @@ def idempotent(scope):
                     # IntegrityError and the lookup). Behave like a fresh
                     # request rather than 500.
                     return view_func(request, *args, **kwargs)
+                if (
+                    record.request_fingerprint
+                    and record.request_fingerprint != request_fingerprint
+                ):
+                    # One client key represents exactly one request. Returning
+                    # the old success for a changed amount/tender is a false
+                    # acknowledgement; executing it is a duplicate-money risk.
+                    return JsonResponse(
+                        {
+                            'success': False,
+                            'message': (
+                                'Idempotency-Key was already used for a '
+                                'different request.'
+                            ),
+                        },
+                        status=409,
+                    )
                 if record.response_status == 0:
                     age = (timezone.now() - record.created_at).total_seconds()
                     if age < INFLIGHT_TTL_SECONDS:

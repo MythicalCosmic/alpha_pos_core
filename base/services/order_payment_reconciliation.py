@@ -3,7 +3,7 @@ from decimal import Decimal
 from django.db import transaction
 
 
-def reconcile_stale_paid_headers(order_ids):
+def reconcile_stale_paid_headers(order_ids, *, require_later_sync_evidence=True):
     """Repair only the unmistakable paid-header sync-race state.
 
     This is deliberately narrower than normal tender settlement. It never
@@ -11,9 +11,14 @@ def reconcile_stale_paid_headers(order_ids):
     tender evidence must cover an intact unpaid order and its item arithmetic.
     Cash evidence may exceed the bill because the row records cash tendered
     before change; the order header total remains canonical revenue. Returns
-    repaired Order UUID strings.
+    repaired Order UUID strings. ``require_later_sync_evidence=False`` is only
+    for the authenticated cloud-to-owning-branch pull path: there, complete
+    immutable tender rows remain authoritative even after a newer local
+    operational status edit.
     """
-    from base.models import Order, OrderItem, OrderPayment
+    from base.models import (
+        ExternalOrderPayment, Order, OrderItem, OrderPayment,
+    )
 
     repaired = set()
     concrete_methods = {
@@ -38,56 +43,99 @@ def reconcile_stale_paid_headers(order_ids):
             if order is None:
                 continue
 
-            payments = list(
+            till_payments = list(
                 OrderPayment.objects.select_for_update()
                 .filter(order=order, is_deleted=False)
                 .order_by('created_at', 'pk')
             )
-            if not payments:
+            external_payments = list(
+                ExternalOrderPayment.objects.select_for_update()
+                .filter(order=order, is_deleted=False)
+                .order_by('occurred_at', 'pk')
+            )
+            if not till_payments and not external_payments:
                 continue
-            if any(payment.method not in concrete_methods for payment in payments):
+            if any(
+                payment.method not in concrete_methods
+                for payment in [*till_payments, *external_payments]
+            ):
                 continue
-            if any(payment.branch_id != order.branch_id for payment in payments):
+            if any(
+                payment.branch_id != order.branch_id
+                for payment in [*till_payments, *external_payments]
+            ):
                 continue
-            if any(payment.amount < 0 for payment in payments):
+            if any(payment.amount < 0 for payment in till_payments):
+                continue
+            if any(payment.amount <= 0 for payment in external_payments):
                 continue
             noncash_sum = sum(
-                (payment.amount for payment in payments
+                (payment.amount for payment in till_payments
                  if payment.method != Order.PaymentMethod.CASH),
                 Decimal('0'),
             )
-            cash_sum = sum(
-                (payment.amount for payment in payments
+            noncash_sum += sum(
+                (payment.amount for payment in external_payments
+                 if payment.method != Order.PaymentMethod.CASH),
+                Decimal('0'),
+            )
+            till_cash_tendered = sum(
+                (payment.amount for payment in till_payments
                  if payment.method == Order.PaymentMethod.CASH),
                 Decimal('0'),
             )
-            if noncash_sum > order.total_amount:
-                continue
-            has_cash = any(
-                payment.method == Order.PaymentMethod.CASH
-                for payment in payments
+            external_cash = sum(
+                (payment.amount for payment in external_payments
+                 if payment.method == Order.PaymentMethod.CASH),
+                Decimal('0'),
             )
-            if has_cash:
+            exact_external_total = noncash_sum + external_cash
+            if exact_external_total > order.total_amount:
+                continue
+            has_till_cash = any(
+                payment.method == Order.PaymentMethod.CASH
+                for payment in till_payments
+            )
+            residual = order.total_amount - exact_external_total
+            if has_till_cash:
                 # CASH rows store the amount tendered and may include change.
-                # Only the residual bill after non-cash must be covered; the
-                # header total remains canonical revenue.
-                if cash_sum < order.total_amount - noncash_sum:
+                # Only the residual bill after exact non-drawer collections
+                # must be covered; the header total remains canonical revenue.
+                if till_cash_tendered < residual:
                     continue
-            elif noncash_sum != order.total_amount:
-                # Card/Payme cannot over- or under-tender.
+            elif residual != 0:
+                # External cash and all non-cash evidence are exact collected
+                # amounts; only a till CASH line may legitimately include change.
                 continue
             inferred_paid_at = max(
-                (payment.created_at for payment in payments if payment.created_at),
+                [
+                    payment.created_at
+                    for payment in till_payments if payment.created_at
+                ] + [
+                    payment.occurred_at
+                    for payment in external_payments if payment.occurred_at
+                ],
                 default=None,
             )
-            if not inferred_paid_at or inferred_paid_at < order.updated_at:
+            if not inferred_paid_at:
+                continue
+            if (
+                require_later_sync_evidence
+                and inferred_paid_at < order.updated_at
+            ):
                 # Protect pay -> unpay ordering: an old payment delivered after
                 # a newer explicit unpay header must not resurrect the sale.
                 continue
-            if not order.synced_at or any(not payment.synced_at for payment in payments):
-                continue
-            if max(payment.synced_at for payment in payments) <= order.synced_at:
-                continue
+            if require_later_sync_evidence:
+                all_payments = [*till_payments, *external_payments]
+                if not order.synced_at or any(
+                    not payment.synced_at for payment in all_payments
+                ):
+                    continue
+                if max(
+                    payment.synced_at for payment in all_payments
+                ) <= order.synced_at:
+                    continue
 
             items = list(
                 OrderItem.objects.select_for_update()
@@ -100,11 +148,24 @@ def reconcile_stale_paid_headers(order_ids):
             )
             if item_gross != order.subtotal:
                 continue
-            if order.total_amount != order.subtotal - order.discount_amount:
+            # Product arithmetic remains strict, while total_amount may also
+            # contain non-product delivery fees/tips (Telegram/online orders).
+            # Those additions are non-negative by contract, so the customer
+            # total can exceed, but never fall below, discounted product value.
+            product_net = order.subtotal - order.discount_amount
+            if (
+                order.subtotal < 0
+                or order.discount_amount < 0
+                or product_net < 0
+                or order.total_amount < product_net
+            ):
                 continue
 
             order.is_paid = True
-            methods = {payment.method for payment in payments}
+            methods = {
+                payment.method
+                for payment in [*till_payments, *external_payments]
+            }
             order.payment_method = (
                 next(iter(methods)) if len(methods) == 1
                 else Order.PaymentMethod.MIXED

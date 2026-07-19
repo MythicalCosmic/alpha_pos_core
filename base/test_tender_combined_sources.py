@@ -64,3 +64,16 @@ def test_cash_tender_may_exceed_but_must_cover_bill_residual():
     assert split['card'] == Decimal('20000')
     assert split['cash'] == Decimal('30000')
     assert split['unknown'] == Decimal('0')
+
+
+def test_external_cash_is_exact_and_cannot_hide_as_till_change():
+    split, _detail = split_from_rows(
+        Decimal('100000'),
+        'MIXED',
+        op_rows=[('UZCARD', Decimal('60000'))],
+        courier_rows=[('CASH', Decimal('50000'))],
+        order_id=1,
+    )
+
+    assert split['unknown'] == Decimal('100000')
+    assert sum(split.values()) == Decimal('100000')

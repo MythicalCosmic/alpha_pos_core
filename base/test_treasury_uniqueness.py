@@ -26,7 +26,7 @@ def test_soft_deleted_historical_account_does_not_block_replacement():
 
 
 @pytest.mark.django_db(transaction=True)
-def test_treasury_migration_merges_legacy_duplicate_balances():
+def test_treasury_migration_merges_legacy_duplicate_balances(request):
     from django.db import connection
     from django.db.migrations.executor import MigrationExecutor
 
@@ -34,6 +34,13 @@ def test_treasury_migration_merges_legacy_duplicate_balances():
     after = [('base', '0041_unique_active_treasury_account')]
 
     executor = MigrationExecutor(connection)
+    latest = executor.loader.graph.leaf_nodes()
+    # Migration tests mutate the shared test schema. Always restore every app
+    # to its leaf nodes, even if an assertion below fails, so later
+    # transaction=True tests do not run against base@0041.
+    request.addfinalizer(
+        lambda: MigrationExecutor(connection).migrate(latest)
+    )
     executor.migrate(before)
     old_apps = executor.loader.project_state(before).apps
     OldAccount = old_apps.get_model('base', 'TreasuryAccount')

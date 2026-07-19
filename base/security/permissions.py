@@ -2,7 +2,7 @@ from functools import wraps
 from django.http import JsonResponse
 from base.helpers.request import get_session_key
 from base.repositories import SessionRepository
-from base.security.auth import _ua_matches
+from base.security.auth import _ua_matches, is_courier_identity
 
 
 def _session_role_required(allowed_roles, denied_message):
@@ -38,6 +38,16 @@ def _session_role_required(allowed_roles, denied_message):
                 return JsonResponse(
                     {"success": False, "message": "Invalid or expired session"},
                     status=401,
+                )
+            # Courier access tokens live in the shared Session table, but are
+            # intentionally a different audience.  Checking the linked
+            # Courier profile as well as the role closes a role-drift window:
+            # changing a courier user back to CASHIER/MANAGER must not turn an
+            # already-issued mobile bearer into a POS/admin bearer.
+            if is_courier_identity(session.user_id):
+                return JsonResponse(
+                    {"success": False, "message": "Session audience not permitted"},
+                    status=403,
                 )
             if session.user_id.role not in allowed_roles:
                 return JsonResponse(

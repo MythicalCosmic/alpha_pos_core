@@ -9,7 +9,6 @@ completes and a retry sweep picks it up later.
 import logging
 from datetime import timedelta
 
-from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
@@ -51,6 +50,18 @@ class FiscalizationService:
         order = Order.objects.filter(id=order_id).first()
         if not order:
             return ServiceResponse.not_found('Order not found')
+        if (
+            receipt_type == FiscalReceipt.ReceiptType.SALE
+            and (not order.is_paid or order.paid_at is None)
+        ):
+            # The manual admin/management endpoint reaches this service too.
+            # Never let it turn an unpaid kitchen ticket into an official sale
+            # receipt; only the committed payment path may establish the paid
+            # header (and its OrderPayment/CourierPayment evidence) first.
+            return ServiceResponse.validation_error(
+                errors={'order': 'Order payment has not been committed'},
+                message='Cannot fiscalize an unpaid order',
+            )
 
         mode = FiscalConfig.get_mode()
         cfg = FiscalConfig.tenant()

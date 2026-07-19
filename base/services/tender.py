@@ -17,7 +17,7 @@ cancel path reverses. Summing the raw CASH lines over-reports cash by the change
 
 An order is attributed by this ladder (first match wins):
 
-  1. complete till and/or courier payment lines -> cash = total - all noncash
+  1. complete till and/or external payment lines -> cash = total - all noncash
   2. no lines, payment_method NULL | CASH      -> cash  = total   (documented legacy)
   3. no lines, payment_method UZCARD|HUMO|CARD -> card  = total
   4. no lines, payment_method PAYME            -> payme = total
@@ -80,8 +80,10 @@ def _dec(v):
 def split_from_rows(total, payment_method, op_rows=(), courier_rows=(), order_id=None):
     """Pure ladder over plain data. Returns (split, card_detail).
 
-    `op_rows` / `courier_rows` are iterables of (method, amount) — courier providers
-    must already be mapped to a tender. The returned split sums EXACTLY to `total`.
+    `op_rows` / `courier_rows` are iterables of (method, amount). The latter is
+    the exact non-drawer collection stream: canonical ExternalOrderPayment rows
+    plus a de-duplicated legacy CourierPayment fallback. The returned split
+    sums EXACTLY to `total`.
     """
     total = _dec(total)
     split, detail = empty_split(), empty_detail()
@@ -140,6 +142,35 @@ def split_from_rows(total, payment_method, op_rows=(), courier_rows=(), order_id
     op_rows = list(op_rows)
     courier_rows = list(courier_rows)
     if op_rows or courier_rows:
+        # A till CASH line is cash tendered and may contain change. External
+        # collections are exact settled amounts, so they may never borrow the
+        # till-CASH change rule to hide an over-collection.
+        external_total = ZERO
+        for method, amount in courier_rows:
+            normalized = normalize_method(method)
+            amount = _dec(amount)
+            if normalized not in KNOWN_METHODS or amount <= ZERO:
+                logger.error(
+                    'tender: order %s has invalid external payment %r=%s '
+                    '-> unknown', order_id, method, amount,
+                )
+                split['unknown'] = total
+                return split, detail
+            external_total += amount
+        till_noncash = sum(
+            (_dec(amount) for method, amount in op_rows
+             if normalize_method(method) in NONCASH_METHODS
+             and _dec(amount) > ZERO),
+            ZERO,
+        )
+        if external_total + till_noncash > total:
+            logger.error(
+                'tender: order %s exact external=%s plus till noncash=%s '
+                'exceeds total=%s -> unknown',
+                order_id, external_total, till_noncash, total,
+            )
+            split['unknown'] = total
+            return split, detail
         got = _derive(op_rows + courier_rows, 'payment')
         if got:
             return got
@@ -164,24 +195,43 @@ def split_from_rows(total, payment_method, op_rows=(), courier_rows=(), order_id
 
 
 def _courier_rows_by_order(order_ids):
-    """{order_id: [(tender, amount)]} for PAID courier collections. Empty when the
-    couriers app is not installed in this edition."""
+    """Return exact non-drawer collection rows, de-duplicated by event ID.
+
+    ``ExternalOrderPayment`` is the canonical synced evidence available in
+    every edition. The optional courier app remains a compatibility fallback
+    for historical rows created before that event existed; once its external_id
+    has a canonical mirror, only the synced row is counted.
+    """
     if not order_ids:
         return {}
+    from base.models import ExternalOrderPayment
+
+    ids = list(order_ids)
+    out = {}
+    mirrored = set()
+    for oid, method, amount, source_id in ExternalOrderPayment.objects.filter(
+        order_id__in=ids,
+        source=ExternalOrderPayment.Source.COURIER,
+        is_deleted=False,
+    ).values_list('order_id', 'method', 'amount', 'source_id'):
+        out.setdefault(oid, []).append((method, amount))
+        mirrored.add((oid, str(source_id or '')))
+
     try:
         from couriers.models import CourierPayment
     except Exception:  # noqa: BLE001 — edition without the courier app
-        return {}
-    out = {}
+        return out
     try:
         rows = CourierPayment.objects.filter(
-            order_id__in=list(order_ids), status='PAID',
-        ).values_list('order_id', 'provider', 'amount')
+            order_id__in=ids, status__in=['PAID', 'REFUNDED'],
+        ).values_list('order_id', 'provider', 'amount', 'external_id')
     except Exception:  # noqa: BLE001 — table missing on a half-migrated DB
         logger.exception('tender: courier payment lookup failed')
-        return {}
+        return out
     mapping = CourierPayment.PROVIDER_TO_METHOD
-    for oid, provider, amount in rows:
+    for oid, provider, amount, external_id in rows:
+        if (oid, str(external_id or '')) in mirrored:
+            continue
         out.setdefault(oid, []).append((mapping.get(provider, provider), amount))
     return out
 
@@ -341,13 +391,17 @@ def unattributed_orders(order_qs=None):
     payment lines. Must be 0. A non-zero count is the detector for the sync
     dead-letter hole (an Order lands on the cloud, its payments never do)."""
     from django.db.models import Count, Q
-    from base.models import Order
+    from base.models import ExternalOrderPayment, Order
     qs = order_qs if order_qs is not None else Order.objects.filter(
         is_deleted=False, is_paid=True)
     missing = (qs.annotate(_n=Count('payments', filter=Q(payments__is_deleted=False)))
                  .filter(_n=0)
                  .exclude(payment_method=CASH)
                  .exclude(payment_method__isnull=True))
+    external_orders = ExternalOrderPayment.objects.filter(
+        is_deleted=False, order_id__in=missing.values('pk'),
+    ).values('order_id')
+    missing = missing.exclude(pk__in=external_orders)
     # A courier-only delivery correctly has no till OrderPayment row. Do not
     # report it as missing when its PAID courier collection is present.
     try:
@@ -361,8 +415,14 @@ def unattributed_orders(order_qs=None):
     return missing
 
 
-def tender_integrity_issues(order_qs):
-    """List paid orders whose concrete tender evidence is missing/incomplete."""
+def tender_integrity_issues(order_qs, *, require_concrete=False):
+    """List paid orders whose tender evidence is missing or incomplete.
+
+    ``require_concrete`` is used by the post-upgrade shift lifecycle. Legacy
+    reports may still interpret a CASH header without child rows, but a newly
+    settlement-eligible shift must prove every positive sale with either an
+    OrderPayment or a completed CourierPayment before it can be handed over.
+    """
     rows = list(order_qs.values('id', 'total_amount', 'payment_method'))
     if not rows:
         return []
@@ -382,7 +442,13 @@ def tender_integrity_issues(order_qs):
         payment_rows = till.get(order_id, ())
         courier_rows = courier.get(order_id, ())
         if not payment_rows and not courier_rows:
-            if normalize_method(row['payment_method']) != CASH:
+            if (
+                _dec(row['total_amount']) > ZERO
+                and (
+                    require_concrete
+                    or normalize_method(row['payment_method']) != CASH
+                )
+            ):
                 issues.append({
                     'order_id': order_id,
                     'amount': _dec(row['total_amount']),

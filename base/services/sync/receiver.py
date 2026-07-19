@@ -182,28 +182,12 @@ def _strip_branch_rewrites(model_class, instance, values):
     values = dict(values)
     if getattr(settings, 'DEPLOYMENT_MODE', 'local') != 'cloud':
         return values
-    create_only = set(getattr(
-        model_class, 'SYNC_CREATE_ONLY_FROM_BRANCH', frozenset(),
-    ))
-    immutable_after_set = set(getattr(
-        model_class, 'SYNC_IMMUTABLE_FROM_BRANCH_AFTER_SET', frozenset(),
-    ))
+    model_guard = getattr(model_class, '_strip_sync_branch_rewrites', None)
+    if model_guard is not None:
+        values = model_guard(instance, values)
     immutable_after_manifest = _branch_frozen_after_manifest_fields(
         model_class, instance,
     )
-    for field_name in create_only:
-        values.pop(field_name, None)
-    for field_name in immutable_after_set:
-        if field_name not in values:
-            continue
-        current = getattr(instance, field_name, None)
-        incoming = values[field_name]
-        if current not in (None, '', {}, []) and incoming != current:
-            logger.warning(
-                'sync receive: refused rewrite of immutable %s.%s uuid=%s',
-                model_class.__name__, field_name, getattr(instance, 'uuid', None),
-            )
-            values.pop(field_name, None)
     for field_name in immutable_after_manifest:
         values.pop(field_name, None)
     return values
@@ -333,7 +317,9 @@ class CloudReceiver:
                         affected_order_ids.add(instance.id)
                     elif model_label == 'OrderItem' and instance.order_id:
                         affected_order_ids.add(instance.order_id)
-                    elif model_label == 'OrderPayment' and instance.order_id:
+                    elif model_label in {
+                        'OrderPayment', 'ExternalOrderPayment',
+                    } and instance.order_id:
                         affected_order_ids.add(instance.order_id)
             except Exception as e:
                 rec_uuid = record_data.get("uuid")

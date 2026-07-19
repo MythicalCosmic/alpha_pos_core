@@ -532,6 +532,8 @@ class SyncService:
         from django.conf import settings
         from django.db import transaction
         results = {'created': 0, 'updated': 0, 'skipped': 0, 'errors': [], 'deferred': []}
+        affected_order_ids = set()
+        model_label = model_class.__name__
         for record in records:
             try:
                 if (
@@ -561,7 +563,9 @@ class SyncService:
                     quarantine_marker = SyncStatus.restore_quarantined_target(
                         model_class, record,
                     )
-                    _, action = model_class.from_sync_dict(record, branch_id=source_branch)
+                    instance, action = model_class.from_sync_dict(
+                        record, branch_id=source_branch,
+                    )
                     if action == 'deferred' and quarantine_marker:
                         # Roll back the temporary restore and all partial work;
                         # the durable marker remains for the retry.
@@ -571,6 +575,20 @@ class SyncService:
                     results['deferred'].append(record)
                 elif action in ('created', 'updated', 'skipped'):
                     results[action] += 1
+                # Order payment headers are deliberately protected from a raw
+                # cloud overwrite on a till.  Re-derive them from concrete
+                # pulled tender evidence instead. Track Order/Item too so a
+                # payment that arrived on an earlier feed page is retried when
+                # its full parent/item evidence lands later.
+                if instance is not None:
+                    if model_label == 'Order':
+                        affected_order_ids.add(instance.id)
+                    elif model_label in (
+                        'OrderItem', 'OrderPayment', 'ExternalOrderPayment',
+                    ) and getattr(
+                        instance, 'order_id', None,
+                    ):
+                        affected_order_ids.add(instance.order_id)
             except _QuarantinedRecordDeferred:
                 results['deferred'].append(record)
             except Exception as e:
@@ -580,6 +598,40 @@ class SyncService:
                 })
                 results['deferred'].append(record)
                 results['skipped'] += 1
+
+        if affected_order_ids and getattr(settings, 'DEPLOYMENT_MODE', '') == 'local':
+            try:
+                from base.services.order_payment_reconciliation import (
+                    reconcile_stale_paid_headers,
+                )
+                # These are branch-targeted records from the authenticated
+                # cloud feed. Full live tender coverage is itself immutable
+                # payment evidence. A later local READY/status edit may have
+                # cleared synced_at or advanced updated_at, but it is not an
+                # unpay event and must not leave the same bill collectable.
+                repaired = reconcile_stale_paid_headers(
+                    affected_order_ids,
+                    require_later_sync_evidence=False,
+                )
+                if repaired:
+                    logger.warning(
+                        'Pull repaired %d evidence-backed paid order header(s): %s',
+                        len(repaired), ','.join(sorted(repaired)),
+                    )
+            except Exception as exc:  # noqa: BLE001
+                # Do not advance the change-feed cursor past a transient
+                # reconciliation failure. Exact record replays are idempotent
+                # and will drive this hook again on the deferred pass/next pull.
+                logger.warning(
+                    'post-pull money reconciliation failed for %s',
+                    model_label,
+                    exc_info=True,
+                )
+                results['errors'].append({
+                    'uuid': None,
+                    'error': f'post-pull money reconciliation failed: {exc}',
+                })
+                results['deferred'].extend(records)
         return results
 
     @classmethod

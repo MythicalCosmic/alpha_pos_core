@@ -152,7 +152,7 @@ class TestReconciliationInvariants:
         )
         amounts = amounts or {'CASH': '100.00', 'UZCARD': '50.00'}
         _tender_evidence(shift, user, amounts)
-        rows = _freeze_settlement(
+        _freeze_settlement(
             shift,
             counted={
                 method: ('90.00' if method == 'CASH' else max(Decimal(str(value)), 0))
@@ -243,6 +243,39 @@ class TestReconciliationInvariants:
         assert conflict_status == 422, conflict
         assert TreasuryAccount.objects.get(kind='SAFE').balance == Decimal('143.00')
         assert TreasuryTransaction.objects.count() == 2
+
+    def test_unpaid_ready_order_from_old_close_blocks_cloud_reconciliation(self):
+        """The hub protects shifts closed by clients with the old OPEN-only guard."""
+        from base.models import CashReconciliation, Order, TreasuryTransaction
+        from core.shifts.service import ShiftService
+
+        user, shift = self._ended()
+        Order.objects.create(
+            user=user,
+            cashier=user,
+            branch_id=shift.branch_id,
+            status=Order.Status.READY,
+            is_paid=False,
+            subtotal='127000.00',
+            total_amount='127000.00',
+        )
+
+        result, status = ShiftService.reconcile(
+            shift.id,
+            actual_cash='100.00',
+            notes='must not post an incomplete close',
+            reconciled_by_id=user.id,
+            confirmed={'CASH': '100.00', 'UZCARD': '50.00'},
+        )
+
+        assert status == 422, result
+        assert result['errors']['code'] == 'SETTLEMENT_SYNC_INCOMPLETE'
+        assert 'unpaid' in result['errors']['settlement'].lower()
+        assert not CashReconciliation.objects.filter(shift=shift).exists()
+        assert not TreasuryTransaction.objects.filter(
+            reference_type='ShiftSettlement',
+            reference_id=shift.id,
+        ).exists()
 
     def test_mixed_all_tenders_post_to_safe_and_zero_is_ledger_noop(self):
         from base.models import TreasuryAccount, TreasuryTransaction
@@ -729,7 +762,7 @@ def test_sale_and_refund_are_distinct_shift_settlement_events():
     # Operational cancellation does not rewrite or erase the original sale.
     order.status = 'CANCELED'
     order.save(update_fields=['status'])
-    refund = OrderRefund.objects.create(
+    OrderRefund.objects.create(
         order=order,
         shift=refund_shift,
         cashier=user,

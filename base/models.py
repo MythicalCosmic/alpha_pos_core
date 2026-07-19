@@ -310,6 +310,12 @@ class SyncMixin(models.Model):
     # have defaults; only required/no-default fields pass so the row can exist.
     SYNC_WRITE_DENYLIST = frozenset()
     SYNC_DENY_FROM_BRANCH = frozenset()
+    # Fields supplied by a branch only when the row is first created on the
+    # cloud.  They describe immutable producer evidence (for example an
+    # Order's POS/QR origin), so a rolling older terminal may omit or replay a
+    # default value but can never rewrite the value already accepted by the
+    # hub.  Cloud-authored updates still flow down to branches normally.
+    SYNC_CREATE_ONLY_FROM_BRANCH = frozenset()
 
     # Natural keys that uniquely identify a record independent of its uuid.
     # When an incoming sync record's uuid isn't found locally but another row
@@ -420,6 +426,59 @@ class SyncMixin(models.Model):
                 continue
             cleaned[key] = value
         return cleaned
+
+    @classmethod
+    def _strip_sync_branch_rewrites(cls, instance, data, *, mode=None):
+        """Protect producer-owned fields on branch -> cloud updates.
+
+        ``CloudReceiver`` is the normal push path, while a few maintenance and
+        test paths call ``from_sync_dict`` directly.  Keeping the declaration
+        here makes the ownership rule identical in both paths instead of
+        relying on one transport-specific guard.
+        """
+        effective_mode = mode or getattr(settings, 'DEPLOYMENT_MODE', 'local')
+        if effective_mode != 'cloud':
+            return data
+
+        import logging
+        values = dict(data)
+        for field_name in getattr(
+            cls, 'SYNC_CREATE_ONLY_FROM_BRANCH', frozenset(),
+        ):
+            if field_name in values:
+                logging.getLogger(__name__).warning(
+                    'sync ingest: refused create-only rewrite of %s.%s uuid=%s',
+                    cls.__name__, field_name, getattr(instance, 'uuid', None),
+                )
+                values.pop(field_name, None)
+
+        for field_name in getattr(
+            cls, 'SYNC_IMMUTABLE_FROM_BRANCH_AFTER_SET', frozenset(),
+        ):
+            if field_name not in values:
+                continue
+            current = getattr(instance, field_name, None)
+            incoming = values[field_name]
+            if current not in (None, '', {}, []) and incoming != current:
+                logging.getLogger(__name__).warning(
+                    'sync ingest: refused rewrite of immutable %s.%s uuid=%s',
+                    cls.__name__, field_name, getattr(instance, 'uuid', None),
+                )
+                values.pop(field_name, None)
+        return values
+
+    @classmethod
+    def _repair_equal_version_sync(
+        cls, instance, incoming_version, incoming_data, incoming_branch,
+    ):
+        """Apply a narrowly-scoped equal-version convergence repair.
+
+        Normal conflict resolution never lets an equal version overwrite a
+        row. Models may override this hook for one immutable rollout field;
+        it runs only after UUID ownership/branch validation and under the same
+        row lock as ordinary sync ingestion.
+        """
+        return False
 
     @classmethod
     def _pop_sync_automatic_values(cls, data):
@@ -609,6 +668,13 @@ class SyncMixin(models.Model):
                     cls.__name__, uuid_val, instance.branch_id, incoming_branch,
                 )
                 return instance, 'skipped'
+            if cls._repair_equal_version_sync(
+                instance,
+                sync_version,
+                {**data, 'updated_at': incoming_updated},
+                incoming_branch,
+            ):
+                return instance, 'updated'
             # Refuse to resurrect a hard-deleted row's slot via an older
             # incoming payload. (Soft-deletes are handled by is_deleted
             # propagation; this branch only fires for live rows.)
@@ -622,7 +688,11 @@ class SyncMixin(models.Model):
             # A locally-tombstoned row is terminal — never resurrect it.
             if instance.is_deleted and not is_deleted:
                 return instance, 'skipped'
-            for key, value in cls._strip_sync_denied(data, creating=False).items():
+            update_values = cls._strip_sync_denied(data, creating=False)
+            update_values = cls._strip_sync_branch_rewrites(
+                instance, update_values,
+            )
+            for key, value in update_values.items():
                 if hasattr(instance, key):
                     setattr(instance, key, value)
             for fk_field, related in resolved_fks.items():
@@ -650,7 +720,11 @@ class SyncMixin(models.Model):
                 instance.uuid = uuid_val
                 # Reconcile onto an existing row → an UPDATE: protect denied
                 # fields just like the version-matched update branch.
-                for key, value in cls._strip_sync_denied(data, creating=False).items():
+                update_values = cls._strip_sync_denied(data, creating=False)
+                update_values = cls._strip_sync_branch_rewrites(
+                    instance, update_values,
+                )
+                for key, value in update_values.items():
                     if hasattr(instance, key):
                         setattr(instance, key, value)
                 for fk_field, related in resolved_fks.items():
@@ -739,6 +813,10 @@ class User(SyncMixin, models.Model):
         # (settings, etc.). Gated server-side via role_required('MANAGER').
         MANAGER = "MANAGER", "Manager"
         WAITER = "WAITER", "Waiter"
+        # Mobile courier identities authenticate through couriers.courier_required
+        # only. They must never inherit CASHIER/POS permissions merely because
+        # both products use the same Session table.
+        COURIER = "COURIER", "Courier"
         # Kitchen staff. Created without a password (non-login label — used for
         # kitchen attribution / KDS), so it never appears in the cashier login
         # picker (get_pos_staff admits only CASHIER/MANAGER) and can't sign in.
@@ -1363,6 +1441,19 @@ class Order(SyncMixin, models.Model):
         'accounting_recorded_at',
     })
     SYNC_DENY_FROM_BRANCH = frozenset({'accounting_recorded_at'})
+    # Origin is producer evidence, accepted when a branch first creates the
+    # order but never rewritten by later branch pushes.  In particular, an old
+    # till that only knows the POS default cannot downgrade a cloud TELEGRAM or
+    # QR origin during status/payment updates.
+    SYNC_CREATE_ONLY_FROM_BRANCH = frozenset({'order_origin'})
+
+    @classmethod
+    def branch_sync_create_allowed(cls, *, uuid_val, values, resolved_fks):
+        """A till may originate POS/QR orders, never impersonate Telegram."""
+        return values.get('order_origin', cls.Origin.POS) in {
+            cls.Origin.POS,
+            cls.Origin.QR,
+        }
 
     def to_sync_dict(self):
         data = super().to_sync_dict()
@@ -1392,6 +1483,25 @@ class Order(SyncMixin, models.Model):
         data = data.copy()
         data.pop('accounting_recorded_at', None)
         return super().from_sync_dict(data, branch_id=branch_id)
+
+    @classmethod
+    def _repair_equal_version_sync(
+        cls, instance, incoming_version, incoming_data, incoming_branch,
+    ):
+        # Rolling terminals may already hold a server order at the same
+        # version with the pre-field POS default. Repair only that legacy
+        # POS -> remote transition. Never rewrite QR <-> TELEGRAM.
+        incoming_origin = incoming_data.get('order_origin')
+        if not (
+            getattr(settings, 'DEPLOYMENT_MODE', 'local') != 'cloud'
+            and incoming_version == instance.sync_version
+            and instance.order_origin == cls.Origin.POS
+            and incoming_origin in {cls.Origin.QR, cls.Origin.TELEGRAM}
+        ):
+            return False
+        cls.objects.filter(pk=instance.pk).update(order_origin=incoming_origin)
+        instance.order_origin = incoming_origin
+        return True
 
     class Meta:
         indexes = [
@@ -2236,6 +2346,9 @@ class AuditLog(SyncMixin, models.Model):
         LOYALTY_REDEEM = "LOYALTY_REDEEM", "Loyalty stamps redeemed"
         TREASURY_TRANSFER = "TREASURY_TRANSFER", "Treasury transfer"
         TREASURY_EXPENSE = "TREASURY_EXPENSE", "Treasury expense"
+        ORDER_PAYMENT_REPAIR = (
+            "ORDER_PAYMENT_REPAIR", "Order payment repaired"
+        )
 
     actor = models.ForeignKey(
         User,
@@ -2306,6 +2419,11 @@ class IdempotencyKey(models.Model):
 
     scope = models.CharField(max_length=100, db_index=True)
     key = models.CharField(max_length=128, db_index=True)
+    # Bind one client key to the exact request it first represented.  Resource
+    # path lives in ``scope`` so different orders never collide; this digest
+    # additionally rejects changing the query/body under the same key (for
+    # example a second treasury transfer with a different amount).
+    request_fingerprint = models.CharField(max_length=64, blank=True, default='')
     response_status = models.PositiveSmallIntegerField(default=0)
     response_body = models.JSONField(default=dict)
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
@@ -2433,6 +2551,164 @@ class OrderPayment(SyncMixin, models.Model):
 
     def __str__(self):
         return f"OrderPayment<{self.method} {self.amount} on #{self.order_id}>"
+
+
+class ExternalOrderPayment(SyncMixin, models.Model):
+    """Immutable payment evidence collected outside a POS cash drawer.
+
+    ``OrderPayment`` is till tender: its CASH rows may include customer change
+    and participate in physical drawer reconciliation.  Courier/provider money
+    has a different accounting meaning, so overloading that table makes a
+    synced cloud collection look as if it entered the owning terminal's drawer.
+
+    This write-once event is the cross-edition contract instead.  It is synced
+    to the owning branch, can repair the protected ``Order.is_paid`` header,
+    and participates in revenue/tender attribution, but it is *never* drawer
+    cash.  Provider refunds remain separate append-only ``OrderRefund`` events;
+    the positive collection is not deleted or rewritten.
+    """
+
+    class Source(models.TextChoices):
+        COURIER = 'COURIER', 'Courier/provider collection'
+
+    order = models.ForeignKey(
+        'base.Order', on_delete=models.PROTECT,
+        related_name='external_payments',
+    )
+    source = models.CharField(max_length=16, choices=Source.choices)
+    source_id = models.CharField(max_length=160)
+    method = models.CharField(max_length=10, choices=Order.PaymentMethod.choices)
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    occurred_at = models.DateTimeField(db_index=True)
+
+    objects = SyncManager()
+
+    # UUID and the branch-scoped provider key both identify the same immutable
+    # money event.  Exact pull/push replays are no-ops; no peer can revise it.
+    _sync_append_only = True
+    SYNC_NATURAL_KEYS = ('branch_id', 'source', 'source_id')
+
+    @classmethod
+    def branch_sync_create_allowed(cls, *, uuid_val, values, resolved_fks):
+        """Accept only a complete concrete event from its owning branch.
+
+        A branch is already allowed to originate ordinary OrderPayment rows;
+        this guard gives courier/mobile collections the same authority without
+        allowing arbitrary sources, MIXED pseudo-lines, zero money, or an event
+        detached from a branch-owned Order.
+        """
+        from decimal import Decimal, InvalidOperation
+
+        order = resolved_fks.get('order')
+        if order is None:
+            return False
+        if values.get('source') != cls.Source.COURIER:
+            return False
+        if not str(values.get('source_id') or '').strip():
+            return False
+        if values.get('method') not in {
+            value for value, _label in Order.PaymentMethod.choices
+            if value != Order.PaymentMethod.MIXED
+        }:
+            return False
+        try:
+            amount = Decimal(str(values.get('amount')))
+        except (InvalidOperation, TypeError, ValueError):
+            return False
+        return amount.is_finite() and amount > 0 and bool(values.get('occurred_at'))
+
+    class Meta:
+        db_table = 'external_order_payment'
+        indexes = [
+            models.Index(
+                fields=['order', 'method'], name='extpay_order_method_idx',
+            ),
+            models.Index(
+                fields=['branch_id', 'occurred_at'],
+                name='extpay_branch_time_idx',
+            ),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['branch_id', 'source', 'source_id'],
+                name='uniq_external_payment_source_event',
+            ),
+            models.CheckConstraint(
+                condition=models.Q(amount__gt=0),
+                name='external_payment_amount_positive',
+            ),
+            models.CheckConstraint(
+                condition=models.Q(source='COURIER'),
+                name='external_payment_source_known',
+            ),
+            models.CheckConstraint(
+                condition=models.Q(method__in=[
+                    Order.PaymentMethod.CASH,
+                    Order.PaymentMethod.UZCARD,
+                    Order.PaymentMethod.HUMO,
+                    Order.PaymentMethod.CARD,
+                    Order.PaymentMethod.PAYME,
+                ]),
+                name='external_payment_method_concrete',
+            ),
+            models.CheckConstraint(
+                condition=~models.Q(source_id=''),
+                name='external_payment_source_id_required',
+            ),
+        ]
+
+    def to_sync_dict(self):
+        data = super().to_sync_dict()
+        data['order_uuid'] = str(self.order.uuid) if self.order else None
+        return data
+
+    @classmethod
+    def from_sync_dict(cls, data, branch_id=None):
+        """Materialize once; every UUID/natural-key replay is a no-op.
+
+        CloudReceiver already enforces ``_sync_append_only`` for branch pushes,
+        but terminal pulls call ``SyncMixin.from_sync_dict`` directly. Keep the
+        invariant at the model boundary so a forged higher sync_version cannot
+        revise an event after the first accepted insert.
+        """
+        uuid_value = data.get('uuid')
+        if uuid_value:
+            existing = cls.objects.filter(uuid=uuid_value).first()
+            if existing is not None:
+                return existing, 'skipped'
+        incoming_branch = data.get('branch_id') or branch_id or ''
+        source = data.get('source')
+        source_id = data.get('source_id')
+        if incoming_branch and source and source_id:
+            existing = cls.objects.filter(
+                branch_id=incoming_branch,
+                source=source,
+                source_id=source_id,
+            ).first()
+            if existing is not None:
+                return existing, 'skipped'
+        return super().from_sync_dict(data, branch_id=branch_id)
+
+    def save(self, *args, **kwargs):
+        if self.pk and not kwargs.get('_syncing', False):
+            raise ValueError('ExternalOrderPayment events are immutable')
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValueError('ExternalOrderPayment events cannot be deleted')
+
+    def hard_delete(self, *args, **kwargs):
+        raise ValueError('ExternalOrderPayment events cannot be deleted')
+
+    @property
+    def affects_drawer(self):
+        return False
+
+    def __str__(self):
+        return (
+            f"ExternalOrderPayment<{self.source}:{self.source_id} "
+            f"{self.method} {self.amount} on #{self.order_id}>"
+        )
 
 
 class OrderRefund(SyncMixin, models.Model):

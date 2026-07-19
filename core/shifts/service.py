@@ -4,7 +4,7 @@ import logging
 from decimal import Decimal, InvalidOperation
 from django.conf import settings
 from django.db import IntegrityError, transaction
-from django.db.models import Q, Sum, Count, DecimalField
+from django.db.models import Sum, Count, DecimalField
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 from base.repositories.shift import ShiftTemplateRepository, ShiftRepository, CashReconciliationRepository
@@ -129,19 +129,21 @@ def _expense_manifest(shift):
     }
 
 
-def _money_evidence_manifest(shift):
+def _money_evidence_manifest(shift, *, include_external=False):
     """Commit every row used by settlement and shift product analytics.
 
     The close header can arrive at cloud before its children. Recomputing only
     tender totals catches ordinary gaps but not a missing row replaced by a
     compensating row of the same value. These compact commitments make that
-    reordering fail closed until the exact paid orders, till/courier payments,
-    refunds, and order items present at close have arrived. CourierPayment is
-    intentionally excluded: that edition-specific table is not row-synced, so
-    a branch and cloud cannot make a meaningful identity-level commitment for
-    it. Its money still participates in the canonical tender recomputation.
+    reordering fail closed until the exact paid orders, till/external payments,
+    refunds, and order items present at close have arrived. Edition-specific
+    CourierPayment is not committed directly; its canonical, synced
+    ExternalOrderPayment mirror is included in manifest v3. Version 2 remains
+    reproducible for shifts closed during a rolling upgrade.
     """
-    from base.models import OrderItem, OrderPayment, OrderRefund
+    from base.models import (
+        ExternalOrderPayment, OrderItem, OrderPayment, OrderRefund,
+    )
     from cashbox.services.drawer import _shift_orders
 
     orders = list(
@@ -166,6 +168,23 @@ def _money_evidence_manifest(shift):
         'method': str(row.method or ''),
         'amount': _manifest_money(row.amount),
     } for row in payments]
+
+    external_payment_rows = []
+    if include_external:
+        external_payments = list(
+            ExternalOrderPayment.objects.filter(
+                order_id__in=order_ids, is_deleted=False,
+            ).select_related('order').order_by('uuid')
+        )
+        external_payment_rows = [{
+            'uuid': str(row.uuid),
+            'order_uuid': str(row.order.uuid),
+            'source': str(row.source or ''),
+            'source_id': str(row.source_id or ''),
+            'method': str(row.method or ''),
+            'amount': _manifest_money(row.amount),
+            'occurred_at': _manifest_time(row.occurred_at),
+        } for row in external_payments]
 
     refunds = list(
         OrderRefund.objects.filter(
@@ -216,7 +235,7 @@ def _money_evidence_manifest(shift):
         Decimal('0.00'),
     )
 
-    return {
+    result = {
         'orders': _compact_manifest(
             order_rows,
             sum((Decimal(row['total_amount']) for row in order_rows),
@@ -234,9 +253,18 @@ def _money_evidence_manifest(shift):
         ),
         'order_items': _compact_manifest(item_rows, item_total),
     }
+    if include_external:
+        result['external_order_payments'] = _compact_manifest(
+            external_payment_rows,
+            sum(
+                (Decimal(row['amount']) for row in external_payment_rows),
+                Decimal('0.00'),
+            ),
+        )
+    return result
 
 
-def _build_settlement_manifest(shift, settlement_rows):
+def _build_settlement_manifest(shift, settlement_rows, *, version=3):
     tenders = [{
         'uuid': str(row.uuid),
         'method': row.method,
@@ -245,21 +273,103 @@ def _build_settlement_manifest(shift, settlement_rows):
         'difference': _manifest_money(row.difference),
     } for row in sorted(settlement_rows, key=lambda item: item.method)]
     return {
-        'version': 2,
+        'version': version,
         'branch_id': shift.branch_id,
         'tenders': tenders,
         'expenses': _expense_manifest(shift),
-        'money_evidence': _money_evidence_manifest(shift),
+        'money_evidence': _money_evidence_manifest(
+            shift, include_external=version >= 3,
+        ),
     }
+
+
+def _shift_tender_integrity_error(shift, evidence_end):
+    """Require immutable tender evidence for every post-upgrade paid sale."""
+    if not shift.treasury_settlement_eligible:
+        return None
+
+    missing_paid_at = list(
+        Order.objects.filter(
+            is_deleted=False,
+            cashier_id=shift.user_id,
+            branch_id=shift.branch_id,
+            created_at__gte=shift.start_time,
+            created_at__lt=evidence_end,
+            is_paid=True,
+            paid_at__isnull=True,
+        ).values_list('id', flat=True)[:11]
+    )
+    if missing_paid_at:
+        order_ids = ', '.join(str(order_id) for order_id in missing_paid_at[:10])
+        suffix = '' if len(missing_paid_at) <= 10 else ', ...'
+        return (
+            'Paid orders are missing their payment timestamp '
+            f'(order ids: {order_ids}{suffix}); repair or re-sync their '
+            'payment headers before closing the shift'
+        )
+
+    paid_orders = Order.objects.filter(
+        is_deleted=False,
+        cashier_id=shift.user_id,
+        branch_id=shift.branch_id,
+        is_paid=True,
+        paid_at__gte=shift.start_time,
+        paid_at__lt=evidence_end,
+    )
+    from base.services.tender import tender_integrity_issues
+    issues = tender_integrity_issues(paid_orders, require_concrete=True)
+    if not issues:
+        return None
+
+    order_ids = ', '.join(str(issue['order_id']) for issue in issues[:10])
+    suffix = '' if len(issues) <= 10 else ', ...'
+    return (
+        f'{len(issues)} paid order(s) lack complete tender evidence '
+        f'(order ids: {order_ids}{suffix}); repair or re-sync their payments '
+        'before closing the shift'
+    )
 
 
 def _settlement_bundle_error(shift, settlement_rows):
     """Return a fail-closed reason until the full local close bundle arrived."""
     manifest = shift.settlement_manifest or {}
-    if manifest.get('version') != 2 or manifest.get('branch_id') != shift.branch_id:
+    manifest_version = manifest.get('version')
+    if (
+        manifest_version not in {2, 3}
+        or manifest.get('branch_id') != shift.branch_id
+    ):
         return 'Close manifest is missing or invalid'
+
+    # Enforce the payment close guard again on the cloud. A rolling older
+    # terminal only blocked unpaid OPEN carts, so an unpaid PREPARING/READY
+    # order could be omitted from every frozen revenue/tender value while the
+    # close manifest still verified. If that order reached the hub before
+    # manager handover, fail closed instead of posting an incomplete shift.
+    evidence_end = shift.end_time or timezone.now()
+    unpaid_count = (
+        Order.objects.filter(
+            is_deleted=False,
+            cashier_id=shift.user_id,
+            branch_id=shift.branch_id,
+            created_at__gte=shift.start_time,
+            created_at__lt=evidence_end,
+            is_paid=False,
+        )
+        .exclude(status=Order.Status.CANCELED)
+        .count()
+    )
+    if unpaid_count:
+        return (
+            f'{unpaid_count} non-cancelled order(s) in the shift are unpaid; '
+            'take payment or cancel them before reconciliation'
+        )
+    tender_error = _shift_tender_integrity_error(shift, evidence_end)
+    if tender_error:
+        return tender_error
     try:
-        current = _build_settlement_manifest(shift, settlement_rows)
+        current = _build_settlement_manifest(
+            shift, settlement_rows, version=manifest_version,
+        )
     except Exception as exc:  # noqa: BLE001 - fail closed on malformed evidence
         return f'Unable to verify settlement evidence: {exc}'
     if current != manifest:
@@ -578,17 +688,11 @@ class ShiftService:
         if shift.status != 'ACTIVE':
             return ServiceResponse.error("Shift is not active")
 
-        # Only a genuinely in-progress sale blocks the close: an OPEN cart that is
-        # still UNPAID (the cashier is mid-transaction and no money has entered the
-        # drawer for it). Everything else carries over and must NOT make the till
-        # impossible to close:
-        #   - PAID orders are settled — their cash is attributed by paid_at, so they
-        #     belong to this shift's totals whether or not the kitchen has finished.
-        #   - Orders already sent to the kitchen (PREPARING/READY) are committed; they
-        #     stay on the line and hand over to the kitchen / next shift.
-        # The old guard blocked on ANY OPEN/PREPARING/READY order regardless of
-        # payment, so paid orders the kitchen never marked COMPLETED piled up and the
-        # shift could never be closed at all (the bug this fixes).
+        # Every non-cancelled UNPAID sale taken by this cashier must be resolved
+        # before handover, regardless of kitchen state. PREPARING/READY describe
+        # fulfilment, not settlement: allowing an unpaid READY order through makes
+        # it disappear from the frozen revenue/tender totals. Paid kitchen orders
+        # still never block; their money is attributed below by paid_at.
         now = timezone.now()
 
         blocking = Order.objects.filter(
@@ -598,11 +702,10 @@ class ShiftService:
             created_at__gte=shift.start_time,
             created_at__lt=now,
             is_paid=False,
-            status=Order.Status.OPEN,
-        ).count()
+        ).exclude(status=Order.Status.CANCELED).count()
         if blocking:
             return ServiceResponse.error(
-                f"Cannot close shift while {blocking} unpaid order(s) are still open. "
+                f"Cannot close shift while {blocking} non-cancelled order(s) are unpaid. "
                 "Take payment or cancel them first."
             )
 
@@ -632,6 +735,9 @@ class ShiftService:
             paid_at__gte=shift.start_time,
             paid_at__lt=now,
         )
+        tender_error = _shift_tender_integrity_error(shift, now)
+        if tender_error:
+            return ServiceResponse.error(tender_error)
         # cash_collected is DERIVED from the tender split, not from
         # Sum(total_amount, filter=payment_method='CASH'): that booked a MIXED
         # order's cash leg as ZERO (the whole sale vanished from cash), and it
@@ -674,14 +780,10 @@ class ShiftService:
         # cashier's blind count + difference. The drawer figures are derived from
         # OrderPayment (cash net of cashbox expenses).
         #
-        # CRITICAL: this is best-effort and MUST NOT be able to fail the close.
-        # The shift is already persisted ENDED above; these rows are derived and
-        # recomputable. We isolate the whole block in a SAVEPOINT (nested atomic)
-        # so a settlement error — a missing cashbox table on a half-migrated DB, a
-        # duplicate row (MultipleObjectsReturned), an unexpected tender — rolls
-        # back ONLY the settlement writes, never the ENDED status. Without this,
-        # any exception here propagated out of the outer @transaction.atomic and
-        # reverted the close, so the till could never be closed at all (the bug).
+        # A post-upgrade shift may become ENDED only when its complete settlement
+        # bundle was frozen atomically. Legacy shifts retain the old best-effort
+        # behavior so a pre-upgrade offline till can still close. The savepoint
+        # prevents a failed child write from leaving a partial settlement behind.
         try:
             with transaction.atomic():
                 from cashbox.services.drawer import expected_payment_totals
@@ -702,8 +804,9 @@ class ShiftService:
                     )
                     frozen_rows.append(row)
                 # Publish the close handshake only after every tender row was
-                # persisted successfully in this savepoint. If any write above
-                # fails, rows + manifest roll back together while ENDED remains.
+                # persisted successfully in this savepoint. If any write fails,
+                # rows and manifest roll back together; an eligible close also
+                # rolls back its ENDED transition below.
                 shift.settlement_manifest = _build_settlement_manifest(
                     shift, frozen_rows,
                 )
@@ -712,8 +815,15 @@ class ShiftService:
                 ])
         except Exception:
             logger.exception(
-                'shift settlement write failed (shift=%s); closing the shift anyway',
+                'shift settlement write failed (shift=%s)',
                 shift.id)
+            if shift.treasury_settlement_eligible:
+                transaction.set_rollback(True)
+                return ServiceResponse.error(
+                    'Cannot close shift because its settlement evidence could '
+                    'not be frozen. No shift totals were finalized; retry after '
+                    'the payment service is healthy.'
+                )
 
         # The shift is ENDED and persisted above. Serializing the response must
         # NOT be able to revert that: an exception in get_with_relations /

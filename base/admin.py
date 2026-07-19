@@ -69,6 +69,13 @@ class OrderAdmin(admin.ModelAdmin):
     list_filter = ('status', 'is_paid', 'order_type', 'created_at')
     search_fields = ('display_id', 'phone_number', 'description')
     autocomplete_fields = ('user', 'cashier', 'delivery_person', 'place', 'table')
+    # These fields are a derived settlement header, not an admin checkbox.
+    # Editing them directly bypasses OrderPayment, the active-shift guard,
+    # drawer accounting, fiscalization and refund invariants. Corrections must
+    # use the explicit pay/refund/repair services that write auditable evidence.
+    readonly_fields = (
+        'is_paid', 'payment_method', 'paid_at', 'accounting_recorded_at',
+    )
     inlines = [OrderItemInline]
     date_hierarchy = 'created_at'
 

@@ -8,7 +8,8 @@ SYNC_ORDER = [
     # Base models (synced first - other models depend on these)
     'user', 'category', 'deliveryperson', 'place', 'table', 'product',
     'customer',  # before 'order' — Order.customer FK depends on it
-    'order', 'orderitem', 'orderpayment', 'cashregister', 'inkassa',
+    'order', 'orderitem', 'orderpayment', 'externalorderpayment',
+    'cashregister', 'inkassa',
     'shifttemplate', 'shift', 'orderrefund', 'cashreconciliation',
     # Stock models (synced after base, respecting FK dependencies)
     'stocklocation', 'stockunit', 'stockcategory', 'stockitem',
@@ -58,6 +59,7 @@ MODEL_MAP = {
     'order': 'base.Order',
     'orderitem': 'base.OrderItem',
     'orderpayment': 'base.OrderPayment',
+    'externalorderpayment': 'base.ExternalOrderPayment',
     'orderrefund': 'base.OrderRefund',
     'cashregister': 'base.CashRegister',
     'inkassa': 'base.Inkassa',

@@ -2,6 +2,7 @@ from decimal import Decimal
 
 import pytest
 from django.test import override_settings
+from django.utils import timezone
 
 from base.models import User, Category, Product, Order, OrderItem
 from fiscalization.config import FiscalConfig
@@ -19,8 +20,15 @@ def order(db):
     p1 = Product.objects.create(category=cat, name='Lavash', price=Decimal('25000'),
                                 ikpu_code='00803001001000000')
     p2 = Product.objects.create(category=cat, name='Cola', price=Decimal('10000'))
-    o = Order.objects.create(user=user, cashier=user, status='READY',
-                             total_amount=Decimal('60000'), payment_method='CASH')
+    o = Order.objects.create(
+        user=user,
+        cashier=user,
+        status='READY',
+        is_paid=True,
+        paid_at=timezone.now(),
+        total_amount=Decimal('60000'),
+        payment_method='CASH',
+    )
     OrderItem.objects.create(order=o, product=p1, quantity=2, price=Decimal('25000'))
     OrderItem.objects.create(order=o, product=p2, quantity=1, price=Decimal('10000'))
     return o
@@ -105,6 +113,18 @@ class TestFiscalizeOrder:
             assert FiscalReceipt.objects.filter(order=order, receipt_type='SALE').count() == 1
             receipt.refresh_from_db()
             assert receipt.fiscal_sign == sign
+        finally:
+            FiscalConfig.set_mode('off')
+
+    def test_unpaid_order_cannot_issue_a_sale_receipt(self, order):
+        Order.objects.filter(pk=order.pk).update(is_paid=False, paid_at=None)
+        FiscalConfig.set_mode('mock')
+        try:
+            result, status = FiscalizationService.fiscalize_order(order.id)
+            assert status == 422
+            assert result['success'] is False
+            assert 'unpaid' in result['message'].lower()
+            assert not FiscalReceipt.objects.filter(order=order).exists()
         finally:
             FiscalConfig.set_mode('off')
 
