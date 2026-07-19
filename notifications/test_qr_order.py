@@ -112,6 +112,7 @@ class TestCreateOrderService:
         )
         order = qr_order_service.create_qr_order(table, rows)
         assert order.order_type == 'HALL'
+        assert order.order_origin == 'QR'
         assert order.table_id == table.id
         assert order.status == 'OPEN'
         assert order.is_paid is False

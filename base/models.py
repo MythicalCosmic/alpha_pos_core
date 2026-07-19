@@ -1206,6 +1206,19 @@ class Order(SyncMixin, models.Model):
         DELIVERY = "DELIVERY", "Delivery"
         PICKUP = "PICKUP", "Pickup"
 
+    class Origin(models.TextChoices):
+        """Durable producer of the order.
+
+        This is intentionally independent of ``order_type``: a Telegram order
+        can be DELIVERY or PICKUP, while a QR order is usually HALL.  Keeping a
+        stable origin on the synced Order lets tills react to remote orders
+        without guessing from placeholder users, notes, or delivery state.
+        """
+
+        POS = "POS", "POS"
+        QR = "QR", "QR"
+        TELEGRAM = "TELEGRAM", "Telegram"
+
     delivery_person = models.ForeignKey(
         DeliveryPerson,
         on_delete=models.SET_NULL,
@@ -1266,6 +1279,12 @@ class Order(SyncMixin, models.Model):
         max_length=10,
         choices=OrderType.choices,
         default=OrderType.HALL,
+    )
+    order_origin = models.CharField(
+        max_length=16,
+        choices=Origin.choices,
+        default=Origin.POS,
+        db_index=True,
     )
 
     phone_number = models.CharField(max_length=20, null=True, blank=True)

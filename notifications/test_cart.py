@@ -128,6 +128,7 @@ class TestCheckout:
         assert order.status == 'OPEN'
         assert order.is_paid is False
         assert order.order_type == 'PICKUP'
+        assert order.order_origin == 'TELEGRAM'
 
     def test_checkout_provisions_user_for_new_customer(self):
         from base.models import User
