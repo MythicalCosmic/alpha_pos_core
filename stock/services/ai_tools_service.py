@@ -30,7 +30,7 @@ from stock.models import StockLevel, StockBatch, StockLocation
 from base.services.business_day import business_day_date_expr
 from base.services.revenue import net_line_revenue
 from base.services.refund_lines import (
-    REFUND_EVENT_ALIAS, refund_item_events, refund_item_events_in_window,
+    REFUND_EVENT_ALIAS, refund_item_events_in_window,
     refund_line_quantity, refund_line_revenue,
 )
 from stock.services.ai_context import (
@@ -314,6 +314,26 @@ def _order_full(o):
         "amount_uzs": _f(p.amount),
         "at": _iso(p.created_at),
     } for p in payments]
+    # OrderPayment is immutable tender evidence, not an additive revenue
+    # ledger. CASH can include change and replay recovery can temporarily leave
+    # more than one raw row. Expose the same capped breakdown used by shifts and
+    # dashboards so the assistant never derives revenue by summing raw evidence.
+    from base.services.tender import order_tender_sources
+    tender, card_detail, drawer_cash = order_tender_sources(o)
+    data["canonical_tender"] = {
+        "cash_uzs": _f(tender["cash"]),
+        "card_uzs": _f(tender["card"]),
+        "payme_uzs": _f(tender["payme"]),
+        "unknown_uzs": _f(tender["unknown"]),
+        "drawer_cash_uzs": _f(drawer_cash),
+        "card_detail_uzs": {
+            method: _f(amount) for method, amount in card_detail.items()
+        },
+    }
+    data["payment_evidence_note"] = (
+        "payments are raw tender evidence and must not be summed for revenue; "
+        "use canonical_tender or total_amount_uzs"
+    )
     data["delivery_person"] = _name(o.delivery_person) if o.delivery_person_id else None
     data["phone_number"] = o.phone_number or None
     data["description"] = o.description or None
@@ -830,7 +850,36 @@ class AIToolbox:
                                 "row once per line item and inflates the total. Aggregate on "
                                 "the item side (query model 'orderitem', sum 'quantity*price') "
                                 "or use the sales_report tool." % (_fld, ', '.join(sorted(_to_many)))}
-            aggs, err = _build_aggs(aggregate or {'n': 'count'})
+            requested_aggs = aggregate or {'n': 'count'}
+            if model is OrderPayment:
+                # Raw payment amounts are not safe accounting measures: CASH
+                # stores the amount tendered (including change), and replayed
+                # evidence can temporarily coexist under distinct UUIDs. Counts
+                # remain useful for integrity checks; monetary totals must use
+                # the canonical tender engine.
+                unsafe = []
+                money_fields = {
+                    'amount', 'total_amount', 'subtotal', 'discount_amount',
+                }
+                for alias, spec in requested_aggs.items():
+                    fn, sep, field = str(spec).strip().lower().partition(':')
+                    if (
+                        sep
+                        and fn in {'sum', 'avg'}
+                        and field.split('__')[-1] in money_fields
+                    ):
+                        unsafe.append(alias)
+                if unsafe:
+                    return {
+                        "error": (
+                            "raw OrderPayment money aggregation is disabled: "
+                            "payment rows can include cash change or replay "
+                            "evidence. Use sales_report/get_shift for totals or "
+                            "get_order.canonical_tender for one order. Count-only "
+                            "OrderPayment queries remain available."
+                        )
+                    }
+            aggs, err = _build_aggs(requested_aggs)
             if err:
                 return {"error": err}
             try:

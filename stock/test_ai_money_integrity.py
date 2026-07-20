@@ -347,6 +347,57 @@ def test_generic_payment_and_refund_ledgers_are_branch_scoped():
 
 
 @override_settings(DEPLOYMENT_MODE='cloud', BRANCH_ID='cloud')
+def test_generic_query_refuses_raw_order_payment_money_sum():
+    """The generic AI escape hatch must not bypass canonical tender math."""
+    location = StockLocation.objects.create(
+        name='Tender guard', type=StockLocation.LocationType.KITCHEN,
+        branch_id='branch-a',
+    )
+    user = _user('tender-guard@test.local')
+    order = _order(user, branch='branch-a', total='100', paid_at=timezone.now())
+    OrderPayment.objects.create(
+        order=order, method='CASH', amount='200', branch_id='branch-a',
+    )
+
+    result = json.loads(AIToolbox.execute(
+        'query_db',
+        {'model': 'orderpayment', 'aggregate': {'money': 'sum:amount'}},
+        location.id,
+    ))
+
+    assert 'raw OrderPayment money aggregation is disabled' in result['error']
+
+
+@override_settings(DEPLOYMENT_MODE='cloud', BRANCH_ID='cloud')
+def test_order_detail_exposes_canonical_tender_not_raw_cash_sum():
+    location = StockLocation.objects.create(
+        name='Tender detail', type=StockLocation.LocationType.KITCHEN,
+        branch_id='branch-a',
+    )
+    user = _user('tender-detail@test.local')
+    order = _order(user, branch='branch-a', total='100', paid_at=timezone.now())
+    order.payment_method = Order.PaymentMethod.CASH
+    order.save(update_fields=['payment_method'])
+    # Two raw rows total 200, but the bill and drawer credit are only 100.
+    OrderPayment.objects.create(
+        order=order, method='CASH', amount='100', branch_id='branch-a',
+    )
+    OrderPayment.objects.create(
+        order=order, method='CASH', amount='100', branch_id='branch-a',
+    )
+
+    result = json.loads(AIToolbox.execute(
+        'get_order', {'order_id': order.id}, location.id,
+    ))
+
+    assert sum(row['amount_uzs'] for row in result['payments']) == 200.0
+    assert result['canonical_tender']['cash_uzs'] == 100.0
+    assert result['canonical_tender']['drawer_cash_uzs'] == 100.0
+    assert result['canonical_tender']['unknown_uzs'] == 0.0
+    assert 'must not be summed' in result['payment_evidence_note']
+
+
+@override_settings(DEPLOYMENT_MODE='cloud', BRANCH_ID='cloud')
 def test_shift_volume_uses_created_at_but_revenue_uses_paid_at_and_branch():
     user = _user()
     location = StockLocation.objects.create(
