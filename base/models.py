@@ -316,6 +316,14 @@ class SyncMixin(models.Model):
     # default value but can never rewrite the value already accepted by the
     # hub.  Cloud-authored updates still flow down to branches normally.
     SYNC_CREATE_ONLY_FROM_BRANCH = frozenset()
+    # Fields whose branch -> cloud ownership ends at settlement.  Models use
+    # this for values which the originating till may legitimately establish
+    # while an event is open, but must never time-travel after the cloud has
+    # accepted the financial event (for example an Order's cashier and paid
+    # totals).  Field names are expanded to their FK attnames by
+    # ``_sync_frozen_from_branch_fields`` so scalar and relationship writes are
+    # governed by the same rule.
+    SYNC_IMMUTABLE_FROM_BRANCH_WHEN_PAID = frozenset()
 
     # Natural keys that uniquely identify a record independent of its uuid.
     # When an incoming sync record's uuid isn't found locally but another row
@@ -465,7 +473,36 @@ class SyncMixin(models.Model):
                     cls.__name__, field_name, getattr(instance, 'uuid', None),
                 )
                 values.pop(field_name, None)
+
+        for field_name in cls._sync_frozen_from_branch_fields(
+            instance, mode=effective_mode,
+        ):
+            if field_name in values:
+                logging.getLogger(__name__).warning(
+                    'sync ingest: refused settled rewrite of %s.%s uuid=%s',
+                    cls.__name__, field_name, getattr(instance, 'uuid', None),
+                )
+                values.pop(field_name, None)
         return values
+
+    @classmethod
+    def _sync_frozen_from_branch_fields(cls, instance, *, mode=None):
+        """Concrete field names/attnames frozen after financial settlement."""
+        effective_mode = mode or getattr(settings, 'DEPLOYMENT_MODE', 'local')
+        if effective_mode != 'cloud' or not getattr(instance, 'is_paid', False):
+            return frozenset()
+        frozen = set(getattr(
+            cls, 'SYNC_IMMUTABLE_FROM_BRANCH_WHEN_PAID', frozenset(),
+        ))
+        expanded = set(frozen)
+        for name in frozen:
+            try:
+                field = cls._meta.get_field(name)
+            except Exception:  # noqa: BLE001 - stale declarations stay safe
+                continue
+            expanded.add(field.name)
+            expanded.add(field.attname)
+        return frozenset(expanded)
 
     @classmethod
     def _repair_equal_version_sync(
@@ -695,10 +732,18 @@ class SyncMixin(models.Model):
             for key, value in update_values.items():
                 if hasattr(instance, key):
                     setattr(instance, key, value)
+            settled_frozen = cls._sync_frozen_from_branch_fields(instance)
             for fk_field, related in resolved_fks.items():
-                setattr(instance, fk_field, related)
+                try:
+                    model_field = cls._meta.get_field(fk_field)
+                    fk_names = {model_field.name, model_field.attname}
+                except Exception:  # noqa: BLE001
+                    fk_names = {fk_field}
+                if fk_names.isdisjoint(settled_frozen):
+                    setattr(instance, fk_field, related)
             instance.sync_version = sync_version
-            instance.is_deleted = is_deleted
+            if 'is_deleted' not in settled_frozen:
+                instance.is_deleted = is_deleted
             instance.synced_at = timezone.now()
             instance.save(_syncing=True)
             cls._restore_sync_automatic_values(
@@ -727,10 +772,18 @@ class SyncMixin(models.Model):
                 for key, value in update_values.items():
                     if hasattr(instance, key):
                         setattr(instance, key, value)
+                settled_frozen = cls._sync_frozen_from_branch_fields(instance)
                 for fk_field, related in resolved_fks.items():
-                    setattr(instance, fk_field, related)
+                    try:
+                        model_field = cls._meta.get_field(fk_field)
+                        fk_names = {model_field.name, model_field.attname}
+                    except Exception:  # noqa: BLE001
+                        fk_names = {fk_field}
+                    if fk_names.isdisjoint(settled_frozen):
+                        setattr(instance, fk_field, related)
                 instance.sync_version = sync_version
-                instance.is_deleted = is_deleted
+                if 'is_deleted' not in settled_frozen:
+                    instance.is_deleted = is_deleted
                 instance.synced_at = timezone.now()
                 instance.branch_id = incoming_branch or instance.branch_id or ''
                 instance.save(_syncing=True)
@@ -1395,6 +1448,14 @@ class Order(SyncMixin, models.Model):
         MIXED = "MIXED", "Mixed"
 
     is_paid = models.BooleanField(default=False, db_index=True)
+    # Stable identity of the atomic checkout action which settled this order.
+    # A UUID survives HTTP retries, queue retries and UUID changes on individual
+    # OrderPayment rows.  Nullable preserves rolling compatibility with orders
+    # produced by pre-action-id terminals; new payment writers populate it in
+    # the same transaction as the header and tender lines.
+    payment_action_id = models.UUIDField(
+        null=True, blank=True, unique=True, editable=False,
+    )
     payment_method = models.CharField(
         max_length=10,
         choices=PaymentMethod.choices,
@@ -1446,6 +1507,17 @@ class Order(SyncMixin, models.Model):
     # till that only knows the POS default cannot downgrade a cloud TELEGRAM or
     # QR origin during status/payment updates.
     SYNC_CREATE_ONLY_FROM_BRANCH = frozenset({'order_origin'})
+    # Once the cloud has accepted a paid header, later/stale branch versions
+    # may still advance operational state (READY/COMPLETED) but can no longer
+    # rewrite the economic event or move it to another cashier/shift.
+    SYNC_IMMUTABLE_FROM_BRANCH_WHEN_PAID = frozenset({
+        'is_paid', 'payment_method', 'subtotal', 'discount_amount',
+        'discount_percent', 'total_amount', 'paid_at', 'cashier', 'is_deleted',
+    })
+    # A rolling-upgrade retry may backfill a previously blank action identity,
+    # but an established identity is immutable even before header repair marks
+    # the order paid.
+    SYNC_IMMUTABLE_FROM_BRANCH_AFTER_SET = frozenset({'payment_action_id'})
 
     @classmethod
     def branch_sync_create_allowed(cls, *, uuid_val, values, resolved_fks):
@@ -2533,21 +2605,132 @@ class OrderPayment(SyncMixin, models.Model):
     )
     method = models.CharField(max_length=10, choices=Order.PaymentMethod.choices)
     amount = models.DecimalField(max_digits=10, decimal_places=2)
+    # Logical checkout identity + deterministic position within its tender
+    # split.  Payment row UUIDs are transport identities and can change when a
+    # client reconstructs a queued request; this pair is the durable business
+    # key.  Both remain NULL for pre-rollout clients.
+    payment_action_id = models.UUIDField(null=True, blank=True, editable=False)
+    line_index = models.PositiveIntegerField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     objects = SyncManager()
 
-    # The cloud is the collector of money rows; a peer cannot invent payments.
-    SYNC_WRITE_DENYLIST = frozenset({'amount', 'method'})
+    # Payment evidence is append-only. A new UUID that carries the same logical
+    # action/line is a replay, not another collection event.
+    _sync_append_only = True
+    SYNC_NATURAL_KEYS = ('order', 'payment_action_id', 'line_index')
+
+    # The cloud is the collector of money rows; a peer cannot revise evidence.
+    SYNC_WRITE_DENYLIST = frozenset({
+        'amount', 'method', 'payment_action_id', 'line_index',
+    })
+
+    @classmethod
+    def branch_sync_create_allowed(cls, *, uuid_val, values, resolved_fks):
+        """Validate a new branch payment against the settled Order action.
+
+        Old terminals omit both action fields and remain accepted while the
+        Order itself is legacy (no action identity). Once a server Order owns
+        an action, however, absent or different-action rows are stale/duplicate
+        evidence and must be acknowledged without inserting another tender.
+        """
+        from decimal import Decimal, InvalidOperation
+
+        order = resolved_fks.get('order')
+        if order is None:
+            return False
+        action_id = values.get('payment_action_id')
+        line_index = values.get('line_index')
+        if (action_id is None) != (line_index is None):
+            return False
+        if (
+            order.payment_action_id is not None
+            and (
+                action_id is None
+                or str(action_id) != str(order.payment_action_id)
+            )
+        ):
+            return False
+        if values.get('method') not in {
+            value for value, _label in Order.PaymentMethod.choices
+            if value != Order.PaymentMethod.MIXED
+        }:
+            return False
+        try:
+            amount = Decimal(str(values.get('amount')))
+        except (InvalidOperation, TypeError, ValueError):
+            return False
+        return amount.is_finite() and amount > 0
 
     class Meta:
         db_table = 'order_payment'
         indexes = [models.Index(fields=['order', 'method'])]
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        payment_action_id__isnull=True,
+                        line_index__isnull=True,
+                    )
+                    | models.Q(
+                        payment_action_id__isnull=False,
+                        line_index__isnull=False,
+                    )
+                ),
+                name='order_payment_action_pair_complete',
+            ),
+            models.UniqueConstraint(
+                fields=['order', 'payment_action_id', 'line_index'],
+                condition=models.Q(
+                    is_deleted=False,
+                    payment_action_id__isnull=False,
+                ),
+                name='uniq_live_order_payment_action_line',
+            ),
+        ]
 
     def to_sync_dict(self):
         data = super().to_sync_dict()
         data['order_uuid'] = str(self.order.uuid) if self.order else None
         return data
+
+    @classmethod
+    def from_sync_dict(cls, data, branch_id=None):
+        """Apply each logical tender line once on cloud and branch receivers."""
+        uuid_value = data.get('uuid')
+        if uuid_value:
+            existing = cls.objects.filter(uuid=uuid_value).first()
+            if existing is not None:
+                return existing, 'skipped'
+
+        action_id = data.get('payment_action_id')
+        line_index = data.get('line_index')
+        if (action_id in (None, '')) != (line_index in (None, '')):
+            return None, 'skipped'
+
+        order = None
+        order_uuid = data.get('order_uuid')
+        if order_uuid:
+            order = Order.objects.filter(uuid=order_uuid).first()
+        if order is not None:
+            if (
+                order.payment_action_id is not None
+                and (
+                    action_id in (None, '')
+                    or str(action_id) != str(order.payment_action_id)
+                )
+            ):
+                return None, 'skipped'
+            if action_id not in (None, '') and line_index not in (None, ''):
+                logical = cls.objects.filter(
+                    order=order,
+                    payment_action_id=action_id,
+                    line_index=line_index,
+                    is_deleted=False,
+                ).first()
+                if logical is not None:
+                    return logical, 'skipped'
+        return super().from_sync_dict(data, branch_id=branch_id)
 
     def __str__(self):
         return f"OrderPayment<{self.method} {self.amount} on #{self.order_id}>"

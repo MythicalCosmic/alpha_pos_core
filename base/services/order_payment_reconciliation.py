@@ -55,6 +55,32 @@ def reconcile_stale_paid_headers(order_ids, *, require_later_sync_evidence=True)
             )
             if not till_payments and not external_payments:
                 continue
+            # New tills stamp every line in one checkout with the same logical
+            # action identity.  Refuse to combine actions (or half-upgraded
+            # identified + anonymous lines) into one repaired paid header. Old
+            # clients remain compatible because an entirely anonymous set is
+            # still handled by the legacy evidence rules below.
+            identified_actions = {
+                payment.payment_action_id
+                for payment in till_payments
+                if payment.payment_action_id is not None
+            }
+            has_anonymous_till_line = any(
+                payment.payment_action_id is None
+                for payment in till_payments
+            )
+            if len(identified_actions) > 1 or (
+                identified_actions and has_anonymous_till_line
+            ):
+                continue
+            inferred_action_id = (
+                next(iter(identified_actions)) if identified_actions else None
+            )
+            if order.payment_action_id is not None and till_payments and (
+                inferred_action_id is None
+                or inferred_action_id != order.payment_action_id
+            ):
+                continue
             if any(
                 payment.method not in concrete_methods
                 for payment in [*till_payments, *external_payments]
@@ -171,7 +197,11 @@ def reconcile_stale_paid_headers(order_ids, *, require_later_sync_evidence=True)
                 else Order.PaymentMethod.MIXED
             )
             order.paid_at = inferred_paid_at
-            order.save(update_fields=['is_paid', 'payment_method', 'paid_at'])
+            update_fields = ['is_paid', 'payment_method', 'paid_at']
+            if order.payment_action_id is None and inferred_action_id is not None:
+                order.payment_action_id = inferred_action_id
+                update_fields.append('payment_action_id')
+            order.save(update_fields=update_fields)
             repaired.add(str(order.uuid))
 
     return repaired

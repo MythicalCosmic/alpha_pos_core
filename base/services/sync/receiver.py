@@ -185,10 +185,10 @@ def _strip_branch_rewrites(model_class, instance, values):
     model_guard = getattr(model_class, '_strip_sync_branch_rewrites', None)
     if model_guard is not None:
         values = model_guard(instance, values)
-    immutable_after_manifest = _branch_frozen_after_manifest_fields(
+    immutable_from_branch = _branch_frozen_update_fields(
         model_class, instance,
     )
-    for field_name in immutable_after_manifest:
+    for field_name in immutable_from_branch:
         values.pop(field_name, None)
     return values
 
@@ -213,6 +213,17 @@ def _branch_frozen_after_manifest_fields(model_class, instance):
         expanded.add(field.name)
         expanded.add(field.attname)
     return frozenset(expanded)
+
+
+def _branch_frozen_update_fields(model_class, instance):
+    """All fields/attnames a branch may no longer rewrite on the cloud."""
+    frozen = set(_branch_frozen_after_manifest_fields(model_class, instance))
+    settled_guard = getattr(
+        model_class, '_sync_frozen_from_branch_fields', None,
+    )
+    if settled_guard is not None:
+        frozen.update(settled_guard(instance))
+    return frozenset(frozen)
 
 
 def _append_only_trusted_update_fields(model_class):
@@ -572,7 +583,7 @@ class CloudReceiver:
 
                 denied = model_class._effective_denylist() \
                     if hasattr(model_class, '_effective_denylist') else frozenset()
-                branch_frozen = _branch_frozen_after_manifest_fields(
+                branch_frozen = _branch_frozen_update_fields(
                     model_class, instance,
                 )
                 for fk_field, fk_instance in resolved_fks.items():
@@ -580,7 +591,10 @@ class CloudReceiver:
                         setattr(instance, fk_field, fk_instance)
 
                 instance.sync_version = sync_version
-                if not _del_denied:           # SYNC_DENY_FROM_BRANCH guard (e.g. User.is_deleted)
+                if (
+                    not _del_denied
+                    and 'is_deleted' not in branch_frozen
+                ):  # class denylist + settled-row guard
                     instance.is_deleted = is_deleted
                 # Keep this version outside the timestamp feed until its
                 # per-record transaction commits.  A NULL row is still served
@@ -635,14 +649,17 @@ class CloudReceiver:
                         setattr(instance, key, value)
                     denied = model_class._effective_denylist() \
                         if hasattr(model_class, '_effective_denylist') else frozenset()
-                    branch_frozen = _branch_frozen_after_manifest_fields(
+                    branch_frozen = _branch_frozen_update_fields(
                         model_class, instance,
                     )
                     for fk_field, fk_instance in resolved_fks.items():
                         if fk_field not in denied and fk_field not in branch_frozen:
                             setattr(instance, fk_field, fk_instance)
                     instance.sync_version = sync_version
-                    if not _del_denied:       # SYNC_DENY_FROM_BRANCH guard (e.g. User.is_deleted)
+                    if (
+                        not _del_denied
+                        and 'is_deleted' not in branch_frozen
+                    ):  # class denylist + settled-row guard
                         instance.is_deleted = is_deleted
                     instance.synced_at = None
                     # Reconcile = update of an existing row: preserve its owner
