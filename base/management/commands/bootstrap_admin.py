@@ -19,7 +19,7 @@ import secrets
 import string
 import sys
 
-from django.core.management.base import BaseCommand
+from django.core.management.base import BaseCommand, CommandError
 
 from base.models import User
 from base.security.hashing import hash_password
@@ -83,6 +83,11 @@ class Command(BaseCommand):
         )
         generated = False
         if not password:
+            if sys.stderr is None:
+                raise CommandError(
+                    'Cannot auto-generate an admin password without a console. '
+                    'Supply --password or ALPHA_POS_ADMIN_PASSWORD.',
+                )
             password = _generate_password()
             generated = True
 
@@ -114,6 +119,8 @@ class Command(BaseCommand):
             f'  User ID:  {user.id}\n'
             f'{banner}\n'
         )
-        # Use stderr so it's visible even when run.py pipes stdout to a logfile.
-        sys.stderr.write(msg)
-        sys.stderr.flush()
+        # GUI-subsystem executables have sys.stderr=None. The desktop supplies
+        # and separately persists a password, so no banner is required there.
+        # CLI calls retain the prominent one-time-password banner.
+        if sys.stderr is not None:
+            self.stderr.write(msg)
