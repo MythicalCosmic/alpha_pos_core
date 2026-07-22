@@ -19,6 +19,7 @@ import time
 
 from django.conf import settings
 from django.core.cache import cache
+from django.db.models import Q
 
 logger = logging.getLogger('base.presence')
 
@@ -104,7 +105,9 @@ def resolve_active_cashier(branch_id=None):
         legacy_id = entry.get('cashier_id')
         if not cashier_ref and not legacy_id:
             continue
-        shift_qs = Shift.objects.filter(status='ACTIVE', is_deleted=False)
+        shift_qs = Shift.objects.filter(
+            status='ACTIVE', is_deleted=False, user__role='CASHIER',
+        )
         # Old heartbeat entries may have no branch. In a branch-scoped lookup,
         # the requested branch must still constrain the Shift query; otherwise
         # a UUID/legacy-PK collision can select an active cashier at a different
@@ -113,6 +116,14 @@ def resolve_active_cashier(branch_id=None):
         effective_branch = entry_branch or requested_branch
         if effective_branch:
             shift_qs = shift_qs.filter(branch_id=effective_branch)
+        entry_device = str(entry.get('device_id') or '').strip()
+        if entry_device:
+            # A bound shift belongs only to its owning install. Blank is the
+            # rolling-upgrade lane for shifts opened before device ownership
+            # existed; it preserves the old presence behavior until they end.
+            shift_qs = shift_qs.filter(
+                Q(device_id=entry_device) | Q(device_id=''),
+            )
         if cashier_ref and not str(cashier_ref).isdigit():
             try:
                 import uuid
@@ -143,11 +154,18 @@ def device_presence_headers():
     headers = {'X-Device-Id': str(device_id)}
     try:
         from base.models import Shift
-        shifts = Shift.objects.filter(status='ACTIVE', is_deleted=False)
+        shifts = Shift.objects.filter(
+            status='ACTIVE', is_deleted=False, user__role='CASHIER',
+        )
         local_branch = str(getattr(settings, 'BRANCH_ID', '') or '')
         if local_branch:
             shifts = shifts.filter(branch_id=local_branch)
-        shift = shifts.select_related('user').order_by('-start_time').first()
+        ordered = shifts.select_related('user').order_by('-start_time')
+        # Prefer the cashier shift explicitly owned by this install. Fall back
+        # only to a blank legacy shift; never advertise another device's shift.
+        shift = ordered.filter(device_id=device_id).first()
+        if shift is None:
+            shift = ordered.filter(device_id='').first()
         if shift:
             headers['X-Active-Cashier'] = str(shift.user.uuid)
     except Exception:  # noqa: BLE001 — never break a sync over presence

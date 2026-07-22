@@ -21,10 +21,10 @@ def _cashier(email):
                                role='CASHIER', status='ACTIVE', password='!')
 
 
-def _shift(user, branch_id='branch-1', status='ACTIVE'):
+def _shift(user, branch_id='branch-1', status='ACTIVE', device_id=''):
     from base.models import Shift
     return Shift.objects.create(user=user, start_time=timezone.now(), status=status,
-                                branch_id=branch_id)
+                                branch_id=branch_id, device_id=device_id)
 
 
 @pytest.mark.django_db
@@ -66,8 +66,10 @@ class TestPresence:
         assert presence.resolve_active_cashier(branch_id='branch-1') is not None
 
     def test_resolve_prefers_most_recent_device(self):
-        u1 = _cashier('r5a@x.local'); _shift(u1)
-        u2 = _cashier('r5b@x.local'); _shift(u2)
+        u1 = _cashier('r5a@x.local')
+        _shift(u1)
+        u2 = _cashier('r5b@x.local')
+        _shift(u2)
         presence.mark_device_live('dev-OLD', 'branch-1', u1.id)
         presence.mark_device_live('dev-NEW', 'branch-1', u2.id)   # marked later -> newer ts
         res = presence.resolve_active_cashier()
@@ -97,6 +99,13 @@ class TestPresence:
 
         assert presence.resolve_active_cashier(branch_id='branch-1') is None
 
+    def test_bound_shift_cannot_be_claimed_by_another_devices_heartbeat(self):
+        u = _cashier('bound-device@x.local')
+        _shift(u, device_id='dev-A')
+        presence.mark_device_live('dev-B', 'branch-1', str(u.uuid))
+
+        assert presence.resolve_active_cashier(branch_id='branch-1') is None
+
 
 @pytest.mark.django_db
 class TestPresenceHeaders:
@@ -120,6 +129,43 @@ class TestPresenceHeaders:
         other = _cashier('other-branch@x.local')
         _shift(own, branch_id='branch-1')
         _shift(other, branch_id='branch-2')
+
+        headers = presence.device_presence_headers()
+
+        assert headers['X-Active-Cashier'] == str(own.uuid)
+
+    def test_header_uses_owned_cashier_and_ignores_non_cashier_shift(self, settings):
+        from base.models import Shift, User
+
+        settings.DEVICE_ID = 'dev-Z'
+        settings.BRANCH_ID = 'branch-1'
+        cashier = _cashier('owned-cashier@x.local')
+        manager = User.objects.create(
+            first_name='Ma', last_name='Nager', email='manager@x.local',
+            role='MANAGER', status='ACTIVE', password='!',
+        )
+        _shift(cashier, device_id='dev-Z')
+        Shift.objects.create(
+            user=manager, start_time=timezone.now() + timedelta(seconds=1),
+            status='ACTIVE', branch_id='branch-1', device_id='',
+        )
+
+        headers = presence.device_presence_headers()
+
+        assert headers['X-Active-Cashier'] == str(cashier.uuid)
+
+    def test_header_does_not_advertise_newer_cashier_from_another_till(self, settings):
+        from base.models import Shift
+
+        settings.DEVICE_ID = 'dev-Z'
+        settings.BRANCH_ID = 'branch-1'
+        own = _cashier('owned-till@x.local')
+        other = _cashier('other-till@x.local')
+        _shift(own, device_id='dev-Z')
+        Shift.objects.create(
+            user=other, start_time=timezone.now() + timedelta(seconds=1),
+            status='ACTIVE', branch_id='branch-1', device_id='dev-Y',
+        )
 
         headers = presence.device_presence_headers()
 

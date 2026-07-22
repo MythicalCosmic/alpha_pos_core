@@ -692,11 +692,34 @@ class ShiftService:
         if active:
             return ServiceResponse.error("User already has an active shift")
 
+        # DEVICE_ID is minted once per desktop install and is already used by
+        # sync presence. Persist it only for CASHIER shifts: managers, admins,
+        # and waiters may work alongside the cashier on the same physical till
+        # without taking its exclusive cash-drawer slot. Cloud-created and
+        # pre-upgrade shifts stay blank for rolling-upgrade compatibility.
+        device_id = ''
+        if user.role == User.RoleChoices.CASHIER and mode != 'cloud':
+            device_id = str(getattr(settings, 'DEVICE_ID', '') or '').strip()
+            if len(device_id) > Shift._meta.get_field('device_id').max_length:
+                return ServiceResponse.error(
+                    'This terminal has an invalid device identity',
+                )
+        if device_id and Shift.objects.filter(
+            is_deleted=False,
+            device_id=device_id,
+            status=Shift.Status.ACTIVE,
+            end_time__isnull=True,
+        ).exists():
+            return ServiceResponse.error(
+                'This terminal already has an active cashier shift',
+            )
+
         kwargs = {
             'user_id': user_id,
             'start_time': timezone.now(),
             'status': 'ACTIVE',
             'branch_id': operational_branch,
+            'device_id': device_id,
             # Explicit opt-in proves this shift began under the reconciliation
             # -> SAFE lifecycle. Model default stays fail-closed for late syncs
             # from pre-upgrade/offline clients that do not send this field.
@@ -714,6 +737,19 @@ class ShiftService:
             with transaction.atomic():
                 shift = ShiftRepository.create(**kwargs)
         except IntegrityError:
+            # Different users lock different User rows. The conditional device
+            # unique constraint is therefore the definitive concurrent-start
+            # guard; re-read after the savepoint rollback to return the useful
+            # error rather than misreporting it as a per-user duplicate.
+            if device_id and Shift.objects.filter(
+                is_deleted=False,
+                device_id=device_id,
+                status=Shift.Status.ACTIVE,
+                end_time__isnull=True,
+            ).exists():
+                return ServiceResponse.error(
+                    'This terminal already has an active cashier shift',
+                )
             return ServiceResponse.error('User already has an active shift')
         shift = ShiftRepository.get_with_relations(shift.id)
         return ServiceResponse.created(data=ShiftService._serialize_shift(shift))
@@ -2054,6 +2090,7 @@ class ShiftService:
             'start_time': shift.start_time.isoformat() if shift.start_time else None,
             'end_time': shift.end_time.isoformat() if shift.end_time else None,
             'status': shift.status,
+            'device_id': shift.device_id or None,
             'treasury_settlement_eligible': shift.treasury_settlement_eligible,
             'total_orders': total_orders,
             'total_revenue': _q2(total_revenue),

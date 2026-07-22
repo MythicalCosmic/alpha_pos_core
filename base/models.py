@@ -2248,6 +2248,12 @@ class Shift(SyncMixin, models.Model):
     total_revenue = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     cash_collected = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     notes = models.TextField(blank=True, default='')
+    # Stable install identity for CASHIER shifts opened by an upgraded till.
+    # Non-cashier and pre-upgrade shifts deliberately keep this blank so a
+    # manager/waiter can work on the same till and rolling upgrades remain
+    # compatible. The conditional unique constraint below makes the non-empty
+    # value the exclusive live cashier slot for that physical device.
+    device_id = models.CharField(max_length=128, blank=True, default='')
     # Rollout eligibility for the reconciliation->SAFE lifecycle. Migration
     # 0048 leaves every already-ended historical shift false because its money
     # may already have reached treasury through legacy Inkassa and cannot be
@@ -2266,7 +2272,9 @@ class Shift(SyncMixin, models.Model):
 
     objects = SyncManager()
     SYNC_IMMUTABLE_FROM_BRANCH_AFTER_SET = frozenset({'settlement_manifest'})
-    SYNC_CREATE_ONLY_FROM_BRANCH = frozenset({'treasury_settlement_eligible'})
+    SYNC_CREATE_ONLY_FROM_BRANCH = frozenset({
+        'treasury_settlement_eligible', 'device_id',
+    })
     # Once the close handshake exists, the branch cannot move the economic
     # window/owner/totals or revert cloud COMPLETED back to ENDED. The first
     # close update is still accepted while the current manifest is empty.
@@ -2286,6 +2294,16 @@ class Shift(SyncMixin, models.Model):
                     & models.Q(end_time__isnull=True)
                 ),
                 name='uniq_live_active_shift_per_user',
+            ),
+            models.UniqueConstraint(
+                fields=['device_id'],
+                condition=(
+                    models.Q(is_deleted=False)
+                    & models.Q(status='ACTIVE')
+                    & models.Q(end_time__isnull=True)
+                    & ~models.Q(device_id='')
+                ),
+                name='uniq_live_shift_per_device',
             ),
         ]
 
