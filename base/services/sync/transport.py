@@ -1,11 +1,14 @@
 import json
 import logging
+import hashlib
+import uuid
 import requests
 from base.services.sync.config import (
     get_cloud_url, get_cloud_token, get_branch_id,
     get_sync_timeout, get_sync_max_retries, get_sync_require_https,
 )
 from base.services.sync.encoder import SyncEncoder
+from base.services.sync.evidence import emit_sync_evidence
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +84,8 @@ def send_batch(model_name, records, retry=True):
         'branch_id': get_branch_id(),
         'records': records,
     }, cls=SyncEncoder)
+    batch_id = str(uuid.uuid4())
+    payload_sha256 = hashlib.sha256(payload.encode('utf-8')).hexdigest()
 
     # A bad SYNC_MAX_RETRIES=0 setting must not turn sync into a silent no-op
     # that reports error=None without issuing even one request.
@@ -89,6 +94,17 @@ def send_batch(model_name, records, retry=True):
     last_error = None
 
     for attempt in range(max_retries):
+        attempt_number = attempt + 1
+        emit_sync_evidence(
+            'push_http_attempt',
+            batch_id=batch_id,
+            model_name=model_name,
+            branch_id=get_branch_id(),
+            attempt=attempt_number,
+            max_attempts=max_retries,
+            payload_sha256=payload_sha256,
+            records=records,
+        )
         try:
             resp = requests.post(
                 f'{url}/receive',
@@ -101,6 +117,15 @@ def send_batch(model_name, records, retry=True):
                 data = resp.json()
                 errors = data.get('errors', [])
                 failed_uuids = data.get('failed_uuids', [])
+                emit_sync_evidence(
+                    'push_http_response',
+                    batch_id=batch_id,
+                    model_name=model_name,
+                    attempt=attempt_number,
+                    http_status=resp.status_code,
+                    payload_sha256=payload_sha256,
+                    response=data,
+                )
 
                 # HTTP 200 with per-record failures is a valid partial-batch
                 # acknowledgement. Let the pusher ACK successful/skipped UUIDs
@@ -130,16 +155,40 @@ def send_batch(model_name, records, retry=True):
                 }
 
             last_error = f'HTTP {resp.status_code}: {resp.text[:200]}'
+            emit_sync_evidence(
+                'push_http_response',
+                batch_id=batch_id,
+                model_name=model_name,
+                attempt=attempt_number,
+                http_status=resp.status_code,
+                payload_sha256=payload_sha256,
+                error=last_error,
+            )
             logger.warning(f'Sync attempt {attempt + 1}/{max_retries} failed: {last_error}')
 
         except requests.exceptions.Timeout:
             last_error = 'Request timeout'
+            emit_sync_evidence(
+                'push_http_error', batch_id=batch_id, model_name=model_name,
+                attempt=attempt_number, payload_sha256=payload_sha256,
+                error=last_error,
+            )
             logger.warning(f'Sync attempt {attempt + 1}/{max_retries}: timeout')
         except requests.exceptions.ConnectionError:
             last_error = 'Connection failed'
+            emit_sync_evidence(
+                'push_http_error', batch_id=batch_id, model_name=model_name,
+                attempt=attempt_number, payload_sha256=payload_sha256,
+                error=last_error,
+            )
             logger.warning(f'Sync attempt {attempt + 1}/{max_retries}: connection failed')
         except Exception as e:
             last_error = str(e)
+            emit_sync_evidence(
+                'push_http_error', batch_id=batch_id, model_name=model_name,
+                attempt=attempt_number, payload_sha256=payload_sha256,
+                error=last_error,
+            )
             logger.error(f'Sync attempt {attempt + 1}/{max_retries}: {e}')
 
         if attempt < max_retries - 1:
@@ -165,8 +214,14 @@ def fetch_changes(since_timestamp=None):
     max_retries = max(1, get_sync_max_retries())
     timeout = get_sync_timeout()
     last_error = None
+    pull_id = str(uuid.uuid4())
 
     for attempt in range(max_retries):
+        attempt_number = attempt + 1
+        emit_sync_evidence(
+            'pull_http_attempt', pull_id=pull_id, attempt=attempt_number,
+            max_attempts=max_retries, branch_id=get_branch_id(), params=params,
+        )
         try:
             resp = requests.get(
                 f'{url}/changes',
@@ -177,6 +232,11 @@ def fetch_changes(since_timestamp=None):
 
             if resp.status_code == 200:
                 data = resp.json()
+                emit_sync_evidence(
+                    'pull_http_response', pull_id=pull_id,
+                    attempt=attempt_number, http_status=resp.status_code,
+                    response=data,
+                )
                 return {
                     'success': True,
                     'data': data.get('data', {}),
@@ -190,16 +250,33 @@ def fetch_changes(since_timestamp=None):
                 }
 
             last_error = f'HTTP {resp.status_code}: {resp.text[:200]}'
+            emit_sync_evidence(
+                'pull_http_response', pull_id=pull_id,
+                attempt=attempt_number, http_status=resp.status_code,
+                error=last_error,
+            )
             logger.warning(f'Pull attempt {attempt + 1}/{max_retries} failed: {last_error}')
 
         except requests.exceptions.Timeout:
             last_error = 'Request timeout'
+            emit_sync_evidence(
+                'pull_http_error', pull_id=pull_id, attempt=attempt_number,
+                error=last_error,
+            )
             logger.warning(f'Pull attempt {attempt + 1}/{max_retries}: timeout')
         except requests.exceptions.ConnectionError:
             last_error = 'Connection failed'
+            emit_sync_evidence(
+                'pull_http_error', pull_id=pull_id, attempt=attempt_number,
+                error=last_error,
+            )
             logger.warning(f'Pull attempt {attempt + 1}/{max_retries}: connection failed')
         except Exception as e:
             last_error = str(e)
+            emit_sync_evidence(
+                'pull_http_error', pull_id=pull_id, attempt=attempt_number,
+                error=last_error,
+            )
             logger.error(f'Pull attempt {attempt + 1}/{max_retries}: {e}')
 
         if attempt < max_retries - 1:

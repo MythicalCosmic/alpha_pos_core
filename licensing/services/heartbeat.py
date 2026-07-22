@@ -168,6 +168,14 @@ def _client_version() -> str:
     global _CLIENT_VERSION_CACHED
     if _CLIENT_VERSION_CACHED is not None:
         return _CLIENT_VERSION_CACHED
+    # PyInstaller releases do not contain a .git directory. The desktop
+    # settings module injects its semantic version before this core module is
+    # imported, giving support an authoritative installed release instead of
+    # the historical alpha_pos@unknown value.
+    semantic = str(os.environ.get('ALPHA_POS_CLIENT_VERSION') or '').strip()
+    if semantic:
+        _CLIENT_VERSION_CACHED = semantic[:100]
+        return _CLIENT_VERSION_CACHED
     import subprocess
     try:
         sha = subprocess.run(

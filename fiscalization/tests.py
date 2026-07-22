@@ -5,6 +5,9 @@ from django.test import override_settings
 from django.utils import timezone
 
 from base.models import User, Category, Product, Order, OrderItem
+from base.services.sync.evidence import (
+    register_sync_evidence_observer, unregister_sync_evidence_observer,
+)
 from fiscalization.config import FiscalConfig
 from fiscalization.models import FiscalReceipt
 from fiscalization.providers import get_provider, MockProvider
@@ -115,6 +118,28 @@ class TestFiscalizeOrder:
             assert receipt.fiscal_sign == sign
         finally:
             FiscalConfig.set_mode('off')
+
+    def test_attempt_emits_append_only_start_and_completion_evidence(self, order):
+        events = []
+        def observer(event_type, payload):
+            events.append((event_type, payload))
+        register_sync_evidence_observer(observer)
+        FiscalConfig.set_mode('mock')
+        try:
+            result, _status = FiscalizationService.fiscalize_order(order.id)
+            assert result['success']
+        finally:
+            FiscalConfig.set_mode('off')
+            unregister_sync_evidence_observer(observer)
+
+        assert [name for name, _payload in events] == [
+            'fiscal_attempt_started', 'fiscal_attempt_completed',
+        ]
+        assert events[0][1]['order_uuid'] == str(order.uuid)
+        assert events[0][1]['status'] == 'SENT'
+        assert events[0][1]['request_payload']['total'] == 6000000
+        assert events[1][1]['status'] == 'CONFIRMED'
+        assert events[1][1]['fiscal_sign']
 
     def test_unpaid_order_cannot_issue_a_sale_receipt(self, order):
         Order.objects.filter(pk=order.pk).update(is_paid=False, paid_at=None)

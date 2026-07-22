@@ -16,6 +16,7 @@ from collections import defaultdict
 from django.db import IntegrityError, transaction
 
 from base.services.sync.encoder import serialize_payload
+from base.services.sync.evidence import emit_sync_evidence
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,7 @@ class SyncQueue:
         # Reset retry state only for genuinely new content.  Re-adding the same
         # poison payload (the reconcile sweep runs every cycle) must not revive
         # it forever; editing/correcting it should revive it immediately.
+        operation = 'unchanged'
         for create_attempt in range(2):
             try:
                 with transaction.atomic():
@@ -66,6 +68,7 @@ class SyncQueue:
                             record_uuid=record_uuid,
                             payload=payload,
                         )
+                        operation = 'created'
                     elif (_payload_version(payload) is not None
                           and _payload_version(record.payload) is not None
                           and _payload_version(payload)
@@ -84,6 +87,7 @@ class SyncQueue:
                             'payload', 'generation', 'attempts', 'last_error',
                             'updated_at',
                         ])
+                        operation = 'replaced'
                 break
             except IntegrityError:
                 # Two first-time enqueue attempts can both observe an empty slot.
@@ -92,6 +96,9 @@ class SyncQueue:
                 if create_attempt:
                     raise
         logger.debug(f'Sync queued: {model_name} {uuid_val}')
+        emit_sync_evidence(
+            'queue_upsert', operation=operation, record=cls._to_dict(record),
+        )
         return str(record.generation)
 
     @classmethod
@@ -158,7 +165,10 @@ class SyncQueue:
         qs = SyncQueueRecord.objects.filter(record_uuid__in=coerced)
         if model_name is not None:
             qs = qs.filter(model_name=model_name)
+        removed = [cls._to_dict(row) for row in qs.iterator()]
         qs.delete()
+        if removed:
+            emit_sync_evidence('queue_removed', reason='explicit_remove', records=removed)
 
     @classmethod
     def acknowledge(cls, records, model_name):
@@ -175,6 +185,7 @@ class SyncQueue:
         if not expected:
             return set()
 
+        snapshots = []
         with transaction.atomic():
             rows = list(
                 SyncQueueRecord.objects.select_for_update().filter(
@@ -187,9 +198,14 @@ class SyncQueue:
                 if expected.get(row.record_uuid) == row.generation
             ]
             if matched:
+                snapshots = [cls._to_dict(row) for row in matched]
                 SyncQueueRecord.objects.filter(
                     pk__in=[row.pk for row in matched],
                 ).delete()
+        if snapshots:
+            emit_sync_evidence(
+                'queue_acknowledged', model_name=model_name, records=snapshots,
+            )
         return {str(row.record_uuid) for row in matched}
 
     @classmethod
@@ -211,6 +227,9 @@ class SyncQueue:
             attempts=models_F_plus_one(),
             last_error=str(error)[:500],
         )
+        rows = [cls._to_dict(row) for row in qs.iterator()]
+        if rows:
+            emit_sync_evidence('queue_failed', error=str(error)[:500], records=rows)
 
     @classmethod
     def mark_batch_failed(cls, uuids, error, model_name=None, generations=None):
@@ -248,6 +267,13 @@ class SyncQueue:
                     attempts=models_F_plus_one(),
                     last_error=str(error)[:500],
                 )
+                failed_rows = list(
+                    SyncQueueRecord.objects.filter(pk__in=matched_pks).iterator()
+                )
+                emit_sync_evidence(
+                    'queue_failed', error=str(error)[:500],
+                    records=[cls._to_dict(row) for row in failed_rows],
+                )
             return {
                 str(row.record_uuid) for row in rows if row.pk in matched_pks
             }
@@ -255,12 +281,18 @@ class SyncQueue:
             attempts=models_F_plus_one(),
             last_error=str(error)[:500],
         )
+        rows = [cls._to_dict(row) for row in qs.iterator()]
+        if rows:
+            emit_sync_evidence('queue_failed', error=str(error)[:500], records=rows)
         return {str(u) for u in coerced}
 
     @classmethod
     def clear(cls):
         from base.models import SyncQueueRecord
+        rows = [cls._to_dict(row) for row in SyncQueueRecord.objects.all().iterator()]
         SyncQueueRecord.objects.all().delete()
+        if rows:
+            emit_sync_evidence('queue_removed', reason='clear_all', records=rows)
 
     @classmethod
     def get_summary(cls):

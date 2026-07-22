@@ -13,6 +13,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from base.helpers.response import ServiceResponse
+from base.services.sync.evidence import emit_sync_evidence
 from fiscalization.config import FiscalConfig
 from fiscalization.models import FiscalReceipt
 from fiscalization.providers import get_provider
@@ -90,6 +91,20 @@ class FiscalizationService:
             receipt.status = FiscalReceipt.Status.SENT
             receipt.save()
 
+        emit_sync_evidence(
+            'fiscal_attempt_started',
+            order_id=order.id,
+            order_uuid=str(order.uuid),
+            receipt_id=receipt.id,
+            receipt_type=receipt_type,
+            attempt=receipt.attempts,
+            provider=receipt.provider,
+            mode=receipt.mode,
+            amount=str(receipt.amount),
+            request_payload=payload,
+            status=receipt.status,
+        )
+
         # Provider call OUTSIDE the row lock — network I/O must not hold a DB
         # lock on the receipt row.
         provider = get_provider(cfg['provider'], cfg)
@@ -118,6 +133,27 @@ class FiscalizationService:
                 receipt.status = FiscalReceipt.Status.FAILED
                 receipt.error = result.error or 'unknown provider error'
             receipt.save()
+
+        emit_sync_evidence(
+            'fiscal_attempt_completed',
+            order_id=order.id,
+            order_uuid=str(order.uuid),
+            receipt_id=receipt.id,
+            receipt_type=receipt_type,
+            attempt=receipt.attempts,
+            provider=receipt.provider,
+            mode=receipt.mode,
+            amount=str(receipt.amount),
+            status=receipt.status,
+            response_payload=receipt.response_payload,
+            error=receipt.error,
+            fiscal_sign=receipt.fiscal_sign,
+            fiscal_number=receipt.fiscal_number,
+            qr_url=receipt.qr_url,
+            fiscalized_at=(
+                receipt.fiscalized_at.isoformat() if receipt.fiscalized_at else None
+            ),
+        )
 
         if result.success:
             return ServiceResponse.success(
