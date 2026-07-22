@@ -272,8 +272,15 @@ def queue_clear(request):
         }, status=400)
 
     from base.services.sync.queue import SyncQueue
-    SyncQueue.clear()
-    return JsonResponse({'success': True, 'message': 'Queue cleared'})
+    cleared = SyncQueue.clear()
+    return JsonResponse({
+        'success': True,
+        'cleared': cleared,
+        'message': (
+            f'Cleared {cleared} rebuildable queue record(s); '
+            'hard-delete tombstones were preserved'
+        ),
+    })
 
 
 @csrf_exempt

@@ -137,3 +137,34 @@ def test_hard_delete_rolls_back_when_durable_tombstone_enqueue_fails(
     assert not SyncQueueRecord.objects.filter(
         model_name='orderitem', record_uuid=item_uuid,
     ).exists()
+
+
+@pytest.mark.django_db
+def test_queue_clear_preserves_source_less_hard_delete_tombstone(
+    settings, order_factory,
+):
+    """Queue maintenance may drop snapshots, never the only delete marker."""
+    from base.models import SyncQueueRecord
+    from base.services.sync.queue import SyncQueue
+
+    settings.DEPLOYMENT_MODE = 'local'
+    settings.SYNC_ENABLED = True
+    order = order_factory()
+    item = order.items.get()
+    item_uuid = item.uuid
+    SyncQueueRecord.objects.all().delete()
+
+    item.hard_delete()
+    live_uuid = order.uuid
+    SyncQueue.add('order', live_uuid, order.to_sync_dict())
+
+    cleared = SyncQueue.clear()
+
+    assert cleared == 1
+    assert not SyncQueueRecord.objects.filter(
+        model_name='order', record_uuid=live_uuid,
+    ).exists()
+    tombstone = SyncQueueRecord.objects.get(
+        model_name='orderitem', record_uuid=item_uuid,
+    )
+    assert tombstone.payload['is_deleted'] is True

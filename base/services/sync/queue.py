@@ -233,6 +233,50 @@ class SyncQueue:
 
     @classmethod
     def mark_batch_failed(cls, uuids, error, model_name=None, generations=None):
+        """Consume one poison-record attempt for exact rejected generations.
+
+        This is reserved for receiver responses which identify the individual
+        UUIDs that could not be applied.  Transport/authentication/server-wide
+        failures are not evidence that any record is poison and must use
+        :meth:`mark_batch_deferred` instead; otherwise a short outage can
+        dead-letter valid orders and payments permanently.
+        """
+        return cls._record_batch_error(
+            uuids,
+            error,
+            model_name=model_name,
+            generations=generations,
+            consume_attempt=True,
+        )
+
+    @classmethod
+    def mark_batch_deferred(cls, uuids, error, model_name=None, generations=None):
+        """Retain a systemically blocked batch without poisoning its records.
+
+        A 401 after token rotation, a 5xx deployment fault, timeout, or a legacy
+        batch-level rejection applies to the delivery attempt as a whole.  It
+        should remain observable in ``last_error`` but must not advance the
+        per-record dead-letter counter: the exact same payload may be valid as
+        soon as the shared dependency recovers.
+        """
+        return cls._record_batch_error(
+            uuids,
+            error,
+            model_name=model_name,
+            generations=generations,
+            consume_attempt=False,
+        )
+
+    @classmethod
+    def _record_batch_error(
+        cls,
+        uuids,
+        error,
+        *,
+        model_name=None,
+        generations=None,
+        consume_attempt,
+    ):
         # Scope by model_name (the unique key's other half) when known so a
         # failure on one model doesn't bump attempts on a different model's row
         # sharing the same record_uuid.
@@ -263,36 +307,60 @@ class SyncQueue:
                 ]
                 if not matched_pks:
                     return set()
-                SyncQueueRecord.objects.filter(pk__in=matched_pks).update(
-                    attempts=models_F_plus_one(),
-                    last_error=str(error)[:500],
-                )
+                updates = {'last_error': str(error)[:500]}
+                if consume_attempt:
+                    updates['attempts'] = models_F_plus_one()
+                SyncQueueRecord.objects.filter(pk__in=matched_pks).update(**updates)
                 failed_rows = list(
                     SyncQueueRecord.objects.filter(pk__in=matched_pks).iterator()
                 )
                 emit_sync_evidence(
                     'queue_failed', error=str(error)[:500],
+                    failure_scope=('record' if consume_attempt else 'batch'),
+                    attempts_consumed=consume_attempt,
                     records=[cls._to_dict(row) for row in failed_rows],
                 )
             return {
                 str(row.record_uuid) for row in rows if row.pk in matched_pks
             }
-        qs.update(
-            attempts=models_F_plus_one(),
-            last_error=str(error)[:500],
-        )
+        updates = {'last_error': str(error)[:500]}
+        if consume_attempt:
+            updates['attempts'] = models_F_plus_one()
+        qs.update(**updates)
         rows = [cls._to_dict(row) for row in qs.iterator()]
         if rows:
-            emit_sync_evidence('queue_failed', error=str(error)[:500], records=rows)
+            emit_sync_evidence(
+                'queue_failed', error=str(error)[:500],
+                failure_scope=('record' if consume_attempt else 'batch'),
+                attempts_consumed=consume_attempt, records=rows,
+            )
         return {str(u) for u in coerced}
 
     @classmethod
-    def clear(cls):
+    def clear(cls, *, include_tombstones=False):
+        """Clear rebuildable queue slots without erasing deletion evidence.
+
+        A live row removed from this cache is rediscovered by the unsynced-row
+        reconciliation sweep.  A hard-delete tombstone has no source row left;
+        its queue slot is the *only* durable record that tells the peer to
+        remove the object.  The old blanket clear silently resurrected deleted
+        order items on the cloud.  Preserve tombstones by default, while keeping
+        an explicit internal escape hatch for full database reset workflows.
+        Returns the number of rows removed.
+        """
         from base.models import SyncQueueRecord
-        rows = [cls._to_dict(row) for row in SyncQueueRecord.objects.all().iterator()]
-        SyncQueueRecord.objects.all().delete()
+        qs = SyncQueueRecord.objects.all()
+        if not include_tombstones:
+            qs = qs.exclude(payload__is_deleted=True)
+        rows = [cls._to_dict(row) for row in qs.iterator()]
+        qs.delete()
         if rows:
-            emit_sync_evidence('queue_removed', reason='clear_all', records=rows)
+            emit_sync_evidence(
+                'queue_removed',
+                reason=('clear_all' if include_tombstones else 'clear_rebuildable'),
+                records=rows,
+            )
+        return len(rows)
 
     @classmethod
     def get_summary(cls):

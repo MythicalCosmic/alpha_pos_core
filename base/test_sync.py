@@ -141,6 +141,87 @@ class TestPushKeepsRejectedRecordsQueued:
         assert parent_row.attempts == 1
         assert child_row.attempts == 0
 
+    def test_systemic_failures_never_dead_letter_valid_money_records(
+        self, settings, monkeypatch,
+    ):
+        """A repaired token/server must resume the exact unchanged payload.
+
+        ``/health`` is intentionally public and can return 200 while /receive
+        rejects an expired branch token.  Before this regression fix, 25 such
+        cycles consumed the *record* poison budget and permanently hid valid
+        orders/payments from every later push.
+        """
+        from base.models import SyncQueueRecord
+        from base.services.sync import service as sync_service
+        from base.services.sync.queue import SyncQueue
+
+        settings.SYNC_ENABLED = True
+        settings.DEPLOYMENT_MODE = 'local'
+        settings.BRANCH_ID = 'main'
+        settings.CLOUD_SYNC_URL = 'https://cloud.test'
+        settings.CLOUD_SYNC_TOKEN = 'rotated-or-expired'
+        settings.SYNC_MAX_QUEUE_ATTEMPTS = 2
+
+        payment_uuid = str(uuidlib.uuid4())
+        SyncQueue.add(
+            'orderpayment', payment_uuid,
+            {
+                'uuid': payment_uuid,
+                'sync_version': 1,
+                'order_uuid': str(uuidlib.uuid4()),
+                'method': 'CASH',
+                'amount': '50000.00',
+            },
+        )
+
+        monkeypatch.setattr(sync_service, 'check_health', lambda: True)
+        monkeypatch.setattr(
+            sync_service.SyncService, '_reconcile_unsynced',
+            classmethod(lambda cls: None),
+        )
+        monkeypatch.setattr(
+            sync_service.SyncService, '_notify_success',
+            staticmethod(lambda *a, **k: None),
+        )
+        monkeypatch.setattr(
+            sync_service.SyncService, '_notify_error',
+            staticmethod(lambda *a, **k: None),
+        )
+
+        calls = 0
+
+        def systemic_then_recovered(model_name, records, retry=True):
+            nonlocal calls
+            calls += 1
+            if calls <= settings.SYNC_MAX_QUEUE_ATTEMPTS + 1:
+                return {
+                    'success': False,
+                    'error': 'HTTP 401: Invalid branch token',
+                }
+            return {
+                'success': True, 'created': 1, 'updated': 0, 'skipped': 0,
+                'errors': [], 'failed_uuids': [],
+            }
+
+        monkeypatch.setattr(sync_service, 'send_batch', systemic_then_recovered)
+
+        for _ in range(settings.SYNC_MAX_QUEUE_ATTEMPTS + 1):
+            result = sync_service.SyncService.push()
+            assert result['success'] is False
+            row = SyncQueueRecord.objects.get(
+                model_name='orderpayment', record_uuid=payment_uuid,
+            )
+            assert row.attempts == 0
+            assert '401' in row.last_error
+            assert SyncQueue.dead_letter_count() == 0
+            assert 'orderpayment' in SyncQueue.get_grouped()
+
+        recovered = sync_service.SyncService.push()
+        assert recovered['success'] is True
+        assert not SyncQueueRecord.objects.filter(
+            model_name='orderpayment', record_uuid=payment_uuid,
+        ).exists()
+
 
 class TestPullCursorNotClobbered:
     """Regression: set_last_pull() used to stamp `last_pull` (the durable pull
@@ -524,3 +605,44 @@ class TestPushQueueGenerationSafety:
         row.refresh_from_db()
         assert row.generation == generation
         assert row.payload == newer
+
+
+def test_reconcile_poison_row_does_not_block_later_unsynced_siblings(
+    settings, monkeypatch,
+):
+    """A single unserializable legacy row cannot strand a whole model."""
+    from base.models import Category, SyncQueueRecord
+    from base.services.sync import service as sync_service
+
+    settings.SYNC_ENABLED = True
+    settings.DEPLOYMENT_MODE = 'local'
+    settings.BRANCH_ID = 'main'
+
+    first = Category.objects.create(name='Poison first', branch_id='main')
+    second = Category.objects.create(name='Healthy second', branch_id='main')
+    Category.objects.filter(pk__in=[first.pk, second.pk]).update(synced_at=None)
+    SyncQueueRecord.objects.all().delete()
+
+    monkeypatch.setattr(sync_service, 'SYNC_ORDER', ['category'])
+    monkeypatch.setattr(
+        sync_service, 'get_all_models', lambda: {'category': Category},
+    )
+    original = Category.to_sync_dict
+
+    def one_poison(self):
+        if self.pk == first.pk:
+            raise ValueError('legacy field cannot be serialized')
+        return original(self)
+
+    monkeypatch.setattr(Category, 'to_sync_dict', one_poison)
+
+    requeued = sync_service.SyncService._reconcile_unsynced()
+
+    assert requeued == 1
+    assert not SyncQueueRecord.objects.filter(
+        model_name='category', record_uuid=first.uuid,
+    ).exists()
+    queued = SyncQueueRecord.objects.get(
+        model_name='category', record_uuid=second.uuid,
+    )
+    assert queued.payload['uuid'] == str(second.uuid)

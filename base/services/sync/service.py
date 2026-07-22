@@ -148,7 +148,15 @@ class SyncService:
                         total_failed += len(batch)
                         error_msg = f'{model_name}: {result.get("error", "Unknown")}'
                         errors.append(error_msg)
-                        SyncQueue.mark_batch_failed(
+                        # A whole-batch transport/auth/server failure says
+                        # nothing about the validity of any individual record.
+                        # Consuming the poison-message budget here used to
+                        # dead-letter perfectly valid orders/payments after a
+                        # short token/config outage, so fixing the shared cause
+                        # did not resume them. Keep the exact generations queued
+                        # and observable; only receiver-identified failed UUIDs
+                        # above consume per-record attempts.
+                        SyncQueue.mark_batch_deferred(
                             batch_uuids, result.get('error', 'Unknown'),
                             model_name=model_name,
                             generations=batch_generations,
@@ -511,12 +519,24 @@ class SyncService:
                 qs = model_class.objects.unsynced()
                 if branch:
                     qs = qs.filter(branch_id=branch)
-                for obj in qs.iterator():
-                    # add() compares content with any existing slot. Identical
-                    # payloads retain their generation/retry count; newer edits
-                    # rotate generation and revive a corrected dead letter.
-                    SyncQueue.add(name, str(obj.uuid), obj.to_sync_dict())
-                    requeued += 1
+                for obj in qs.order_by('pk').iterator():
+                    try:
+                        # add() compares content with any existing slot.
+                        # Identical payloads retain their generation/retry
+                        # count; newer edits rotate generation and revive a
+                        # corrected dead letter.
+                        SyncQueue.add(name, str(obj.uuid), obj.to_sync_dict())
+                        requeued += 1
+                    except Exception as e:  # noqa: BLE001 - isolate poison row
+                        # One legacy/corrupt row must never prevent every later
+                        # order/payment of the same model from entering the
+                        # durable queue. Keep the bad row unsynced for repair and
+                        # continue with its siblings; a later cycle retries it.
+                        logger.warning(
+                            'reconcile unsynced failed for %s uuid=%s: %s',
+                            name, getattr(obj, 'uuid', None), e,
+                            exc_info=True,
+                        )
             except Exception as e:
                 logger.warning('reconcile unsynced failed for %s: %s', name, e)
         if requeued:
