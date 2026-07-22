@@ -264,7 +264,9 @@ def _money_evidence_manifest(shift, *, include_external=False):
     return result
 
 
-def _build_settlement_manifest(shift, settlement_rows, *, version=3):
+def _build_settlement_manifest(
+    shift, settlement_rows, *, version=3, cashier_counted_methods=None,
+):
     tenders = [{
         'uuid': str(row.uuid),
         'method': row.method,
@@ -272,7 +274,7 @@ def _build_settlement_manifest(shift, settlement_rows, *, version=3):
         'counted': _manifest_money(row.counted_amount),
         'difference': _manifest_money(row.difference),
     } for row in sorted(settlement_rows, key=lambda item: item.method)]
-    return {
+    manifest = {
         'version': version,
         'branch_id': shift.branch_id,
         'tenders': tenders,
@@ -281,6 +283,45 @@ def _build_settlement_manifest(shift, settlement_rows, *, version=3):
             shift, include_external=version >= 3,
         ),
     }
+    # A numeric zero is a valid physical count, so it cannot also mean "the
+    # cashier never submitted this tender". Keep the explicit method keys in
+    # the immutable close handshake. Older manifests omit the marker and are
+    # interpreted conservatively by _settlement_row_status below.
+    if cashier_counted_methods is not None:
+        manifest['cashier_counted_methods'] = sorted({
+            str(method).strip().upper()
+            for method in cashier_counted_methods
+            if str(method).strip()
+        })
+    return manifest
+
+
+def _settlement_row_status(shift, row, *, reconciled):
+    """Return an honest per-tender handover state.
+
+    ENDED means the sales window was frozen; it does not prove that the cashier
+    entered a physical tender count. Historically all absent counts were stored
+    as zero and then every ENDED row was labelled COUNTED, making an untouched
+    handover look like a full shortage. New close manifests preserve the exact
+    submitted method keys. For legacy manifests, only a non-zero count proves
+    that a value was supplied; zero remains safely UNCOUNTED.
+    """
+    if reconciled:
+        return 'CONFIRMED'
+    if shift.status not in ('ENDED', 'COMPLETED'):
+        return 'OPEN'
+
+    manifest = shift.settlement_manifest or {}
+    if 'cashier_counted_methods' in manifest:
+        submitted = {
+            str(method).strip().upper()
+            for method in (manifest.get('cashier_counted_methods') or [])
+            if str(method).strip()
+        }
+        return 'COUNTED' if str(row.method).upper() in submitted else 'UNCOUNTED'
+
+    counted = _money(row.counted_amount)
+    return 'COUNTED' if counted not in (None, Decimal('0.00')) else 'UNCOUNTED'
 
 
 def _shift_tender_integrity_error(shift, evidence_end):
@@ -367,8 +408,16 @@ def _settlement_bundle_error(shift, settlement_rows):
     if tender_error:
         return tender_error
     try:
+        manifest_kwargs = {}
+        if 'cashier_counted_methods' in manifest:
+            manifest_kwargs['cashier_counted_methods'] = manifest.get(
+                'cashier_counted_methods'
+            )
         current = _build_settlement_manifest(
-            shift, settlement_rows, version=manifest_version,
+            shift,
+            settlement_rows,
+            version=manifest_version,
+            **manifest_kwargs,
         )
     except Exception as exc:  # noqa: BLE001 - fail closed on malformed evidence
         return f'Unable to verify settlement evidence: {exc}'
@@ -788,12 +837,15 @@ class ShiftService:
             with transaction.atomic():
                 from cashbox.services.drawer import expected_payment_totals
                 from cashbox.models import ShiftPaymentTotal
-                counted = counted or {}
+                counted = counted if isinstance(counted, dict) else {}
+                cashier_counted_methods = set()
                 frozen_rows = []
                 for method, exp in expected_payment_totals(shift).items():
                     raw = counted.get(method)
                     try:
                         cnt = Decimal(str(raw)) if raw is not None else Decimal('0')
+                        if raw is not None:
+                            cashier_counted_methods.add(method)
                     except (InvalidOperation, TypeError, ValueError):
                         cnt = Decimal('0')
                     row, _ = ShiftPaymentTotal.objects.update_or_create(
@@ -808,7 +860,9 @@ class ShiftService:
                 # rows and manifest roll back together; an eligible close also
                 # rolls back its ENDED transition below.
                 shift.settlement_manifest = _build_settlement_manifest(
-                    shift, frozen_rows,
+                    shift,
+                    frozen_rows,
+                    cashier_counted_methods=cashier_counted_methods,
                 )
                 shift.save(update_fields=[
                     'settlement_manifest', 'synced_at', 'sync_version',
@@ -1298,18 +1352,15 @@ class ShiftService:
         reconciled = CashReconciliation.objects.filter(
             shift=shift, is_deleted=False,
         ).exists()
-        status = (
-            'CONFIRMED' if reconciled
-            else 'COUNTED' if shift.status in ('ENDED', 'COMPLETED')
-            else 'OPEN'
-        )
         return [{
             'method': r.method,
             'expected': str(r.expected_amount),
             'counted': str(r.counted_amount),      # cashier
             'confirmed': str(r.confirmed_amount),  # manager
             'difference': str(r.difference),
-            'status': status,
+            'status': _settlement_row_status(
+                shift, r, reconciled=reconciled,
+            ),
             'reconciled': reconciled,
         } for r in rows]
 
@@ -1843,7 +1894,7 @@ class ShiftService:
                     is_deleted=False,
                 ).values_list('shift_id', flat=True)
             )
-            shift_status = {shift.id: shift.status for shift in valid}
+            shifts_by_id = {shift.id: shift for shift in valid}
 
             def money(d):
                 return str((d or zero).quantize(zero))   # always 2dp, e.g. "100.00"
@@ -1863,18 +1914,15 @@ class ShiftService:
                 n = prep_n.get(sid)
                 frozen = settlement_rows.get(sid, [])
                 reconciled = sid in reconciled_shift_ids
-                settlement_status = (
-                    'CONFIRMED' if reconciled
-                    else 'COUNTED' if shift_status.get(sid) in ('ENDED', 'COMPLETED')
-                    else 'OPEN'
-                )
                 settlement = [{
                     'method': row.method,
                     'expected': money(row.expected_amount),
                     'counted': money(row.counted_amount),
                     'confirmed': money(row.confirmed_amount),
                     'difference': money(row.difference),
-                    'status': settlement_status,
+                    'status': _settlement_row_status(
+                        shifts_by_id[sid], row, reconciled=reconciled,
+                    ),
                     'reconciled': reconciled,
                 } for row in frozen]
                 expected_by_tender = {
