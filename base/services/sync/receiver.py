@@ -8,6 +8,19 @@ from base.services.sync.config import FK_UUID_MAPPINGS
 logger = logging.getLogger(__name__)
 
 
+class CriticalSyncConflict(ValueError):
+    """A financial state transition was not authoritatively stored.
+
+    The receive endpoint returns these UUIDs as failed so the branch's durable
+    queue retains them instead of treating an HTTP 200/skipped write as proof
+    that a shift close reached the cloud.
+    """
+
+    def __init__(self, record_result):
+        self.record_result = record_result
+        super().__init__(record_result.get('reason') or 'Critical sync conflict')
+
+
 def _resolve_foreign_keys(model_class, data, incoming_branch):
     """Resolve UUID-keyed FK references to local PKs.
 
@@ -277,6 +290,9 @@ class CloudReceiver:
             # re-queues the failures — otherwise a partial-failure batch was
             # purged wholesale on the HTTP-200, silently losing the bad rows.
             'failed_uuids': [],
+            # Additive per-record evidence for state transitions where
+            # created/updated/skipped is too weak to be an acknowledgement.
+            'record_results': [],
         }
 
         try:
@@ -320,6 +336,11 @@ class CloudReceiver:
                     result['updated'] += 1
                 else:
                     result['skipped'] += 1
+                record_result = getattr(instance, '_sync_record_result', None)
+                if record_result:
+                    record_result = dict(record_result)
+                    record_result['action'] = action
+                    result['record_results'].append(record_result)
                 # Collect the orders touched by this batch so staff notifications
                 # fire AFTER the order + its items are all applied (items arrive
                 # in a separate batch after the order — see _notify_received_orders).
@@ -332,6 +353,17 @@ class CloudReceiver:
                         'OrderPayment', 'ExternalOrderPayment',
                     } and instance.order_id:
                         affected_order_ids.add(instance.order_id)
+            except CriticalSyncConflict as e:
+                rec_uuid = str(record_data.get('uuid') or '')
+                record_result = dict(e.record_result)
+                record_result['action'] = 'conflict'
+                result['record_results'].append(record_result)
+                result['skipped'] += 1
+                error_msg = f'{rec_uuid or "?"}: {e}'
+                result['errors'].append(error_msg)
+                if rec_uuid:
+                    result['failed_uuids'].append(rec_uuid)
+                logger.warning('Receive critical conflict: %s', error_msg)
             except Exception as e:
                 rec_uuid = record_data.get("uuid")
                 error_msg = f'{rec_uuid or "?"}: {str(e)}'
@@ -345,6 +377,86 @@ class CloudReceiver:
             cls._notify_received_orders(affected_order_ids)
 
         return result
+
+    @staticmethod
+    def _shift_close_result(
+        *, uuid_val, state, instance=None, manifest=None,
+        reason_code=None, reason=None,
+    ):
+        from core.shifts.service import settlement_manifest_digest
+
+        manifest = manifest or {}
+        return {
+            'uuid': str(uuid_val),
+            'kind': 'SHIFT_CLOSE',
+            'state': state,
+            'server_status': getattr(instance, 'status', None),
+            'server_sync_version': getattr(instance, 'sync_version', None),
+            'manifest_version': manifest.get('version'),
+            'manifest_digest': settlement_manifest_digest(manifest),
+            'reason_code': reason_code,
+            'reason': reason,
+        }
+
+    @classmethod
+    def _validate_shift_close_intent(
+        cls, *, model_class, uuid_val, cleaned, incoming_branch,
+    ):
+        """Validate the immutable minimum needed to store a close header."""
+        if (
+            getattr(settings, 'DEPLOYMENT_MODE', 'local') != 'cloud'
+            or model_class._meta.label_lower != 'base.shift'
+            or str(cleaned.get('status') or '').upper() != 'ENDED'
+        ):
+            return None
+
+        manifest = cleaned.get('settlement_manifest')
+        result_kwargs = {
+            'uuid_val': uuid_val,
+            'state': 'CONFLICT',
+            'manifest': manifest if isinstance(manifest, dict) else None,
+        }
+        if not isinstance(manifest, dict) or not manifest:
+            raise CriticalSyncConflict(cls._shift_close_result(
+                **result_kwargs,
+                reason_code='MANIFEST_REQUIRED',
+                reason='A shift close must include its immutable settlement manifest',
+            ))
+        if (
+            manifest.get('version') not in {2, 3}
+            or manifest.get('branch_id') != incoming_branch
+            or not isinstance(manifest.get('tenders'), list)
+        ):
+            raise CriticalSyncConflict(cls._shift_close_result(
+                **result_kwargs,
+                reason_code='INVALID_CLOSE_MANIFEST',
+                reason='The shift close manifest is malformed or belongs to another branch',
+            ))
+        end_time = cleaned.get('end_time')
+        if end_time is None:
+            raise CriticalSyncConflict(cls._shift_close_result(
+                **result_kwargs,
+                reason_code='INVALID_CLOSE_WINDOW',
+                reason='A shift close must include end_time',
+            ))
+        if (
+            not isinstance(cleaned.get('total_orders'), int)
+            or cleaned['total_orders'] < 0
+        ):
+            raise CriticalSyncConflict(cls._shift_close_result(
+                **result_kwargs,
+                reason_code='INVALID_CLOSE_TOTALS',
+                reason='A shift close must include frozen order and money totals',
+            ))
+        for field_name in ('total_revenue', 'cash_collected'):
+            value = cleaned.get(field_name)
+            if not isinstance(value, Decimal) or not value.is_finite():
+                raise CriticalSyncConflict(cls._shift_close_result(
+                    **result_kwargs,
+                    reason_code='INVALID_CLOSE_TOTALS',
+                    reason=f'A shift close has invalid {field_name}',
+                ))
+        return manifest
 
     @staticmethod
     def _reconcile_received_order_money(order_ids):
@@ -508,6 +620,12 @@ class CloudReceiver:
             data.pop(uuid_field, None)
 
         cleaned = _prepare_fields(model_class, data)
+        close_manifest = cls._validate_shift_close_intent(
+            model_class=model_class,
+            uuid_val=uuid_val,
+            cleaned=cleaned,
+            incoming_branch=incoming_branch,
+        )
 
         # Per-record atomic + row lock. Without this the get → _should_replace →
         # save sequence is a read-modify-write with no isolation: two concurrent
@@ -519,6 +637,8 @@ class CloudReceiver:
         with transaction.atomic():
             try:
                 instance = model_class.objects.select_for_update().get(uuid=uuid_val)
+                force_shift_close = False
+                prior_sync_version = instance.sync_version
 
                 if (
                     getattr(model_class, 'SYNC_PULL_SCOPE', 'branch') == 'branch'
@@ -531,6 +651,88 @@ class CloudReceiver:
                         instance.branch_id,
                     )
                     return instance, 'skipped'
+
+                if close_manifest:
+                    def close_conflict(code, reason):
+                        raise CriticalSyncConflict(cls._shift_close_result(
+                            uuid_val=uuid_val,
+                            state='CONFLICT',
+                            instance=instance,
+                            manifest=close_manifest,
+                            reason_code=code,
+                            reason=reason,
+                        ))
+
+                    incoming_user = resolved_fks.get('user')
+                    if (
+                        incoming_user is not None
+                        and incoming_user.pk != instance.user_id
+                    ):
+                        close_conflict(
+                            'CLOSE_OWNER_MISMATCH',
+                            'The close owner differs from the cloud shift owner',
+                        )
+                    incoming_start = cleaned.get('start_time')
+                    if (
+                        incoming_start is not None
+                        and incoming_start != instance.start_time
+                    ):
+                        close_conflict(
+                            'CLOSE_WINDOW_MISMATCH',
+                            'The close start_time differs from the cloud shift window',
+                        )
+                    if cleaned['end_time'] <= instance.start_time:
+                        close_conflict(
+                            'INVALID_CLOSE_WINDOW',
+                            'The close end_time must be later than start_time',
+                        )
+
+                    stored_closed = instance.status in {
+                        'ENDED', 'COMPLETED',
+                    }
+                    same_header = (
+                        instance.end_time == cleaned['end_time']
+                        and instance.total_orders == cleaned['total_orders']
+                        and instance.total_revenue == cleaned['total_revenue']
+                        and instance.cash_collected == cleaned['cash_collected']
+                    )
+                    stored_manifest = instance.settlement_manifest or {}
+                    if stored_closed:
+                        if not same_header:
+                            close_conflict(
+                                'CLOSE_TOTALS_MISMATCH',
+                                'The replayed close differs from frozen cloud totals',
+                            )
+                        if stored_manifest == close_manifest:
+                            instance._sync_record_result = cls._shift_close_result(
+                                uuid_val=uuid_val,
+                                state='STORED',
+                                instance=instance,
+                                manifest=stored_manifest,
+                            )
+                            return instance, 'skipped'
+                        if stored_manifest or instance.status == 'COMPLETED':
+                            close_conflict(
+                                'CLOSE_MANIFEST_MISMATCH',
+                                'The replayed close differs from the immutable cloud manifest',
+                            )
+                        # Repair a previously stored ENDED legacy header by
+                        # attaching the first immutable manifest. Header values
+                        # were proven identical above.
+                        force_shift_close = True
+                    elif (
+                        instance.status == 'ACTIVE'
+                        and instance.end_time is None
+                    ):
+                        # A close is irreversible branch-owned evidence. Apply a
+                        # valid manifest even when an unrelated cloud-side save
+                        # advanced sync_version and ordinary LWW would skip it.
+                        force_shift_close = True
+                    else:
+                        close_conflict(
+                            'INVALID_CLOUD_SHIFT_STATE',
+                            f'The cloud shift cannot close from {instance.status}',
+                        )
 
                 trusted_append_fields = frozenset()
                 if getattr(model_class, '_sync_append_only', False):
@@ -555,11 +757,11 @@ class CloudReceiver:
                 # sync_version. Without this, two branches that landed at the
                 # same version silently let whichever batch arrived second win.
                 if hasattr(model_class, '_should_replace'):
-                    if not model_class._should_replace(
+                    if not force_shift_close and not model_class._should_replace(
                         instance, sync_version, cleaned, incoming_branch,
                     ):
                         return instance, 'skipped'
-                elif sync_version < instance.sync_version:
+                elif not force_shift_close and sync_version < instance.sync_version:
                     return instance, 'skipped'
 
                 # A locally-tombstoned row is terminal: never let a stale
@@ -590,7 +792,11 @@ class CloudReceiver:
                     if fk_field not in denied and fk_field not in branch_frozen:
                         setattr(instance, fk_field, fk_instance)
 
-                instance.sync_version = sync_version
+                instance.sync_version = (
+                    max(prior_sync_version, sync_version) + 1
+                    if force_shift_close and sync_version <= prior_sync_version
+                    else sync_version
+                )
                 if (
                     not _del_denied
                     and 'is_deleted' not in branch_frozen
@@ -613,6 +819,13 @@ class CloudReceiver:
                     model_class, instance, automatic_values, creating=False,
                 )
                 instance._publish_synced_at_after_commit(using=instance._state.db)
+                if close_manifest:
+                    instance._sync_record_result = cls._shift_close_result(
+                        uuid_val=uuid_val,
+                        state='STORED',
+                        instance=instance,
+                        manifest=instance.settlement_manifest,
+                    )
                 return instance, 'updated'
 
             except model_class.DoesNotExist:
@@ -713,4 +926,11 @@ class CloudReceiver:
                     model_class, instance, automatic_values, creating=True,
                 )
                 instance._publish_synced_at_after_commit(using=instance._state.db)
+                if close_manifest:
+                    instance._sync_record_result = cls._shift_close_result(
+                        uuid_val=uuid_val,
+                        state='STORED',
+                        instance=instance,
+                        manifest=instance.settlement_manifest,
+                    )
                 return instance, 'created'

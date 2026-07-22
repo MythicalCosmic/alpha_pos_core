@@ -61,6 +61,47 @@ def _management_denied():
     )
 
 
+def _authenticated_branch_scope(request):
+    """Return ``(branch_id, error_response)`` for a branch sync credential.
+
+    Close acknowledgement exposes financial integrity state, so it uses the
+    same token-to-branch binding and production fail-closed rules as receive.
+    Reusing the receive endpoint's token resolver and fail-closed rules keeps
+    the two contracts aligned without exposing management credentials.
+    """
+    auth = request.META.get('HTTP_AUTHORIZATION', '')
+    if not auth.startswith('Branch '):
+        return None, JsonResponse({'error': 'Invalid authorization'}, status=401)
+
+    bound_branch, ok = _resolve_branch_token(auth[7:])
+    if not ok:
+        return None, JsonResponse({'error': 'Invalid branch token'}, status=401)
+
+    branch_id = request.META.get('HTTP_X_BRANCH_ID', 'unknown')
+    if bound_branch is not None:
+        if branch_id != bound_branch:
+            return None, JsonResponse(
+                {'error': f'X-Branch-ID does not match token (expected {bound_branch})'},
+                status=403,
+            )
+        return bound_branch, None
+
+    allowed_ids = getattr(settings, 'ALLOWED_BRANCH_IDS', None)
+    if allowed_ids:
+        if branch_id not in allowed_ids:
+            return None, JsonResponse(
+                {'error': 'X-Branch-ID is not in ALLOWED_BRANCH_IDS'},
+                status=403,
+            )
+    elif not settings.DEBUG:
+        return None, JsonResponse(
+            {'error': 'Unbound branch tokens are not permitted in production; '
+                      'configure BRANCH_TOKEN_MAP or ALLOWED_BRANCH_IDS'},
+            status=403,
+        )
+    return branch_id, None
+
+
 @csrf_exempt
 @require_POST
 def receive(request):
@@ -183,6 +224,66 @@ def receive(request):
     result = CloudReceiver.receive_batch(model_name, branch_id, records)
 
     return JsonResponse(result)
+
+
+@csrf_exempt
+@require_http_methods(['GET', 'POST'])
+def shift_close_ack(request):
+    """Validate whether one terminal close is complete on the cloud.
+
+    Both methods expose the same read-only operation: GET is useful for support
+    inspection, while POST keeps the manifest identity out of access-log query
+    strings for the desktop's normal polling path.
+    """
+    branch_id, denied = _authenticated_branch_scope(request)
+    if denied is not None:
+        return denied
+    if getattr(settings, 'DEPLOYMENT_MODE', '') != 'cloud':
+        return JsonResponse(
+            {'error': 'Shift close acknowledgement is available only on the cloud'},
+            status=403,
+        )
+
+    if request.method == 'GET':
+        payload = request.GET
+    else:
+        import json
+        try:
+            payload = json.loads(request.body or b'{}')
+        except (json.JSONDecodeError, ValueError):
+            return JsonResponse({'error': 'Invalid JSON'}, status=400)
+        if not isinstance(payload, dict):
+            return JsonResponse({'error': 'Expected JSON object'}, status=400)
+
+    raw_uuid = payload.get('shift_uuid')
+    raw_version = payload.get('manifest_version')
+    raw_digest = str(payload.get('manifest_digest') or '').strip().lower()
+    try:
+        from uuid import UUID
+        shift_uuid = UUID(str(raw_uuid))
+    except (TypeError, ValueError, AttributeError):
+        return JsonResponse({'error': 'shift_uuid must be a valid UUID'}, status=400)
+    try:
+        manifest_version = int(raw_version)
+    except (TypeError, ValueError):
+        return JsonResponse({'error': 'manifest_version must be an integer'}, status=400)
+    if manifest_version < 1:
+        return JsonResponse({'error': 'manifest_version must be positive'}, status=400)
+    if len(raw_digest) != 64 or any(
+        char not in '0123456789abcdef' for char in raw_digest
+    ):
+        return JsonResponse(
+            {'error': 'manifest_digest must be a 64-character SHA-256 hex digest'},
+            status=400,
+        )
+
+    from core.shifts.service import shift_close_acknowledgement
+    return JsonResponse(shift_close_acknowledgement(
+        shift_uuid=shift_uuid,
+        branch_id=branch_id,
+        manifest_version=manifest_version,
+        manifest_digest=raw_digest,
+    ))
 
 
 @csrf_exempt
@@ -489,6 +590,7 @@ def get_sync_urls():
     return [
         path('health', health, name='sync-health'),
         path('receive', receive, name='sync-receive'),
+        path('shift-close/ack', shift_close_ack, name='sync-shift-close-ack'),
         path('status', status, name='sync-status'),
         path('trigger', trigger, name='sync-trigger'),
         path('trigger-pull', trigger_pull, name='sync-trigger-pull'),

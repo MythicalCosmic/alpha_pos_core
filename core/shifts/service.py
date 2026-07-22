@@ -296,6 +296,25 @@ def _build_settlement_manifest(
     return manifest
 
 
+def settlement_manifest_digest(manifest):
+    """Return the cross-node identity of one immutable close manifest.
+
+    The desktop sends this digest when it asks the hub to acknowledge a shift
+    close.  Sorting keys and removing insignificant whitespace makes the value
+    independent of JSON object insertion order while preserving list order
+    (the manifest builder already orders every evidence list deterministically).
+    """
+    if not isinstance(manifest, dict) or not manifest:
+        return None
+    encoded = json.dumps(
+        manifest,
+        sort_keys=True,
+        separators=(',', ':'),
+        ensure_ascii=False,
+    ).encode('utf-8')
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _settlement_row_status(shift, row, *, reconciled):
     """Return an honest per-tender handover state.
 
@@ -451,6 +470,212 @@ def _settlement_bundle_error(shift, settlement_rows):
     if frozen != canonical:
         return 'Cloud order/refund evidence does not match frozen expected tenders'
     return None
+
+
+def _settlement_bundle_pending_reason(shift, settlement_rows):
+    """Identify an ordinary child-before-parent delivery gap.
+
+    The sync order sends ShiftPaymentTotal before CashboxExpense, and an ACK
+    poll can legitimately land between those batches.  A lower cloud evidence
+    count is therefore PENDING; equal/higher counts with different digests are
+    real conflicts and remain fail-closed.
+    """
+    manifest = shift.settlement_manifest or {}
+    version = manifest.get('version')
+    if version not in {2, 3}:
+        return None
+    try:
+        manifest_kwargs = {}
+        if 'cashier_counted_methods' in manifest:
+            manifest_kwargs['cashier_counted_methods'] = manifest.get(
+                'cashier_counted_methods'
+            )
+        current = _build_settlement_manifest(
+            shift,
+            settlement_rows,
+            version=version,
+            **manifest_kwargs,
+        )
+    except Exception:  # noqa: BLE001 - malformed evidence is a conflict
+        return None
+
+    pending = []
+    expected_expenses = manifest.get('expenses') or {}
+    current_expenses = current.get('expenses') or {}
+    try:
+        if int(current_expenses.get('count', 0)) < int(
+            expected_expenses.get('count', 0)
+        ):
+            pending.append('expenses')
+    except (TypeError, ValueError):
+        return None
+
+    expected_money = manifest.get('money_evidence') or {}
+    current_money = current.get('money_evidence') or {}
+    for evidence_name, expected_commitment in expected_money.items():
+        if not isinstance(expected_commitment, dict):
+            continue
+        current_commitment = current_money.get(evidence_name) or {}
+        try:
+            if int(current_commitment.get('count', 0)) < int(
+                expected_commitment.get('count', 0)
+            ):
+                pending.append(evidence_name)
+        except (TypeError, ValueError):
+            return None
+    if not pending:
+        return None
+    return 'Waiting for cloud evidence rows: ' + ', '.join(sorted(pending))
+
+
+def shift_close_acknowledgement(
+    *, shift_uuid, branch_id, manifest_version, manifest_digest,
+):
+    """Return the hub's authoritative, branch-scoped close state.
+
+    Receiving the Shift header is not an acknowledgement: its OrderPayment,
+    refund, expense and ShiftPaymentTotal children are delivered in later sync
+    batches.  A close becomes ACKNOWLEDGED only after the exact local manifest
+    is stored and the normal reconciliation guard can reproduce it from cloud
+    evidence.  The function is deliberately read-only and therefore naturally
+    idempotent for desktop polling/retries.
+    """
+    from cashbox.models import ShiftPaymentTotal
+
+    requested_digest = str(manifest_digest or '').strip().lower()
+    base = {
+        'success': True,
+        'shift_uuid': str(shift_uuid),
+        'state': 'PENDING',
+        'acknowledged': False,
+        'manifest_version': manifest_version,
+        'manifest_digest': requested_digest,
+        'digest_algorithm': 'sha256-canonical-json-v1',
+        'server_status': None,
+        'server_sync_version': None,
+        'server_manifest_version': None,
+        'server_manifest_digest': None,
+        'settlement_rows': {'expected': 0, 'received': 0},
+        'reason_code': None,
+        'reason': None,
+    }
+
+    def outcome(state, code=None, reason=None):
+        result = dict(base)
+        result['settlement_rows'] = dict(base['settlement_rows'])
+        result.update({
+            'state': state,
+            'acknowledged': state == 'ACKNOWLEDGED',
+            'reason_code': code,
+            'reason': reason,
+        })
+        return result
+
+    shift = Shift.objects.filter(
+        uuid=shift_uuid,
+        branch_id=str(branch_id or ''),
+        is_deleted=False,
+    ).first()
+    if shift is None:
+        return outcome(
+            'PENDING', 'SHIFT_NOT_RECEIVED',
+            'The shift header has not reached the cloud yet',
+        )
+
+    base.update({
+        'server_status': shift.status,
+        'server_sync_version': shift.sync_version,
+    })
+    manifest = shift.settlement_manifest or {}
+    if not manifest:
+        return outcome(
+            'PENDING', 'MANIFEST_NOT_RECEIVED',
+            'The immutable close manifest has not reached the cloud yet',
+        )
+
+    server_version = manifest.get('version')
+    server_digest = settlement_manifest_digest(manifest)
+    base.update({
+        'server_manifest_version': server_version,
+        'server_manifest_digest': server_digest,
+    })
+    if server_version != manifest_version:
+        return outcome(
+            'CONFLICT', 'MANIFEST_VERSION_MISMATCH',
+            'The cloud and terminal close-manifest versions differ',
+        )
+    if server_digest != requested_digest:
+        return outcome(
+            'CONFLICT', 'MANIFEST_DIGEST_MISMATCH',
+            'The cloud and terminal close manifests differ',
+        )
+
+    if shift.status == Shift.Status.ACTIVE:
+        return outcome(
+            'PENDING', 'SHIFT_NOT_CLOSED',
+            'The cloud still considers this shift active',
+        )
+    if shift.status not in (Shift.Status.ENDED, Shift.Status.COMPLETED):
+        return outcome(
+            'CONFLICT', 'INVALID_SHIFT_STATUS',
+            f'The cloud shift is {shift.status}, not ended or completed',
+        )
+
+    tenders = manifest.get('tenders')
+    if not isinstance(tenders, list):
+        return outcome(
+            'CONFLICT', 'INVALID_MANIFEST_TENDERS',
+            'The close manifest does not contain a valid tender list',
+        )
+    expected_uuids = {
+        str(tender.get('uuid'))
+        for tender in tenders
+        if isinstance(tender, dict) and tender.get('uuid')
+    }
+    if len(expected_uuids) != len(tenders):
+        return outcome(
+            'CONFLICT', 'INVALID_MANIFEST_TENDERS',
+            'The close manifest contains a missing or duplicate tender UUID',
+        )
+
+    settlement_rows = list(
+        ShiftPaymentTotal.objects.filter(
+            shift=shift,
+            branch_id=shift.branch_id,
+            is_deleted=False,
+        ).order_by('method')
+    )
+    received_uuids = {str(row.uuid) for row in settlement_rows}
+    base['settlement_rows'] = {
+        'expected': len(expected_uuids),
+        'received': len(received_uuids & expected_uuids),
+    }
+    missing = expected_uuids - received_uuids
+    if missing:
+        return outcome(
+            'PENDING', 'SETTLEMENT_ROWS_PENDING',
+            f'{len(missing)} settlement tender row(s) have not reached the cloud',
+        )
+    if received_uuids != expected_uuids:
+        return outcome(
+            'CONFLICT', 'SETTLEMENT_ROWS_CONFLICT',
+            'The cloud contains settlement tender rows outside the close manifest',
+        )
+
+    bundle_error = _settlement_bundle_error(shift, settlement_rows)
+    if bundle_error:
+        pending_reason = _settlement_bundle_pending_reason(
+            shift, settlement_rows,
+        )
+        if pending_reason:
+            return outcome(
+                'PENDING', 'EVIDENCE_ROWS_PENDING', pending_reason,
+            )
+        return outcome(
+            'CONFLICT', 'SETTLEMENT_BUNDLE_CONFLICT', bundle_error,
+        )
+
+    return outcome('ACKNOWLEDGED')
 
 
 class ShiftTemplateService:
@@ -985,7 +1210,10 @@ class ShiftService:
                 shift=shift, is_deleted=False,
             ).order_by('method')
         )
-        if existing is None and shift.treasury_settlement_eligible:
+        if existing is None and (
+            shift.treasury_settlement_eligible
+            or bool(shift.settlement_manifest)
+        ):
             bundle_error = _settlement_bundle_error(shift, settlement_rows)
             if bundle_error:
                 return ServiceResponse.validation_error(
