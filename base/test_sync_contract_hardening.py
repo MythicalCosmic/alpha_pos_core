@@ -77,8 +77,10 @@ def test_cloud_rejects_child_link_to_other_branch_parent(settings):
         'orderitem', branch_id='branch-a', records=[payload],
     )
     assert result['skipped'] == 1
-    assert result['failed_uuids'] == []
-    assert result['errors'] == []
+    assert result['acknowledged_uuids'] == []
+    assert result['rejected_uuids'] == [payload['uuid']]
+    assert result['failed_uuids'] == [payload['uuid']]
+    assert result['record_results'][0]['reason_code'] == 'CROSS_BRANCH_PARENT'
     assert not OrderItem.objects.filter(uuid=payload['uuid']).exists()
 
 

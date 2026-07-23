@@ -177,7 +177,7 @@ def test_cloud_receiver_publishes_after_commit_and_preserves_feed_scope_order(
     assert source_customer_uuids == [str(older.uuid), str(received_uuid)]
 
 
-def test_null_rows_bypass_timed_page_cap_on_bootstrap_and_cursored_pulls(
+def test_null_rows_are_promoted_in_bounded_slices_on_successive_pulls(
     settings, monkeypatch,
 ):
     from base.models import Category
@@ -198,7 +198,9 @@ def test_null_rows_bypass_timed_page_cap_on_bootstrap_and_cursored_pulls(
 
     bootstrap = _changes(settings, branch_id='branch-a', per_page=2)
     bootstrap_ids = {row['uuid'] for row in bootstrap['data']['category']}
-    assert bootstrap_ids == expected
+    assert len(bootstrap_ids) == 2
+    assert bootstrap_ids < expected
+    assert Category.objects.filter(synced_at__isnull=True).count() == 5
     assert bootstrap['has_more'] is False
     assert bootstrap['next_since'] is None
 
@@ -209,6 +211,8 @@ def test_null_rows_bypass_timed_page_cap_on_bootstrap_and_cursored_pulls(
         per_page=2,
     )
     cursored_ids = {row['uuid'] for row in cursored['data']['category']}
-    assert cursored_ids == expected
-    assert cursored['has_more'] is False
-    assert cursored['next_since'] is None
+    assert bootstrap_ids <= cursored_ids < expected
+    # Exactly one additional NULL slice was promoted. Frozen-time timestamp
+    # ties may make the response replay the prior slice too, but never promote
+    # the unbounded remainder in one request.
+    assert Category.objects.filter(synced_at__isnull=True).count() == 3

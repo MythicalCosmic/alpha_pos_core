@@ -68,7 +68,16 @@ def test_transport_emits_actual_attempt_payload_and_receiver_response(monkeypatc
 
         @staticmethod
         def json():
-            return {'success': True, 'created': 1, 'failed_uuids': []}
+            values = [str(record['uuid']) for record in records]
+            return {
+                'ack_protocol_version': 2,
+                'success': True,
+                'created': 1,
+                'acknowledged_uuids': values,
+                'retryable_uuids': [],
+                'rejected_uuids': [],
+                'failed_uuids': [],
+            }
 
     monkeypatch.setattr(transport.requests, 'post', lambda *args, **kwargs: Response())
     events = []

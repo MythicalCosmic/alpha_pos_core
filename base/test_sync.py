@@ -68,6 +68,9 @@ class TestPushKeepsRejectedRecordsQueued:
             return {
                 'success': True, 'created': 1, 'updated': 0, 'skipped': 0,
                 'errors': [f'{bad}: boom'], 'failed_uuids': [bad],
+                'acknowledged_uuids': [good],
+                'retryable_uuids': [],
+                'rejected_uuids': [bad],
             }
 
         monkeypatch.setattr(sync_service, 'send_batch', fake_send_batch)
@@ -124,6 +127,9 @@ class TestPushKeepsRejectedRecordsQueued:
                 'success': True, 'created': 0, 'updated': 0, 'skipped': 0,
                 'errors': [f'{parent}: parent rejected'],
                 'failed_uuids': [parent],
+                'acknowledged_uuids': [],
+                'retryable_uuids': [],
+                'rejected_uuids': [parent],
             }
 
         monkeypatch.setattr(sync_service, 'send_batch', fake_send_batch)
@@ -138,7 +144,11 @@ class TestPushKeepsRejectedRecordsQueued:
         child_row = SyncQueueRecord.objects.get(
             model_name='orderitem', record_uuid=uuidlib.UUID(child),
         )
-        assert parent_row.attempts == 1
+        # Protocol v2 distinguishes a permanent receiver rejection from a
+        # retryable dependency. Permanently invalid generations become visible
+        # dead letters immediately instead of burning one attempt per cycle.
+        assert parent_row.attempts == settings.SYNC_MAX_QUEUE_ATTEMPTS
+        assert parent_row.last_error.startswith('[REJECTED]')
         assert child_row.attempts == 0
 
     def test_systemic_failures_never_dead_letter_valid_money_records(
@@ -201,6 +211,11 @@ class TestPushKeepsRejectedRecordsQueued:
             return {
                 'success': True, 'created': 1, 'updated': 0, 'skipped': 0,
                 'errors': [], 'failed_uuids': [],
+                'acknowledged_uuids': [
+                    str(record['uuid']) for record in records
+                ],
+                'retryable_uuids': [],
+                'rejected_uuids': [],
             }
 
         monkeypatch.setattr(sync_service, 'send_batch', systemic_then_recovered)
@@ -263,6 +278,10 @@ class TestPullTruthfulFailureStatus:
             classmethod(lambda cls, name: 'owner'),
         )
         monkeypatch.setattr(
+            sync_service.SyncService, '_renew_lock',
+            classmethod(lambda cls, name, token: True),
+        )
+        monkeypatch.setattr(
             sync_service.SyncService, '_release_lock',
             classmethod(lambda cls, name, token: None),
         )
@@ -319,6 +338,10 @@ class TestPullCursorWaitsForDeferredRecords:
         monkeypatch.setattr(
             sync_service.SyncService, '_acquire_lock',
             classmethod(lambda cls, name: 'owner'),
+        )
+        monkeypatch.setattr(
+            sync_service.SyncService, '_renew_lock',
+            classmethod(lambda cls, name, token: True),
         )
         monkeypatch.setattr(
             sync_service.SyncService, '_release_lock',
@@ -470,6 +493,11 @@ class TestPushQueueGenerationSafety:
             return {
                 'success': True, 'created': 1, 'updated': 0, 'skipped': 0,
                 'errors': [], 'failed_uuids': [],
+                'acknowledged_uuids': [
+                    str(record['uuid']) for record in records
+                ],
+                'retryable_uuids': [],
+                'rejected_uuids': [],
             }
 
         monkeypatch.setattr(sync_service, 'send_batch', fake_send_batch)
@@ -526,6 +554,11 @@ class TestPushQueueGenerationSafety:
             return {
                 'success': True, 'created': 1, 'updated': 0, 'skipped': 0,
                 'errors': [], 'failed_uuids': [],
+                'acknowledged_uuids': [
+                    str(record['uuid']) for record in records
+                ],
+                'retryable_uuids': [],
+                'rejected_uuids': [],
             }
 
         monkeypatch.setattr(sync_service, 'send_batch', fake_send_batch)

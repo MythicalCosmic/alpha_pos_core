@@ -21,7 +21,7 @@ def _configure(settings):
     settings.SYNC_MAX_RETRIES = 0
 
 
-def test_partial_batch_with_only_skips_and_one_failure_is_not_whole_failure(
+def test_explicit_rejected_partition_is_preserved(
     settings, monkeypatch,
 ):
     _configure(settings)
@@ -31,11 +31,15 @@ def test_partial_batch_with_only_skips_and_one_failure_is_not_whole_failure(
     def post(*args, **kwargs):
         calls.append((args, kwargs))
         return _Response({
+            'ack_protocol_version': 2,
             'success': True,
             'created': 0,
             'updated': 0,
-            'skipped': 499,
+            'skipped': 1,
             'errors': [f'{failed}: invalid'],
+            'acknowledged_uuids': [],
+            'retryable_uuids': [],
+            'rejected_uuids': [failed],
             'failed_uuids': [failed],
         })
 
@@ -44,7 +48,8 @@ def test_partial_batch_with_only_skips_and_one_failure_is_not_whole_failure(
 
     assert len(calls) == 1  # retry=0 is clamped to one real attempt
     assert result['success'] is True
-    assert result['skipped'] == 499
+    assert result['skipped'] == 1
+    assert result['rejected_uuids'] == [failed]
     assert result['failed_uuids'] == [failed]
 
 
@@ -83,4 +88,4 @@ def test_legacy_errors_without_failed_ids_fail_closed(settings, monkeypatch):
     result = transport.send_batch('order', [{'uuid': 'unknown'}])
 
     assert result['success'] is False
-    assert 'rejected' in result['error'].lower()
+    assert 'acknowledgement partition' in result['error'].lower()

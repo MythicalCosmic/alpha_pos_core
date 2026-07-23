@@ -61,7 +61,7 @@ def test_payment_batch_repairs_exact_later_unpaid_header(
     ).exists()
 
 
-def test_older_payment_cannot_resurrect_a_newer_unpay_header(
+def test_older_payment_survives_a_newer_operational_header_edit(
     order_factory, settings,
 ):
     from base.models import OrderPayment
@@ -79,8 +79,8 @@ def test_older_payment_cannot_resurrect_a_newer_unpay_header(
     repaired = reconcile_stale_paid_headers([order.id])
 
     order.refresh_from_db()
-    assert repaired == set()
-    assert order.is_paid is False
+    assert repaired == {str(order.uuid)}
+    assert order.is_paid is True
 
 
 def test_completed_order_is_covered_by_same_payment_invariant(

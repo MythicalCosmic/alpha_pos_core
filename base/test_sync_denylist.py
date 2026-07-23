@@ -64,11 +64,13 @@ class TestBranchCannotSoftDeleteCloudUser:
     def test_branch_cannot_create_cloud_owned_user(self, settings):
         settings.DEPLOYMENT_MODE = 'cloud'
         import uuid
+        from django.contrib.auth.hashers import is_password_usable
         from base.models import User
         from base.services.sync.receiver import CloudReceiver
 
+        user_uuid = str(uuid.uuid4())
         result = CloudReceiver.receive_batch('user', 'branch-a', [{
-            'uuid': str(uuid.uuid4()),
+            'uuid': user_uuid,
             'sync_version': 1,
             'is_deleted': False,
             'first_name': 'Forged',
@@ -79,8 +81,13 @@ class TestBranchCannotSoftDeleteCloudUser:
             'status': 'ACTIVE',
         }])
 
-        assert result['skipped'] == 1
-        assert not User._base_manager.filter(email='forged-admin@example.test').exists()
+        assert result['created'] == 1
+        assert result['acknowledged_uuids'] == [user_uuid]
+        bridge = User._base_manager.get(uuid=user_uuid)
+        assert bridge.role == User.RoleChoices.USER
+        assert bridge.status == User.UserStatus.SUSPENDED
+        assert bridge.permissions == []
+        assert is_password_usable(bridge.password) is False
 
 
 class TestBranchCannotMutateCloudCatalog:

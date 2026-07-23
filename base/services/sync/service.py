@@ -1,9 +1,9 @@
 import logging
 from django.utils import timezone
-from base.services.sync.cache import safe_add, safe_delete
 from base.services.sync.config import (
     SYNC_ORDER, SyncConfig, get_branch_id, is_local_mode,
-    get_all_models, get_sync_batch_size,
+    get_all_models, get_sync_batch_size, get_sync_max_retries,
+    get_sync_timeout,
 )
 from base.services.sync.queue import SyncQueue
 from base.services.sync.transport import check_health, send_batch, fetch_changes
@@ -12,6 +12,14 @@ from base.services.sync.status import SyncStatus
 logger = logging.getLogger(__name__)
 
 LOCK_TTL = 120
+
+
+def _lease_ttl():
+    """Cover one complete transport retry envelope plus scheduling margin."""
+    retries = max(1, int(get_sync_max_retries()))
+    timeout = max(1, int(get_sync_timeout()))
+    backoff = sum(min(2 ** attempt, 30) for attempt in range(retries - 1))
+    return max(LOCK_TTL, retries * timeout + backoff + 60)
 
 
 class _QuarantinedRecordDeferred(Exception):
@@ -44,11 +52,19 @@ class SyncService:
         if not is_local_mode():
             return {'success': False, 'message': 'Push only available in local mode'}
 
+        # Push can be the first operation after BRANCH_ID changes. Scope repair
+        # and branch-keyed state therefore cannot wait for a pull.
+        SyncStatus.ensure_scope_epoch()
+
         push_token = cls._acquire_lock('push')
         if not push_token:
             return {'success': False, 'message': 'Push already in progress'}
 
         try:
+            revived_dead_letters = SyncQueue.revive_legacy_dead_letters()
+            quarantined_foreign = SyncQueue.quarantine_foreign_branch_records(
+                get_branch_id(),
+            )
             if not check_health():
                 SyncStatus.set_online(False)
                 cls._notify_error('Cannot reach cloud server')
@@ -66,7 +82,29 @@ class SyncService:
 
             grouped = SyncQueue.get_grouped()
             if not grouped:
-                return {'success': True, 'message': 'Nothing to sync', 'synced': 0}
+                dead_letters = SyncQueue.dead_letter_count()
+                if dead_letters:
+                    message = (
+                        f'Nothing eligible to sync; {dead_letters} record(s) '
+                        'remain dead-lettered or branch-quarantined'
+                    )
+                    SyncStatus.set_last_sync(0, dead_letters, [message])
+                    return {
+                        'success': False,
+                        'message': message,
+                        'synced': 0,
+                        'failed': dead_letters,
+                        'dead_letter_count': dead_letters,
+                        'revived_dead_letters': revived_dead_letters,
+                        'quarantined_foreign': quarantined_foreign,
+                    }
+                return {
+                    'success': True,
+                    'message': 'Nothing to sync',
+                    'synced': 0,
+                    'revived_dead_letters': revived_dead_letters,
+                    'quarantined_foreign': quarantined_foreign,
+                }
 
             sorted_models = sorted(
                 grouped.keys(),
@@ -81,6 +119,10 @@ class SyncService:
             # generation + payload version, not only UUID: a save may replace a
             # queue slot while its older HTTP request is in flight.
             confirmed_by_model = {}
+            applied_aliases = {}
+            blocked_models = set()
+            rejected_this_push = 0
+            aliases_refreshed = False
             batch_size = get_sync_batch_size()
 
             # A full-batch send failure (transport down, HTTP error) means the
@@ -92,6 +134,12 @@ class SyncService:
             for model_name in sorted_models:
                 if stop_push:
                     break
+                if model_name in blocked_models:
+                    logger.warning(
+                        'Sync deferred %s because an unsynced dependency failed',
+                        model_name,
+                    )
+                    continue
                 records = grouped[model_name]
 
                 for i in range(0, len(records), batch_size):
@@ -102,18 +150,73 @@ class SyncService:
                         r['uuid']: r.get('generation') for r in batch
                     }
 
+                    if not cls._renew_lock('push', push_token):
+                        total_failed += len(batch)
+                        errors.append('Push lease ownership was lost')
+                        stop_push = True
+                        break
                     result = send_batch(model_name, batch_data)
 
-                    if result['success']:
+                    partition = None
+                    partition_error = None
+                    if result.get('success'):
+                        partition, partition_error = (
+                            cls._validate_ack_partition(result, batch_uuids)
+                        )
+
+                    if result.get('success') and not partition_error:
                         # A 200 can still carry per-record failures (partial
                         # batch). Remove ONLY the records the receiver confirmed
                         # and keep the rest queued — purging the whole batch on
                         # the HTTP-200 silently lost the failed rows.
-                        failed = {
-                            str(u) for u in (result.get('failed_uuids') or [])
-                        }
+                        acknowledged = set(partition['acknowledged_uuids'])
+                        retryable = set(partition['retryable_uuids'])
+                        rejected = set(partition['rejected_uuids'])
+                        aliases_applied_in_batch = False
+                        if model_name == 'user' and acknowledged:
+                            for evidence in result.get('record_results') or []:
+                                old_uuid = str(evidence.get('uuid') or '')
+                                canonical_uuid = str(
+                                    evidence.get('canonical_uuid') or ''
+                                )
+                                if not (
+                                    old_uuid in acknowledged
+                                    and canonical_uuid
+                                    and canonical_uuid != old_uuid
+                                ):
+                                    continue
+                                if cls._apply_global_user_alias(
+                                    old_uuid, canonical_uuid,
+                                ):
+                                    applied_aliases[old_uuid] = canonical_uuid
+                                    aliases_applied_in_batch = True
+                                else:
+                                    # Cloud identity is available but the local
+                                    # FK graph did not re-key. Retain this exact
+                                    # queue generation; deleting it would strand
+                                    # every dependent payload forever.
+                                    acknowledged.remove(old_uuid)
+                                    retryable.add(old_uuid)
+                                    blocked_models.update(
+                                        cls._dependent_models(model_name)
+                                    )
+                        if aliases_applied_in_batch:
+                            # FK rows were re-keyed locally before their queued
+                            # payloads are sent. Refresh the durable generations
+                            # and replace future in-memory snapshots now; doing
+                            # this only after the outer loop sent stale
+                            # user_uuid values and stranded the order cluster
+                            # until another push.
+                            cls._reconcile_unsynced()
+                            refreshed_grouped = SyncQueue.get_grouped()
+                            for queued_model in sorted_models:
+                                if queued_model != model_name:
+                                    grouped[queued_model] = (
+                                        refreshed_grouped.get(queued_model, [])
+                                    )
+                            aliases_refreshed = True
                         confirmed_records = [
-                            r for r in batch if r['uuid'] not in failed
+                            r for r in batch if r['uuid'] in acknowledged
                         ]
                         confirmed = [r['uuid'] for r in confirmed_records]
                         synced_uuids.extend(confirmed)
@@ -121,32 +224,54 @@ class SyncService:
                             confirmed_records
                         )
                         total_synced += len(confirmed_records)
-                        if failed:
-                            failed_in_batch = [u for u in batch_uuids if u in failed]
-                            total_failed += len(failed_in_batch)
-                            SyncQueue.mark_batch_failed(
-                                failed_in_batch,
-                                'receiver rejected record(s) in a partial batch',
+                        retryable_in_batch = [
+                            value for value in batch_uuids
+                            if value in retryable
+                        ]
+                        rejected_in_batch = [
+                            value for value in batch_uuids
+                            if value in rejected
+                        ]
+                        if retryable_in_batch:
+                            SyncQueue.mark_batch_deferred(
+                                retryable_in_batch,
+                                'receiver deferred record(s) in a partial batch',
                                 model_name=model_name,
                                 generations=batch_generations,
                             )
-                            msg = (f'{model_name}: {len(failed_in_batch)} of '
-                                   f'{len(batch_uuids)} record(s) rejected by receiver')
+                        if rejected_in_batch:
+                            marked_rejected = SyncQueue.mark_batch_rejected(
+                                rejected_in_batch,
+                                'receiver permanently rejected record(s)',
+                                model_name=model_name,
+                                generations=batch_generations,
+                            )
+                            rejected_this_push += len(marked_rejected or ())
+                        unacknowledged = [
+                            *retryable_in_batch, *rejected_in_batch,
+                        ]
+                        if unacknowledged:
+                            total_failed += len(unacknowledged)
+                            msg = (
+                                f'{model_name}: {len(retryable_in_batch)} '
+                                f'retryable and {len(rejected_in_batch)} '
+                                f'rejected of {len(batch_uuids)} record(s)'
+                            )
                             errors.append(msg)
                             logger.warning(msg)
-                            # A rejected parent (Order, Product, etc.) means
-                            # later models may depend on a row that is still
-                            # absent. Do not burn retry attempts/dead-letter
-                            # children on guaranteed FK failures. Confirmed
-                            # siblings are still acknowledged below; the next
-                            # push retries the failed parent before dependents.
-                            stop_push = True
+                            blocked_models.update(
+                                cls._dependent_models(model_name)
+                            )
                         logger.info(f'Synced {len(confirmed)} {model_name} records')
-                        if stop_push:
+                        if model_name in blocked_models:
                             break
                     else:
                         total_failed += len(batch)
-                        error_msg = f'{model_name}: {result.get("error", "Unknown")}'
+                        failure_reason = (
+                            partition_error
+                            or result.get('error', 'Unknown')
+                        )
+                        error_msg = f'{model_name}: {failure_reason}'
                         errors.append(error_msg)
                         # A whole-batch transport/auth/server failure says
                         # nothing about the validity of any individual record.
@@ -157,11 +282,14 @@ class SyncService:
                         # and observable; only receiver-identified failed UUIDs
                         # above consume per-record attempts.
                         SyncQueue.mark_batch_deferred(
-                            batch_uuids, result.get('error', 'Unknown'),
+                            batch_uuids, failure_reason,
                             model_name=model_name,
                             generations=batch_generations,
                         )
-                        logger.warning(f'Sync failed for {model_name}: {result.get("error")}')
+                        logger.warning(
+                            'Sync failed for %s: %s',
+                            model_name, failure_reason,
+                        )
                         stop_push = True
                         break
 
@@ -177,6 +305,11 @@ class SyncService:
                     acknowledged_by_model[mname] = [
                         r for r in snapshots if r['uuid'] in acknowledged
                     ]
+
+            if applied_aliases and not aliases_refreshed:
+                # Refresh already-queued Orders/children so their FK UUID
+                # snapshots point at the canonical identity.
+                cls._reconcile_unsynced()
 
             # Stamp only a live row whose version is exactly what the cloud
             # confirmed and whose queue slot has no replacement. An edit during
@@ -214,18 +347,38 @@ class SyncService:
                                 synced_at=now,
                             )
 
-            SyncStatus.set_last_sync(total_synced, total_failed, errors)
+            remaining_dead_letters = SyncQueue.dead_letter_count()
+            if remaining_dead_letters and not errors:
+                errors.append(
+                    f'{remaining_dead_letters} record(s) remain dead-lettered '
+                    'or branch-quarantined'
+                )
+            SyncStatus.set_last_sync(
+                total_synced,
+                total_failed + max(
+                    0, remaining_dead_letters - rejected_this_push,
+                ),
+                errors,
+            )
 
-            if total_synced > 0 and total_failed == 0:
+            if (
+                total_synced > 0
+                and total_failed == 0
+                and remaining_dead_letters == 0
+            ):
                 cls._notify_success(total_synced)
             elif errors:
                 cls._notify_error(errors[0])
 
             return {
-                'success': total_failed == 0,
+                'success': total_failed == 0 and remaining_dead_letters == 0,
                 'synced': total_synced,
                 'failed': total_failed,
                 'errors': errors,
+                'identity_aliases': applied_aliases,
+                'dead_letter_count': remaining_dead_letters,
+                'revived_dead_letters': revived_dead_letters,
+                'quarantined_foreign': quarantined_foreign,
             }
         finally:
             cls._release_lock('push', push_token)
@@ -277,6 +430,9 @@ class SyncService:
             # first page is permanently lost on a long-disconnected branch.
             MAX_PAGES = 10000  # safety bound against a misbehaving server
             for _ in range(MAX_PAGES):
+                if not cls._renew_lock('pull', pull_token):
+                    errors.append('Pull lease ownership was lost')
+                    break
                 result = fetch_changes(since_timestamp=cursor)
                 if not result['success']:
                     error = result.get('error', 'Unknown')
@@ -654,6 +810,150 @@ class SyncService:
                 results['deferred'].extend(records)
         return results
 
+    @staticmethod
+    def _dependent_models(failed_model_name):
+        """Return only models whose FK graph depends on the failed model."""
+        models = get_all_models()
+        root = models.get(failed_model_name)
+        if root is None:
+            # Unknown extension model: fail safely for later models because its
+            # dependency graph cannot be proven.
+            try:
+                index = SYNC_ORDER.index(failed_model_name)
+            except ValueError:
+                return set(SYNC_ORDER)
+            return set(SYNC_ORDER[index + 1:])
+
+        blocked_classes = {root}
+        blocked_names = set()
+        changed = True
+        while changed:
+            changed = False
+            for name, model in models.items():
+                if name in blocked_names:
+                    continue
+                depends = any(
+                    (
+                        getattr(field, 'many_to_one', False)
+                        or getattr(field, 'one_to_one', False)
+                    )
+                    and field.related_model in blocked_classes
+                    for field in model._meta.fields
+                )
+                if depends:
+                    blocked_names.add(name)
+                    blocked_classes.add(model)
+                    changed = True
+        return blocked_names
+
+    @staticmethod
+    def _validate_ack_partition(result, submitted_uuids):
+        keys = (
+            'acknowledged_uuids', 'retryable_uuids', 'rejected_uuids',
+        )
+        normalized = {}
+        for key in keys:
+            values = result.get(key)
+            if not isinstance(values, list) or any(
+                not isinstance(value, str) or not value for value in values
+            ):
+                return None, f'invalid or missing {key}'
+            if len(set(values)) != len(values):
+                return None, f'duplicate UUID in {key}'
+            normalized[key] = values
+        sets = [set(normalized[key]) for key in keys]
+        if sets[0] & sets[1] or sets[0] & sets[2] or sets[1] & sets[2]:
+            return None, 'acknowledgement partitions overlap'
+        if set().union(*sets) != set(submitted_uuids):
+            return None, (
+                'acknowledgement partition does not exactly match the batch'
+            )
+        return normalized, None
+
+    @staticmethod
+    def _apply_global_user_alias(old_uuid, canonical_uuid):
+        """Re-key one local bootstrap identity after a cloud canonical match."""
+        from django.db import transaction
+        from base.models import User
+
+        with transaction.atomic():
+            old = (
+                User._base_manager.select_for_update()
+                .filter(uuid=old_uuid)
+                .first()
+            )
+            canonical = (
+                User._base_manager.select_for_update()
+                .filter(uuid=canonical_uuid)
+                .first()
+            )
+            if old is None:
+                if canonical is None:
+                    return False
+                # A pull may already have natural-key re-keyed the same User
+                # before this stale queue generation receives its HTTP ACK.
+                # Treat that as an idempotently applied alias: the caller can
+                # delete the old queue slot and refresh dependent payloads.
+                logger.info(
+                    'User alias %s -> %s was already applied locally',
+                    old_uuid, canonical_uuid,
+                )
+                return True
+            if canonical is not None and canonical.pk != old.pk:
+                from django.apps import apps
+
+                references = []
+                for model in apps.get_models():
+                    for field in model._meta.fields:
+                        if not (
+                            (
+                                getattr(field, 'many_to_one', False)
+                                or getattr(field, 'one_to_one', False)
+                            )
+                            and field.related_model is User
+                        ):
+                            continue
+                        source = model._base_manager.filter(
+                            **{field.attname: old.pk},
+                        )
+                        if not source.exists():
+                            continue
+                        if (
+                            getattr(field, 'one_to_one', False)
+                            and model._base_manager.filter(
+                                **{field.attname: canonical.pk},
+                            ).exists()
+                        ):
+                            logger.error(
+                                'Cannot merge User alias %s -> %s: %s.%s '
+                                'already targets the canonical row',
+                                old_uuid, canonical_uuid,
+                                model._meta.label_lower, field.name,
+                            )
+                            return False
+                        references.append((source, field.attname))
+                for source, attname in references:
+                    source.update(**{attname: canonical.pk})
+                User._base_manager.filter(pk=old.pk).update(
+                    is_deleted=True,
+                    synced_at=timezone.now(),
+                )
+                logger.warning(
+                    'Merged local User alias %s into canonical UUID %s',
+                    old_uuid, canonical_uuid,
+                )
+                return True
+            User._base_manager.filter(pk=old.pk).update(
+                uuid=canonical_uuid,
+                branch_id='cloud',
+                synced_at=timezone.now(),
+            )
+        logger.warning(
+            'Re-keyed local bootstrap User %s to canonical cloud UUID %s',
+            old_uuid, canonical_uuid,
+        )
+        return True
+
     @classmethod
     def _acquire_lock(cls, name):
         # Store a per-acquisition owner token (not a bare True) and return it so
@@ -661,21 +961,93 @@ class SyncService:
         # a caller whose lock expired mid-run (LOCK_TTL elapsed) and was
         # re-acquired by a second worker would delete the second worker's lock on
         # its own finally — silently allowing two concurrent push/pull runs.
+        import json
         import uuid
+        from datetime import timedelta
+        from django.db import transaction
+        from django.utils.dateparse import parse_datetime
+        from base.models import SyncState
+
         token = uuid.uuid4().hex
-        if safe_add(f'sync:lock:{name}', token, LOCK_TTL):
-            return token
-        return None
+        key = SyncStatus._branch_state_key(f'sync_lock_{name}')
+        now = timezone.now()
+        with transaction.atomic():
+            lease, _ = SyncState.objects.select_for_update().get_or_create(
+                key=key, defaults={'value': ''},
+            )
+            try:
+                current = json.loads(lease.value or '{}')
+            except (TypeError, ValueError):
+                current = {}
+            expires_at = parse_datetime(str(current.get('expires_at') or ''))
+            if (
+                current.get('token')
+                and expires_at is not None
+                and expires_at > now
+            ):
+                return None
+            lease.value = json.dumps({
+                'token': token,
+                'expires_at': (
+                    now + timedelta(seconds=_lease_ttl())
+                ).isoformat(),
+            })
+            lease.save(update_fields=['value', 'updated_at'])
+        return token
+
+    @classmethod
+    def _renew_lock(cls, name, token):
+        import json
+        from datetime import timedelta
+        from django.db import transaction
+        from base.models import SyncState
+
+        key = SyncStatus._branch_state_key(f'sync_lock_{name}')
+        with transaction.atomic():
+            lease = (
+                SyncState.objects.select_for_update().filter(key=key).first()
+            )
+            if lease is None:
+                return False
+            try:
+                current = json.loads(lease.value or '{}')
+            except (TypeError, ValueError):
+                return False
+            if current.get('token') != token:
+                return False
+            lease.value = json.dumps({
+                'token': token,
+                'expires_at': (
+                    timezone.now() + timedelta(seconds=_lease_ttl())
+                ).isoformat(),
+            })
+            lease.save(update_fields=['value', 'updated_at'])
+        return True
 
     @classmethod
     def _release_lock(cls, name, token=None):
-        from base.services.sync.cache import safe_get
-        key = f'sync:lock:{name}'
+        import json
+        from django.db import transaction
+        from base.models import SyncState
+
+        if token is None:
+            return
+        key = SyncStatus._branch_state_key(f'sync_lock_{name}')
         # Only release if we still own it. If our token no longer matches, the
         # lock expired and another worker holds it now — leave theirs intact.
-        if token is not None and safe_get(key) != token:
-            return
-        safe_delete(key)
+        with transaction.atomic():
+            lease = (
+                SyncState.objects.select_for_update().filter(key=key).first()
+            )
+            if lease is None:
+                return
+            try:
+                current = json.loads(lease.value or '{}')
+            except (TypeError, ValueError):
+                return
+            if current.get('token') != token:
+                return
+            lease.delete()
 
     @classmethod
     def _sync_recipients(cls):

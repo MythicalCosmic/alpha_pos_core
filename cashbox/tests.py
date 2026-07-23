@@ -191,9 +191,9 @@ class TestShiftPaymentTotalSync:
     """ShiftPaymentTotal is immutable close evidence.
 
     A natural-key collision under another UUID is not permission to rewrite the
-    first event; it is acknowledged as a safe no-op and later manifest
-    verification fails closed if the branch committed the conflicting UUID.
-    A tombstone whose shift is gone is likewise skipped.
+    first event. ACK protocol v2 rejects the conflicting identity so the sender
+    cannot delete evidence it failed to store. Peer tombstones are rejected for
+    the same reason: append-only close evidence cannot be deleted through sync.
     """
 
     @override_settings(DEPLOYMENT_MODE='cloud')
@@ -216,8 +216,13 @@ class TestShiftPaymentTotalSync:
             'expected_amount': '250', 'counted_amount': '250',
             'confirmed_amount': '0', 'difference': '0',
         }])
-        assert result['errors'] == [], result['errors']
+        assert result['errors'], result
         assert result['skipped'] == 1
+        assert result['acknowledged_uuids'] == []
+        assert result['rejected_uuids'] == [incoming]
+        assert result['record_results'][0]['reason_code'] == (
+            'APPEND_ONLY_IDENTITY_CONFLICT'
+        )
         assert ShiftPaymentTotal.objects.filter(shift=s, method='CASH').count() == 1
         row = ShiftPaymentTotal.objects.get(shift=s, method='CASH')
         assert str(row.uuid) != incoming
@@ -226,10 +231,16 @@ class TestShiftPaymentTotalSync:
     def test_tombstone_with_missing_shift_is_skipped(self):
         import uuid as _uuid
         from base.services.sync.receiver import CloudReceiver
+        incoming = str(_uuid.uuid4())
         result = CloudReceiver.receive_batch('shiftpaymenttotal', 'branch1', [{
-            'uuid': str(_uuid.uuid4()), 'sync_version': 1, 'is_deleted': True,
+            'uuid': incoming, 'sync_version': 1, 'is_deleted': True,
             'shift_uuid': str(_uuid.uuid4()), 'method': 'CASH', 'expected_amount': '0',
         }])
-        assert result['errors'] == []
+        assert result['errors']
         assert result['skipped'] == 1
-        assert result['failed_uuids'] == []
+        assert result['acknowledged_uuids'] == []
+        assert result['rejected_uuids'] == [incoming]
+        assert result['failed_uuids'] == [incoming]
+        assert result['record_results'][0]['reason_code'] == (
+            'APPEND_ONLY_DELETE'
+        )

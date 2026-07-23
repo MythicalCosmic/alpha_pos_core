@@ -192,6 +192,10 @@ def receive(request):
     if isinstance(data, list):
         if not data:
             return JsonResponse({'error': 'Empty records'}, status=400)
+        if not isinstance(data[0], dict):
+            return JsonResponse(
+                {'error': 'Array items must be objects'}, status=400,
+            )
         # Require an explicit model_name — defaulting to 'order' would write a
         # malformed array as Orders.
         model_name = data[0].get('model_name')
@@ -200,7 +204,28 @@ def receive(request):
                 {'error': 'Array format requires model_name on the first item'},
                 status=400,
             )
-        records = [item.get('data', item) for item in data]
+        records = []
+        for index, item in enumerate(data):
+            if not isinstance(item, dict):
+                return JsonResponse(
+                    {'error': f'Array item {index} must be an object'},
+                    status=400,
+                )
+            if item.get('model_name') != model_name:
+                return JsonResponse(
+                    {'error': (
+                        f'Array item {index} must declare model_name='
+                        f'{model_name}'
+                    )},
+                    status=400,
+                )
+            record = item.get('data', item)
+            if not isinstance(record, dict):
+                return JsonResponse(
+                    {'error': f'Array item {index} data must be an object'},
+                    status=400,
+                )
+            records.append(record)
     elif isinstance(data, dict):
         model_name = data.get('model')
         records = data.get('records', [])
@@ -209,6 +234,24 @@ def receive(request):
 
     if not model_name or not records:
         return JsonResponse({'error': 'Missing model or records'}, status=400)
+    if not isinstance(records, list):
+        return JsonResponse({'error': 'records must be an array'}, status=400)
+    record_uuids = []
+    for index, record in enumerate(records):
+        if not isinstance(record, dict):
+            return JsonResponse(
+                {'error': f'records[{index}] must be an object'}, status=400,
+            )
+        record_uuid = str(record.get('uuid') or '')
+        if not record_uuid:
+            return JsonResponse(
+                {'error': f'records[{index}] is missing uuid'}, status=400,
+            )
+        record_uuids.append(record_uuid)
+    if len(set(record_uuids)) != len(record_uuids):
+        return JsonResponse(
+            {'error': 'record UUIDs must be unique within a batch'}, status=400,
+        )
 
     # Heartbeat presence: this authenticated push proves the till (branch_id +
     # device) is online now; record its active cashier so smartfood auto-dispatch
@@ -221,7 +264,20 @@ def receive(request):
     )
 
     from base.services.sync.receiver import CloudReceiver
-    result = CloudReceiver.receive_batch(model_name, branch_id, records)
+    try:
+        client_ack_protocol = int(
+            request.META.get('HTTP_X_SYNC_ACK_PROTOCOL') or 1
+        )
+    except (TypeError, ValueError):
+        client_ack_protocol = 1
+    if client_ack_protocol != 2:
+        client_ack_protocol = 1
+    result = CloudReceiver.receive_batch(
+        model_name,
+        branch_id,
+        records,
+        client_ack_protocol=client_ack_protocol,
+    )
 
     return JsonResponse(result)
 
@@ -507,16 +563,39 @@ def changes(request):
             )
             continue
 
-        # NULL is the crash-safe, not-yet-published state. Serve every NULL row
-        # on *every* pull, including cursored pulls, outside timestamp paging.
-        # This guarantees completeness when a process dies after committing
-        # content but before its on_commit publisher runs. Re-delivery is
-        # idempotent. It also drains legacy NULL populations larger than
-        # per_page in one bootstrap instead of returning the same first page
-        # forever with has_more=True and next_since=None.
-        null_window = list(
-            base_qs.filter(synced_at__isnull=True).order_by('pk')
+        # NULL is the crash-safe, not-yet-published state. Promote a bounded
+        # slice into the ordinary timestamp feed instead of materializing an
+        # unbounded legacy NULL population in one response. Any remainder is
+        # promoted on a later pull with a timestamp newer than this response's
+        # cursor, so it cannot be skipped.
+        null_pks = list(
+            base_qs.filter(synced_at__isnull=True)
+            .order_by('pk')
+            .values_list('pk', flat=True)[:per_page]
         )
+        null_fallback = []
+        if null_pks:
+            try:
+                model_class.objects.filter(
+                    pk__in=null_pks, synced_at__isnull=True,
+                ).update(synced_at=snapshot_cutoff)
+            except Exception:
+                # A NULL row is the crash-safe lane precisely because the
+                # after-commit publisher may have failed. If the bounded
+                # promotion write is also transiently unavailable, still serve
+                # only that selected slice directly. It remains NULL and will
+                # replay until a later promotion succeeds: duplicates are safe,
+                # dropping the committed change is not.
+                logger.warning(
+                    'sync changes: failed to promote bounded NULL slice for %s',
+                    model_class.__name__,
+                    exc_info=True,
+                )
+                null_fallback = list(
+                    base_qs.filter(
+                        pk__in=null_pks, synced_at__isnull=True,
+                    ).order_by('pk')[:per_page]
+                )
 
         # Only timestamped rows participate in the cursor frontier. Their
         # publication timestamp is assigned after commit. Anything published
@@ -542,7 +621,9 @@ def changes(request):
             if next_since is None or frontier < next_since:
                 next_since = frontier
 
-        window = null_window + timed_window
+        # When promotion failed, do not add a second timed page to the fallback
+        # slice. This keeps the emergency lane bounded to per_page.
+        window = null_fallback or timed_window
 
         records = [obj.to_sync_dict() for obj in window]
         if records:

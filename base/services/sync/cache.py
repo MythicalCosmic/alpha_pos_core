@@ -10,6 +10,24 @@ _available = None
 _available_checked = 0
 
 
+def _fallback_get_locked(key, default=None):
+    import time
+
+    expires_at = _fallback_ttl.get(key)
+    if expires_at is not None and expires_at <= time.monotonic():
+        _fallback.pop(key, None)
+        _fallback_ttl.pop(key, None)
+        return default
+    return _fallback.get(key, default)
+
+
+def _fallback_expiry(ttl):
+    if ttl is None:
+        return None
+    import time
+    return time.monotonic() + max(0, float(ttl))
+
+
 def _cache():
     from django.core.cache import cache
     return cache
@@ -43,16 +61,16 @@ def safe_get(key, default=None):
         if val is not None:
             return val
         with _fallback_lock:
-            return _fallback.get(key, default)
+            return _fallback_get_locked(key, default)
     except Exception:
         with _fallback_lock:
-            return _fallback.get(key, default)
+            return _fallback_get_locked(key, default)
 
 
 def safe_set(key, value, ttl=None):
     with _fallback_lock:
         _fallback[key] = value
-        _fallback_ttl[key] = ttl
+        _fallback_ttl[key] = _fallback_expiry(ttl)
     try:
         _cache().set(key, value, ttl)
     except Exception:
@@ -74,10 +92,11 @@ def safe_add(key, value, ttl):
         return _cache().add(key, value, ttl)
     except Exception:
         with _fallback_lock:
-            if key in _fallback:
+            missing = object()
+            if _fallback_get_locked(key, missing) is not missing:
                 return False
             _fallback[key] = value
-            _fallback_ttl[key] = ttl
+            _fallback_ttl[key] = _fallback_expiry(ttl)
             return True
 
 
@@ -86,6 +105,9 @@ def _flush_fallback():
     with _fallback_lock:
         if not _fallback:
             return
+        missing = object()
+        for key in list(_fallback):
+            _fallback_get_locked(key, missing)
         items = dict(_fallback)
 
     flushed = 0
@@ -94,8 +116,20 @@ def _flush_fallback():
             # Preserve each key's original TTL — flushing with None would make
             # a short-lived lock or status entry permanent in Redis.
             with _fallback_lock:
-                ttl = _fallback_ttl.get(key)
+                expires_at = _fallback_ttl.get(key)
+            if expires_at is None:
+                ttl = None
+            else:
+                import time
+                ttl = max(0, expires_at - time.monotonic())
+                if ttl <= 0:
+                    safe_delete(key)
+                    continue
             _cache().set(key, value, ttl)
+            with _fallback_lock:
+                if _fallback.get(key) == value:
+                    _fallback.pop(key, None)
+                    _fallback_ttl.pop(key, None)
             flushed += 1
         except Exception:
             break

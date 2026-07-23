@@ -403,19 +403,20 @@ class TestReceiveResolvesNonBaseModels:
     "App 'base' doesn't have a 'shiftpaymenttotal' model")."""
 
     def test_bare_cashbox_model_resolves(self):
-        from base.services.sync.receiver import CloudReceiver
-        result = CloudReceiver.receive_batch('shiftpaymenttotal', 'branch1', [])
-        assert result['success'] is True
+        from base.services.sync.config import resolve_model
+        assert resolve_model('shiftpaymenttotal')._meta.label_lower == (
+            'cashbox.shiftpaymenttotal'
+        )
 
     def test_bare_stock_model_resolves(self):
-        from base.services.sync.receiver import CloudReceiver
-        result = CloudReceiver.receive_batch('stocklevel', 'branch1', [])
-        assert result['success'] is True
+        from base.services.sync.config import resolve_model
+        assert resolve_model('stocklevel')._meta.label_lower == (
+            'stock.stocklevel'
+        )
 
     def test_bare_base_model_still_resolves(self):
-        from base.services.sync.receiver import CloudReceiver
-        result = CloudReceiver.receive_batch('user', 'branch1', [])
-        assert result['success'] is True
+        from base.services.sync.config import resolve_model
+        assert resolve_model('user')._meta.label_lower == 'base.user'
 
 
 class TestUnpaidExcludesCancelled:

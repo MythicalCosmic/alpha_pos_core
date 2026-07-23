@@ -4,17 +4,21 @@ from django.db import transaction
 
 
 def reconcile_stale_paid_headers(order_ids, *, require_later_sync_evidence=True):
-    """Repair only the unmistakable paid-header sync-race state.
+    """Repair an unpaid header from complete immutable settlement evidence.
 
-    This is deliberately narrower than normal tender settlement. It never
-    creates money or guesses from a drawer balance: complete, later, live
+    This never creates money or guesses from a drawer balance: complete, live
     tender evidence must cover an intact unpaid order and its item arithmetic.
     Cash evidence may exceed the bill because the row records cash tendered
     before change; the order header total remains canonical revenue. Returns
-    repaired Order UUID strings. ``require_later_sync_evidence=False`` is only
-    for the authenticated cloud-to-owning-branch pull path: there, complete
-    immutable tender rows remain authoritative even after a newer local
-    operational status edit.
+    repaired Order UUID strings.
+
+    ``require_later_sync_evidence`` is retained for rolling callers but no
+    longer imposes timestamp ordering. ``Order.updated_at`` is a generic
+    operational clock (READY, courier, description, and many other saves), not
+    evidence of an "unpay" event. Production settlement is monotonic; refunds
+    are separate append-only OrderRefund evidence. Comparing a payment's
+    branch clock or publication time to that generic field permanently dropped
+    valid offline sales after a later operational edit.
     """
     from base.models import (
         ExternalOrderPayment, Order, OrderItem, OrderPayment,
@@ -145,24 +149,6 @@ def reconcile_stale_paid_headers(order_ids, *, require_later_sync_evidence=True)
             )
             if not inferred_paid_at:
                 continue
-            if (
-                require_later_sync_evidence
-                and inferred_paid_at < order.updated_at
-            ):
-                # Protect pay -> unpay ordering: an old payment delivered after
-                # a newer explicit unpay header must not resurrect the sale.
-                continue
-            if require_later_sync_evidence:
-                all_payments = [*till_payments, *external_payments]
-                if not order.synced_at or any(
-                    not payment.synced_at for payment in all_payments
-                ):
-                    continue
-                if max(
-                    payment.synced_at for payment in all_payments
-                ) <= order.synced_at:
-                    continue
-
             items = list(
                 OrderItem.objects.select_for_update()
                 .filter(order=order, is_deleted=False)

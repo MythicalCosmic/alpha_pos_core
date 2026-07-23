@@ -445,21 +445,16 @@ class SyncMixin(models.Model):
         relying on one transport-specific guard.
         """
         effective_mode = mode or getattr(settings, 'DEPLOYMENT_MODE', 'local')
-        if effective_mode != 'cloud':
-            return data
-
         import logging
         values = dict(data)
-        for field_name in getattr(
-            cls, 'SYNC_CREATE_ONLY_FROM_BRANCH', frozenset(),
-        ):
-            if field_name in values:
-                logging.getLogger(__name__).warning(
-                    'sync ingest: refused create-only rewrite of %s.%s uuid=%s',
-                    cls.__name__, field_name, getattr(instance, 'uuid', None),
-                )
-                values.pop(field_name, None)
 
+        # A write-once business identity is immutable in *both* directions.
+        # Previously this loop sat behind the cloud-only return below, so a
+        # higher-version cloud pull could clear a locally-established
+        # Order.payment_action_id while still preserving is_paid via the local
+        # money deny-list.  That split the header from its append-only payment
+        # evidence and made a later retry impossible to prove.  Blank -> value
+        # remains allowed (cloud-admin settlement can still flow down).
         for field_name in getattr(
             cls, 'SYNC_IMMUTABLE_FROM_BRANCH_AFTER_SET', frozenset(),
         ):
@@ -470,6 +465,19 @@ class SyncMixin(models.Model):
             if current not in (None, '', {}, []) and incoming != current:
                 logging.getLogger(__name__).warning(
                     'sync ingest: refused rewrite of immutable %s.%s uuid=%s',
+                    cls.__name__, field_name, getattr(instance, 'uuid', None),
+                )
+                values.pop(field_name, None)
+
+        if effective_mode != 'cloud':
+            return values
+
+        for field_name in getattr(
+            cls, 'SYNC_CREATE_ONLY_FROM_BRANCH', frozenset(),
+        ):
+            if field_name in values:
+                logging.getLogger(__name__).warning(
+                    'sync ingest: refused create-only rewrite of %s.%s uuid=%s',
                     cls.__name__, field_name, getattr(instance, 'uuid', None),
                 )
                 values.pop(field_name, None)
@@ -705,6 +713,28 @@ class SyncMixin(models.Model):
                     cls.__name__, uuid_val, instance.branch_id, incoming_branch,
                 )
                 return instance, 'skipped'
+            rebase_pending_local = False
+            if (
+                getattr(settings, 'DEPLOYMENT_MODE', 'local') == 'local'
+                and getattr(cls, 'SYNC_PULL_SCOPE', 'branch') == 'branch'
+                and not is_deleted
+            ):
+                # A cloud pull can legitimately outrank an older local payload,
+                # but applying it must not leave that stale generation in the
+                # durable outbound queue.  In particular, local money fields
+                # are deliberately preserved by SYNC_WRITE_DENYLIST; stamping
+                # the merged row synced while the queue still contains the old
+                # version made the hub skip+ACK the only paid header.
+                rebase_pending_local = instance.synced_at is None
+                if not rebase_pending_local:
+                    try:
+                        queue_model = apps.get_model('base', 'SyncQueueRecord')
+                        rebase_pending_local = queue_model.objects.filter(
+                            model_name=cls.__name__.lower(),
+                            record_uuid=instance.uuid,
+                        ).exists()
+                    except Exception:  # noqa: BLE001 - NULL remains the backstop
+                        rebase_pending_local = False
             if cls._repair_equal_version_sync(
                 instance,
                 sync_version,
@@ -744,11 +774,21 @@ class SyncMixin(models.Model):
             instance.sync_version = sync_version
             if 'is_deleted' not in settled_frozen:
                 instance.is_deleted = is_deleted
-            instance.synced_at = timezone.now()
-            instance.save(_syncing=True)
-            cls._restore_sync_automatic_values(
-                instance, automatic_values, creating=False,
-            )
+            if rebase_pending_local:
+                # Save as a new local generation *after* merging the cloud's
+                # winning operational state. SyncMixin bumps to
+                # incoming_version+1 (also for an equal-version tiebreak win),
+                # marks NULL, and replaces the old queue payload atomically. Do
+                # not restore incoming auto_now values: this is now a real local
+                # merge publication with its own clock.
+                instance.synced_at = None
+                instance.save()
+            else:
+                instance.synced_at = timezone.now()
+                instance.save(_syncing=True)
+                cls._restore_sync_automatic_values(
+                    instance, automatic_values, creating=False,
+                )
             return instance, 'updated'
         except cls.DoesNotExist:
             # uuid not present locally. Before INSERTing, check whether a

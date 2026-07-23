@@ -13,8 +13,33 @@ class SyncStatus:
     SCOPE_EPOCH_KEY = 'sync_scope_epoch'
     # v2 adds OneToOne ownership repair, deterministic adoption of legacy
     # blank-branch roots, and durable recovery markers for quarantined rows.
-    SCOPE_EPOCH = 'branch-target-v2'
+    SCOPE_EPOCH = 'branch-target-v3'
     QUARANTINE_KEY_PREFIX = 'sync_scope_quarantine:'
+    ACTIVE_SCOPE_BRANCH_KEY = 'sync_scope_active_branch'
+
+    @classmethod
+    def _branch_state_key(cls, prefix, branch_id=None):
+        """Keep mutable sync state isolated when BRANCH_ID changes."""
+        from hashlib import sha256
+        from base.services.sync.config import get_branch_id
+
+        branch = str(
+            get_branch_id() if branch_id is None else branch_id
+        ).strip()
+        digest = sha256(branch.encode('utf-8')).hexdigest()[:20]
+        return f'{prefix}:{digest}'
+
+    @classmethod
+    def cursor_key(cls, branch_id=None):
+        return cls._branch_state_key(cls.CURSOR_KEY, branch_id)
+
+    @classmethod
+    def scope_epoch_key(cls, branch_id=None):
+        return cls._branch_state_key(cls.SCOPE_EPOCH_KEY, branch_id)
+
+    @classmethod
+    def dead_letter_revival_key(cls, branch_id=None):
+        return cls._branch_state_key('sync_dl_revival_v2', branch_id)
 
     @classmethod
     def scope_quarantine_key(cls, model_class, record_uuid):
@@ -105,11 +130,21 @@ class SyncStatus:
             with transaction.atomic():
                 from base.models import SyncQueueRecord, SyncState
 
+                active_branch, _ = (
+                    SyncState.objects.select_for_update().get_or_create(
+                        key=cls.ACTIVE_SCOPE_BRANCH_KEY,
+                        defaults={'value': ''},
+                    )
+                )
                 epoch, _ = SyncState.objects.select_for_update().get_or_create(
-                    key=cls.SCOPE_EPOCH_KEY,
+                    key=cls.scope_epoch_key(own_branch),
                     defaults={'value': ''},
                 )
-                if epoch.value == cls.SCOPE_EPOCH:
+                branch_transition = active_branch.value != own_branch
+                if (
+                    epoch.value == cls.SCOPE_EPOCH
+                    and not branch_transition
+                ):
                     return False
 
                 from base.services.sync.config import SYNC_ORDER, get_all_models
@@ -258,10 +293,12 @@ class SyncStatus:
                         ).delete()
 
                 SyncState.objects.update_or_create(
-                    key=cls.CURSOR_KEY, defaults={'value': ''},
+                    key=cls.cursor_key(own_branch), defaults={'value': ''},
                 )
                 epoch.value = cls.SCOPE_EPOCH
                 epoch.save(update_fields=['value', 'updated_at'])
+                active_branch.value = own_branch
+                active_branch.save(update_fields=['value', 'updated_at'])
                 return True
         except (OperationalError, ProgrammingError):
             # Called from post_migrate for each app; an early callback can run
@@ -277,14 +314,14 @@ class SyncStatus:
         cache flush can't silently reset it and trigger a full re-pull.
         """
         from base.models import SyncState
-        row = SyncState.objects.filter(key=cls.CURSOR_KEY).first()
+        row = SyncState.objects.filter(key=cls.cursor_key()).first()
         return row.value if (row and row.value) else None
 
     @classmethod
     def set_cursor(cls, value):
         from base.models import SyncState
         SyncState.objects.update_or_create(
-            key=cls.CURSOR_KEY, defaults={'value': value or ''},
+            key=cls.cursor_key(), defaults={'value': value or ''},
         )
 
     @classmethod

@@ -76,7 +76,7 @@ def test_cloud_credential_accepts_exact_local_target(settings, monkeypatch):
     settings.BRANCH_ID = 'branch-a'
     calls = []
 
-    def fake_receive(model_name, branch_id, records):
+    def fake_receive(model_name, branch_id, records, **kwargs):
         calls.append((model_name, branch_id, records))
         return {
             'success': True, 'created': 1, 'updated': 0,
