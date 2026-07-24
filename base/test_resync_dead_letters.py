@@ -30,7 +30,8 @@ def test_resets_dead_lettered_only():
     call_command('resync_dead_letters', stdout=out)
     dead.refresh_from_db()
     healthy.refresh_from_db()
-    assert dead.attempts == 0 and dead.last_error == ''
+    assert dead.attempts == 0
+    assert dead.last_error == '[RETRYING] boom'
     assert healthy.attempts == 1 and healthy.last_error == 'boom'
     assert 'shift' in out.getvalue()
 
@@ -61,3 +62,37 @@ def test_no_dead_letters_is_a_noop():
     out = StringIO()
     call_command('resync_dead_letters', stdout=out)
     assert 'No dead-lettered' in out.getvalue()
+
+
+def test_explicit_rejection_remains_recoverable_when_cap_is_disabled(settings):
+    settings.SYNC_MAX_QUEUE_ATTEMPTS = 0
+    row = _rec('orderpayment', 0)
+    row.last_error = '[REJECTED] PAYMENT_CONFLICT: amount differs'
+    row.save(update_fields=['last_error'])
+
+    call_command('resync_dead_letters', stdout=StringIO())
+
+    row.refresh_from_db()
+    assert row.attempts == 0
+    assert row.last_error == (
+        '[RETRYING] [REJECTED] PAYMENT_CONFLICT: amount differs'
+    )
+
+
+def test_repeated_command_keeps_original_rejection_and_drops_old_push_symptom(
+    settings,
+):
+    settings.SYNC_MAX_QUEUE_ATTEMPTS = 3
+    row = _rec('order', 0)
+    row.last_error = (
+        '[RETRYING] [REJECTED] invalid settlement evidence'
+        ' | latest push: HTTP 401'
+    )
+    row.save(update_fields=['last_error'])
+
+    call_command('resync_dead_letters', stdout=StringIO())
+
+    row.refresh_from_db()
+    assert row.last_error == (
+        '[RETRYING] [REJECTED] invalid settlement evidence'
+    )

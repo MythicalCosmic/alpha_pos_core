@@ -102,6 +102,13 @@ def _local_at(day, hour, minute=0):
     )
 
 
+def _freeze_at_open_business_time(monkeypatch):
+    """Keep current-period assertions independent of the 03:00-07:00 gap."""
+    frozen_now = _local_at(business_date(), 12)
+    monkeypatch.setattr(timezone, 'now', lambda: frozen_now)
+    return frozen_now - timedelta(minutes=1)
+
+
 def _stock_units():
     gram = StockUnit.objects.create(
         name='Gram', short_name='g', unit_type=StockUnit.UnitType.WEIGHT,
@@ -242,7 +249,8 @@ def test_legacy_display_id_never_silently_picks_one_of_duplicates():
 
 
 @override_settings(DEPLOYMENT_MODE='cloud', BRANCH_ID='cloud')
-def test_location_scopes_orders_and_selects_that_branch_live_register():
+def test_location_scopes_orders_and_selects_that_branch_live_register(monkeypatch):
+    event_at = _freeze_at_open_business_time(monkeypatch)
     user = _user()
     a = StockLocation.objects.create(
         name='A', type=StockLocation.LocationType.KITCHEN, branch_id='branch-a',
@@ -252,8 +260,14 @@ def test_location_scopes_orders_and_selects_that_branch_live_register():
     )
     CashRegister.objects.create(branch_id='branch-a', current_balance='123')
     CashRegister.objects.create(branch_id='branch-b', current_balance='999')
-    own = _order(user, branch='branch-a', total='50', paid_at=timezone.now())
-    _order(user, branch='branch-b', total='700', paid_at=timezone.now())
+    own = _order(
+        user, branch='branch-a', total='50',
+        created_at=event_at, paid_at=event_at,
+    )
+    _order(
+        user, branch='branch-b', total='700',
+        created_at=event_at, paid_at=event_at,
+    )
 
     overview = json.loads(AIToolbox.execute('get_overview', {}, a.id))
     unscoped = json.loads(AIToolbox.execute('get_overview', {}))
@@ -486,7 +500,10 @@ def test_sales_report_buckets_pre_cutover_sale_and_allocates_net_revenue():
 
 
 @override_settings(DEPLOYMENT_MODE='cloud', BRANCH_ID='cloud')
-def test_created_day_gets_volume_while_paid_day_gets_money_and_product_sales():
+def test_created_day_gets_volume_while_paid_day_gets_money_and_product_sales(
+    monkeypatch,
+):
+    _freeze_at_open_business_time(monkeypatch)
     user = _user()
     location = StockLocation.objects.create(
         name='A', type=StockLocation.LocationType.KITCHEN, branch_id='branch-a',
@@ -542,14 +559,14 @@ def test_created_day_gets_volume_while_paid_day_gets_money_and_product_sales():
 
 
 @override_settings(DEPLOYMENT_MODE='cloud', BRANCH_ID='cloud')
-def test_canceled_unpaid_order_is_not_reported_as_outstanding():
+def test_canceled_unpaid_order_is_not_reported_as_outstanding(monkeypatch):
+    event_at = _freeze_at_open_business_time(monkeypatch)
     user = _user()
     location = StockLocation.objects.create(
         name='A', type=StockLocation.LocationType.KITCHEN, branch_id='branch-a',
     )
-    now = timezone.now()
-    _order(user, paid=False, status=Order.Status.CANCELED, created_at=now)
-    _order(user, paid=False, status=Order.Status.READY, created_at=now)
+    _order(user, paid=False, status=Order.Status.CANCELED, created_at=event_at)
+    _order(user, paid=False, status=Order.Status.READY, created_at=event_at)
 
     report = json.loads(AIToolbox.execute(
         'sales_report', {'date': business_date().isoformat()}, location.id,
@@ -564,7 +581,10 @@ def test_canceled_unpaid_order_is_not_reported_as_outstanding():
 
 
 @override_settings(DEPLOYMENT_MODE='cloud', BRANCH_ID='cloud')
-def test_menu_and_velocity_only_use_live_paid_branch_sales_at_net_value():
+def test_menu_and_velocity_only_use_live_paid_branch_sales_at_net_value(
+    monkeypatch,
+):
+    _freeze_at_open_business_time(monkeypatch)
     user = _user()
     location = StockLocation.objects.create(
         name='A', type=StockLocation.LocationType.KITCHEN, branch_id='branch-a',
@@ -635,7 +655,10 @@ def test_menu_and_velocity_only_use_live_paid_branch_sales_at_net_value():
     DEPLOYMENT_MODE='cloud', BRANCH_ID='cloud',
     CLOUD_DEFAULT_TARGET_BRANCH_ID='branch-a',
 )
-def test_recipe_snapshot_and_menu_share_canonical_units_yield_waste_and_scope():
+def test_recipe_snapshot_and_menu_share_canonical_units_yield_waste_and_scope(
+    monkeypatch,
+):
+    _freeze_at_open_business_time(monkeypatch)
     user = _user()
     location = StockLocation.objects.create(
         name='Kitchen A', type=StockLocation.LocationType.KITCHEN,
@@ -814,7 +837,8 @@ def test_direct_and_component_cogs_convert_units_and_ignore_deleted_components()
 
 
 @override_settings(DEPLOYMENT_MODE='cloud', BRANCH_ID='cloud')
-def test_uncosted_menu_item_is_not_reported_as_zero_cost_profit():
+def test_uncosted_menu_item_is_not_reported_as_zero_cost_profit(monkeypatch):
+    _freeze_at_open_business_time(monkeypatch)
     user = _user()
     location = StockLocation.objects.create(
         name='Kitchen A', type=StockLocation.LocationType.KITCHEN,

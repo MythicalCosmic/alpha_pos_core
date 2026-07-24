@@ -41,7 +41,8 @@ def _paid_cash_order(user, amount, method='CASH'):
 class TestDrawer:
     def test_drawer_cash_from_payments(self):
         from cashbox.services.drawer import drawer_cash, expected_payment_totals
-        u = _user(); s = _shift(u)
+        u = _user()
+        s = _shift(u)
         _paid_cash_order(u, Decimal('100000'), 'CASH')
         _paid_cash_order(u, Decimal('40000'), 'UZCARD')
         assert drawer_cash(s) == Decimal('100000.00')
@@ -52,12 +53,37 @@ class TestDrawer:
     def test_cash_expense_reduces_drawer(self):
         from cashbox.services.drawer import drawer_cash
         from cashbox.services.expense_service import CashboxExpenseService
-        u = _user(); s = _shift(u)
+        u = _user()
+        s = _shift(u)
         _paid_cash_order(u, Decimal('100000'), 'CASH')
         res, st = CashboxExpenseService.create(
             s.id, Decimal('30000'), comment='napkins', created_by=u)
         assert st == 201, res
         assert drawer_cash(s) == Decimal('70000.00')
+
+    @pytest.mark.parametrize(
+        'bad_amount',
+        ['NaN', 'Infinity', '-Infinity', '1.001'],
+    )
+    def test_cash_expense_rejects_nonfinite_or_overprecision_amounts(
+        self, bad_amount,
+    ):
+        from cashbox.models import CashboxExpense
+        from cashbox.services.drawer import drawer_cash
+        from cashbox.services.expense_service import CashboxExpenseService
+
+        u = _user()
+        s = _shift(u)
+        _paid_cash_order(u, Decimal('100000'), 'CASH')
+
+        result, status = CashboxExpenseService.create(
+            s.id, bad_amount, comment='invalid', created_by=u,
+        )
+
+        assert status == 422, result
+        assert 'amount' in result['errors']
+        assert not CashboxExpense.objects.exists()
+        assert drawer_cash(s) == Decimal('100000.00')
 
 
 def _authenticated_client(user):
@@ -131,7 +157,8 @@ class TestCashboxExpenseRecipients:
     def test_supplier_recipient_reduces_supplier_balance(self):
         from stock.models import Supplier
         from cashbox.services.expense_service import CashboxExpenseService
-        u = _user(); s = _shift(u)
+        u = _user()
+        s = _shift(u)
         _paid_cash_order(u, Decimal('20000'), 'CASH')
         sup = Supplier.objects.create(name='Veg Co', current_balance=Decimal('50000'))
         res, st = CashboxExpenseService.create(
@@ -144,7 +171,8 @@ class TestCashboxExpenseRecipients:
         from base.models import User
         from stock.models import Supplier
         from cashbox.services.expense_service import CashboxExpenseService
-        u = _user(); s = _shift(u)
+        u = _user()
+        s = _shift(u)
         other = User.objects.create(first_name='A', last_name='B',
                                     email='a@t.local', password='x', role='CASHIER')
         sup = Supplier.objects.create(name='Veg Co')
@@ -159,7 +187,8 @@ class TestShiftSettlement:
         from base.models import TreasuryAccount, TreasuryTransaction
         from core.shifts.service import ShiftService
         from cashbox.models import ShiftPaymentTotal
-        u = _user(role='MANAGER'); s = _shift(u)
+        u = _user(role='MANAGER')
+        s = _shift(u)
         _paid_cash_order(u, Decimal('100000'), 'CASH')
         _paid_cash_order(u, Decimal('40000'), 'UZCARD')
         res, st = ShiftService.end_shift(
@@ -201,7 +230,8 @@ class TestShiftPaymentTotalSync:
         import uuid as _uuid
         from cashbox.models import ShiftPaymentTotal
         from base.services.sync.receiver import CloudReceiver
-        u = _user(); s = _shift(u)
+        u = _user()
+        s = _shift(u)
         ShiftPaymentTotal.objects.create(
             shift=s,
             method='CASH',

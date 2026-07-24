@@ -110,7 +110,14 @@ class DeliveryPersonAdmin(admin.ModelAdmin):
 
 @admin.register(CashRegister)
 class CashRegisterAdmin(admin.ModelAdmin):
-    list_display = ('id', 'current_balance', 'last_updated')
+    list_display = (
+        'id', 'branch_id', 'uncollected_cash_cursor', 'last_updated',
+    )
+
+    @admin.display(description='Uncollected branch cash cursor')
+    def uncollected_cash_cursor(self, register):
+        """Administrative accounting cursor, never a per-shift drawer."""
+        return register.current_balance
 
 
 @admin.register(Inkassa)

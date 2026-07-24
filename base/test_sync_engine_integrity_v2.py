@@ -619,6 +619,46 @@ def test_deferred_queue_row_is_visible_as_failed_without_poison_attempt(
     assert SyncQueue.count() == (1, 1)
 
 
+def test_repeated_deferred_failures_preserve_manual_recovery_diagnosis(
+    settings,
+):
+    from base.models import SyncQueueRecord
+    from base.services.sync.queue import SyncQueue
+
+    record_uuid = str(uuid4())
+    generation = SyncQueue.add('order', record_uuid, {
+        'uuid': record_uuid,
+        'branch_id': 'branch-a',
+        'sync_version': 1,
+    })
+    SyncQueueRecord.objects.filter(record_uuid=record_uuid).update(
+        last_error=(
+            '[RETRYING] [REJECTED] PAYMENT_CONFLICT: total differs'
+            ' | latest push: HTTP 503: unavailable'
+        ),
+    )
+
+    SyncQueue.mark_batch_deferred(
+        [record_uuid],
+        'HTTP 401: Invalid authorization',
+        model_name='order',
+        generations={record_uuid: generation},
+    )
+    SyncQueue.mark_batch_deferred(
+        [record_uuid],
+        'connection timed out',
+        model_name='order',
+        generations={record_uuid: generation},
+    )
+
+    row = SyncQueueRecord.objects.get(record_uuid=record_uuid)
+    assert row.attempts == 0
+    assert row.last_error == (
+        '[RETRYING] [REJECTED] PAYMENT_CONFLICT: total differs'
+        ' | latest push: connection timed out'
+    )
+
+
 def test_rejected_order_does_not_block_independent_cashregister(
     settings, monkeypatch,
 ):

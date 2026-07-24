@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+from bisect import bisect_right
 from decimal import Decimal, InvalidOperation
 from django.conf import settings
 from django.db import IntegrityError, transaction
@@ -15,6 +16,65 @@ logger = logging.getLogger(__name__)
 
 _MONEY_QUANTUM = Decimal('0.01')
 _MAX_MONEY = Decimal('9999999999.99')
+
+
+class _ShiftWindowIndex:
+    """Find the latest shift window containing a timestamp in O(log n).
+
+    Windows are sorted by start time.  The max-end segment tree lets a lookup
+    skip whole ranges whose shifts all ended before ``timestamp`` while still
+    preserving the legacy rule for malformed overlaps: the latest-starting
+    matching shift wins.
+    """
+
+    __slots__ = ('_starts', '_ends', '_shift_ids', '_tree', '_size')
+
+    def __init__(self, windows):
+        ordered = sorted(windows, key=lambda row: row[0])
+        self._starts = [row[0] for row in ordered]
+        self._ends = [row[1] for row in ordered]
+        self._shift_ids = [row[2] for row in ordered]
+        size = 1
+        while size < len(ordered):
+            size *= 2
+        self._size = size
+        self._tree = [None] * (size * 2)
+        for index, end in enumerate(self._ends):
+            self._tree[size + index] = end
+        for node in range(size - 1, 0, -1):
+            left = self._tree[node * 2]
+            right = self._tree[node * 2 + 1]
+            if left is None:
+                maximum = right
+            elif right is None:
+                maximum = left
+            else:
+                maximum = right if right > left else left
+            self._tree[node] = maximum
+
+    def find(self, timestamp):
+        if timestamp is None or not self._starts:
+            return None
+        limit = bisect_right(self._starts, timestamp) - 1
+        if limit < 0:
+            return None
+
+        def rightmost(node, left, right):
+            if left > limit:
+                return None
+            maximum = self._tree[node]
+            if maximum is None or maximum <= timestamp:
+                return None
+            if left == right:
+                return left
+            middle = (left + right) // 2
+            found = rightmost(node * 2 + 1, middle + 1, right)
+            if found is not None:
+                return found
+            return rightmost(node * 2, left, middle)
+
+        index = rightmost(1, 0, self._size - 1)
+        return self._shift_ids[index] if index is not None else None
 
 
 def _money(value):
@@ -907,6 +967,15 @@ class ShiftService:
                 return ServiceResponse.forbidden(
                     'You can only start your own shift'
                 )
+
+        # Serialize the transition from "no open drawer" to ACTIVE with direct
+        # branch-cash mutations in the HR ledger. HR cash transactions take the
+        # same register lock and refuse to run while an ACTIVE/ENDED shift owns
+        # that cash. Without the shared lock, a withdrawal could pass its
+        # no-shift check at the same instant this transaction opened a shift,
+        # creating an un-attributed drawer movement.
+        from base.services.accounting_cursor import lock_branch_accounting
+        lock_branch_accounting(operational_branch)
 
         active = Shift.objects.filter(
             is_deleted=False,
@@ -1883,9 +1952,14 @@ class ShiftService:
                 'peak_hour': None,
                 'expected_by_tender': {},
                 'total_expected_to_receive': '0.00',
+                'tender_totals_source': 'UNAVAILABLE',
+                'frozen_tender_evidence_complete': False,
                 'settlement': [],
                 'reconciled_count': 0,
                 'cashbox_expenses': [],
+                # Internal batched equivalent of _live_totals. Serializers
+                # consume it but never expose underscore-prefixed fields.
+                '_live_totals': None,
             }
 
         out = {s.id: _empty() for s in shifts}
@@ -1917,20 +1991,14 @@ class ShiftService:
                 owner = (s.branch_id, s.user_id)
                 by_owner[owner].append((s.start_time, end, s.id))
                 shift_branches[s.id] = s.branch_id
-            for owner in by_owner:
-                by_owner[owner].sort(key=lambda t: t[0])
+            window_indexes = {
+                owner: _ShiftWindowIndex(windows)
+                for owner, windows in by_owner.items()
+            }
 
             def bucket(branch_id, cid, ts):
-                if ts is None:
-                    return None
-                # Half-open end makes an exact handoff timestamp belong only to
-                # the later shift. Last match still resolves malformed overlaps
-                # deterministically to the latest start.
-                found = None
-                for start, end, sid in by_owner.get((branch_id, cid), ()):
-                    if start <= ts < end:
-                        found = sid
-                return found
+                index = window_indexes.get((branch_id, cid))
+                return index.find(ts) if index is not None else None
 
             cashier_ids = list({owner[1] for owner in by_owner})
             branch_ids = list({owner[0] for owner in by_owner})
@@ -1952,6 +2020,8 @@ class ShiftService:
                 lambda: {'cash': zero, 'card': zero, 'payme': zero, 'unknown': zero})
             tender_acc = defaultdict(lambda: defaultdict(lambda: zero))
             paid_cnt = defaultdict(int)
+            revenue_acc = defaultdict(lambda: Decimal('0.00'))
+            order_cnt = defaultdict(int)
             money_rows = list(Order.objects.filter(
                 is_deleted=False, cashier_id__in=cashier_ids, is_paid=True,
                 branch_id__in=branch_ids,
@@ -1991,6 +2061,7 @@ class ShiftService:
                     tender[tender_method] += tender_amount
                 tender['UNKNOWN'] += _s['unknown']
                 paid_cnt[sid] += 1
+                revenue_acc[sid] += amt or zero
 
             refund_cnt = defaultdict(int)
             refund_total = defaultdict(lambda: Decimal('0.00'))
@@ -2023,6 +2094,7 @@ class ShiftService:
                     )
                 refund_cnt[sid] += 1
                 refund_total[sid] += amount or zero
+                revenue_acc[sid] -= amount or zero
 
             # Cancelled orders (count + lost value) by created_at.
             canc_cnt = defaultdict(int)
@@ -2038,6 +2110,7 @@ class ShiftService:
                 if sid is None:
                     continue
                 canc_cnt[sid] += 1
+                order_cnt[sid] += 1
                 # Paid cancellations have an OrderRefund money event and are
                 # already netted in their refunding shift. Only unpaid canceled
                 # carts are potential/lost value (never realized revenue).
@@ -2057,6 +2130,7 @@ class ShiftService:
                 sid = bucket(branch_id, cid, created_at)
                 if sid is None:
                     continue
+                order_cnt[sid] += 1
                 # localtime() -> project-tz wall-clock hour (matches analytics).
                 hour_cnt[sid][timezone.localtime(created_at).hour] += 1
                 if ready_at is not None:
@@ -2189,13 +2263,23 @@ class ShiftService:
                     ),
                     'reconciled': reconciled,
                 } for row in frozen]
-                expected_by_tender = {
-                    row.method: money(row.expected_amount) for row in frozen
-                }
-                if not expected_by_tender:
-                    # Active/legacy fallback from the same source rows as the
-                    # canonical drawer engine. Keep acquirer identities instead
-                    # of collapsing HUMO/UZCARD/CARD into a generic card bucket.
+                frozen_methods = {row.method for row in frozen}
+                expected_methods = set(PAYMENT_METHODS)
+                frozen_complete = frozen_methods == expected_methods
+                expected_by_tender = (
+                    {
+                        row.method: money(row.expected_amount)
+                        for row in frozen
+                    }
+                    if frozen_complete else {}
+                )
+                if not frozen_complete:
+                    # Active/legacy/incomplete-sync fallback from the same source
+                    # rows as the canonical drawer engine. A single arrived
+                    # ShiftPaymentTotal used to suppress this fallback and make
+                    # the other four tenders disappear from both the row and the
+                    # global summary. Keep acquirer identities instead of
+                    # collapsing HUMO/UZCARD/CARD into a generic card bucket.
                     exact = tender_acc.get(sid, {})
                     expected_by_tender = {
                         method: money(
@@ -2206,6 +2290,14 @@ class ShiftService:
                     }
                     if exact.get('UNKNOWN'):
                         expected_by_tender['UNKNOWN'] = money(exact['UNKNOWN'])
+                if frozen_complete:
+                    tender_source = 'FROZEN_COMPLETE'
+                elif frozen:
+                    tender_source = 'DERIVED_INCOMPLETE_FROZEN'
+                elif shifts_by_id[sid].status == 'ACTIVE':
+                    tender_source = 'DERIVED_LIVE'
+                else:
+                    tender_source = 'DERIVED_LEGACY'
                 total_expected = sum(
                     (Decimal(value) for value in expected_by_tender.values()),
                     zero,
@@ -2223,9 +2315,18 @@ class ShiftService:
                     'peak_hour': peak_hour,
                     'expected_by_tender': expected_by_tender,
                     'total_expected_to_receive': money(total_expected),
+                    'tender_totals_source': tender_source,
+                    'frozen_tender_evidence_complete': frozen_complete,
                     'settlement': settlement,
                     'reconciled_count': len(settlement) if reconciled else 0,
                     'cashbox_expenses': expense_items.get(sid, []),
+                    '_live_totals': {
+                        'total_orders': int(order_cnt.get(sid, 0)),
+                        'total_revenue': revenue_acc.get(sid, zero),
+                        'cash_collected': tender_acc.get(sid, {}).get(
+                            'CASH', zero,
+                        ),
+                    },
                 }
         except Exception:
             logger.exception('shift list extras batch failed (%s shifts)', len(shifts))
@@ -2253,8 +2354,15 @@ class ShiftService:
         is_live = shift.status == 'ACTIVE' and not shift.end_time
         effective_end = shift.end_time or now
         if is_live:
-            total_orders, total_revenue, cash_collected = ShiftService._live_totals(
-                shift, effective_end)
+            batched_live = (extras or {}).get('_live_totals')
+            if batched_live is not None:
+                total_orders = batched_live['total_orders']
+                total_revenue = batched_live['total_revenue']
+                cash_collected = batched_live['cash_collected']
+            else:
+                total_orders, total_revenue, cash_collected = (
+                    ShiftService._live_totals(shift, effective_end)
+                )
         else:
             total_orders = shift.total_orders
             total_revenue = shift.total_revenue
@@ -2335,7 +2443,10 @@ class ShiftService:
         # formula: realized revenue (already net of refunds) - cash expenses.
         # Canceled unpaid carts are potential sales, not realized revenue.
         if extras is not None:
-            result.update(extras)
+            result.update({
+                key: value for key, value in extras.items()
+                if not key.startswith('_')
+            })
             try:
                 net = (Decimal(str(total_revenue))
                        - Decimal(result['expenses_total']))

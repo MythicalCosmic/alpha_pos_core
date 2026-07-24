@@ -443,7 +443,27 @@ class SyncQueue:
                     updates['attempts'] = force_attempts
                 elif consume_attempt:
                     updates['attempts'] = models_F_plus_one()
-                SyncQueueRecord.objects.filter(pk__in=matched_pks).update(**updates)
+                if force_attempts is None and not consume_attempt:
+                    # A manual dead-letter recovery deliberately retains the
+                    # receiver's original diagnosis behind a [RETRYING]
+                    # marker. Repeated auth/transport/background failures are
+                    # delivery symptoms, not a new diagnosis, so replacing the
+                    # marker here would make the actionable rejection vanish.
+                    # The row locks also ensure a fresh explicit rejection
+                    # cannot be overwritten by this older batch result.
+                    for row in rows:
+                        if row.pk in matched_pks:
+                            row.last_error = _deferred_error(
+                                row.last_error, error,
+                            )
+                    SyncQueueRecord.objects.bulk_update(
+                        [row for row in rows if row.pk in matched_pks],
+                        ['last_error'],
+                    )
+                else:
+                    SyncQueueRecord.objects.filter(
+                        pk__in=matched_pks,
+                    ).update(**updates)
                 failed_rows = list(
                     SyncQueueRecord.objects.filter(pk__in=matched_pks).iterator()
                 )
@@ -462,7 +482,15 @@ class SyncQueue:
             updates['attempts'] = force_attempts
         elif consume_attempt:
             updates['attempts'] = models_F_plus_one()
-        qs.update(**updates)
+        if force_attempts is None and not consume_attempt:
+            with transaction.atomic():
+                rows = list(qs.select_for_update())
+                for row in rows:
+                    row.last_error = _deferred_error(row.last_error, error)
+                if rows:
+                    SyncQueueRecord.objects.bulk_update(rows, ['last_error'])
+        else:
+            qs.update(**updates)
         rows = [cls._to_dict(row) for row in qs.iterator()]
         if rows:
             emit_sync_evidence(
@@ -534,6 +562,20 @@ def models_F_plus_one():
     # Local helper to keep the import small at module top.
     from django.db.models import F
     return F('attempts') + 1
+
+
+def _deferred_error(current_error, latest_error):
+    """Preserve a recovery diagnosis while refreshing its delivery symptom."""
+    current = str(current_error or '').strip()
+    latest = str(latest_error or '').strip()
+    if current.startswith(('[REJECTED]', '[BRANCH_SCOPE]')):
+        return current[:500]
+    if current.startswith('[RETRYING]'):
+        original = current.split(' | latest push:', 1)[0].rstrip()
+        if latest:
+            return f'{original} | latest push: {latest}'[:500].rstrip()
+        return original[:500]
+    return latest[:500]
 
 
 def _payload_version(payload):

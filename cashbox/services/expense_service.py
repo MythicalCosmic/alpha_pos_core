@@ -17,8 +17,14 @@ from cashbox.models import CashboxExpense, CashboxExpenseCategory
 
 def _to_dec(value):
     try:
-        return Decimal(str(value)).quantize(Decimal('0.01'))
+        amount = Decimal(str(value))
     except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not amount.is_finite():
+        return None
+    try:
+        return amount.quantize(Decimal('0.01'))
+    except InvalidOperation:
         return None
 
 
@@ -80,10 +86,21 @@ class CashboxExpenseService:
         if shift.status != Shift.Status.ACTIVE:
             return ServiceResponse.error('Can only record expenses on an active shift')
 
-        amt = _to_dec(amount)
+        raw_amount = amount
+        amt = _to_dec(raw_amount)
         if amt is None or amt <= 0:
             return ServiceResponse.validation_error(
                 errors={'amount': 'Amount must be greater than 0'})
+        # Never silently round a financial command.  Besides hiding cashier
+        # input mistakes, accepting 1.005 here makes the API response, model
+        # value and the caller's original amount disagree.
+        try:
+            submitted = Decimal(str(raw_amount))
+        except (InvalidOperation, TypeError, ValueError):
+            submitted = None
+        if submitted is None or submitted != amt:
+            return ServiceResponse.validation_error(
+                errors={'amount': 'Amount cannot have more than two decimal places'})
         if recipient_user_id and recipient_supplier_id:
             return ServiceResponse.validation_error(
                 errors={'recipient': 'Choose at most one recipient (user OR supplier)'})

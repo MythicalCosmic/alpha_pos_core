@@ -1696,12 +1696,18 @@ class OrderItem(SyncMixin, models.Model):
 
 
 class CashRegister(SyncMixin, models.Model):
-    """The physical till balance for one branch.
+    """The branch's durable uncollected-cash accounting cursor.
 
-    A cloud database holds a synchronized copy for every branch, so selecting a
-    global ``.first()`` is never valid. The partial unique constraint makes the
-    ownership invariant explicit: one live register per branch; soft-deleted
-    history may remain for audit/recovery.
+    This is deliberately *not* a cashier shift drawer and must never be labelled
+    as one. It accumulates branch cash payment/refund/expense/Inkassa movements
+    across shifts until collection, so its value can span days when Inkassa has
+    not been recorded. A physical shift drawer is derived from that shift's
+    canonical tender/refund/expense evidence in ``cashbox.services.drawer``.
+
+    The cloud holds a synchronized cursor for every branch, so selecting a
+    global ``.first()`` is never valid. The partial unique constraint makes
+    ownership explicit: one live cursor per branch; soft-deleted history may
+    remain for audit/recovery.
     """
     current_balance = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     # Cumulative value of cloud-issued cash-out commands (inkassa, cashbox
@@ -1744,7 +1750,10 @@ class CashRegister(SyncMixin, models.Model):
         ]
 
     def __str__(self):
-        return f"Cash Register: {self.current_balance}"
+        return (
+            f"Branch cash cursor ({self.branch_id}): "
+            f"{self.current_balance}"
+        )
 
 
 class Inkassa(SyncMixin, models.Model):

@@ -9,10 +9,12 @@ retries on its own — it just stays missing on the cloud. That is the mechanism
 behind the "shift is missing on the panel" reports: the till holds it, but it's
 past the retry cap and no longer sent.
 
-This command resets those rows' attempt counter to 0 (and clears the stored
-error) so the next push cycle picks them up again. Run it *after* the underlying
-cause is fixed. Scope to one model with --model, preview with --dry-run, and add
---push to send immediately instead of waiting for the next sync tick.
+This command resets those rows' attempt counter to 0 while retaining the
+original rejection behind a ``[RETRYING]`` marker, so the next push cycle picks
+them up without destroying the operator's only diagnosis. Run it *after* the
+underlying cause is fixed. Scope to one model with --model, preview with
+--dry-run, and add --push to send immediately instead of waiting for the next
+sync tick.
 """
 from collections import Counter
 
@@ -39,13 +41,18 @@ class Command(BaseCommand):
     def handle(self, *args, **opts):
         from base.models import SyncQueueRecord
         from base.services.sync.config import get_sync_max_queue_attempts
+        from django.db import transaction
+        from django.db.models import Q
 
         max_attempts = get_sync_max_queue_attempts()
-        if not max_attempts:
-            self.stdout.write('SYNC_MAX_QUEUE_ATTEMPTS is 0 (dead-lettering disabled); nothing to do.')
-            return
-
-        qs = SyncQueueRecord.objects.filter(attempts__gte=max_attempts)
+        dead = (
+            Q(last_error__startswith='[REJECTED]')
+            | Q(last_error__startswith='[BRANCH_SCOPE]')
+            | Q(last_error__startswith='[RETRYING]')
+        )
+        if max_attempts:
+            dead |= Q(attempts__gte=max_attempts)
+        qs = SyncQueueRecord.objects.filter(dead)
         model = opts.get('model')
         if model:
             qs = qs.filter(model_name=model)
@@ -66,7 +73,21 @@ class Command(BaseCommand):
             self.stdout.write(self.style.WARNING('--dry-run: no changes written.'))
             return
 
-        updated = qs.update(attempts=0, last_error='')
+        with transaction.atomic():
+            rows = list(qs.select_for_update())
+            for row in rows:
+                original = (row.last_error or 'dead-lettered record').strip()
+                if original.startswith('[RETRYING]'):
+                    marker = original.split(' | latest push:', 1)[0]
+                else:
+                    marker = f'[RETRYING] {original}'
+                row.attempts = 0
+                row.last_error = marker[:500].rstrip()
+            if rows:
+                SyncQueueRecord.objects.bulk_update(
+                    rows, ['attempts', 'last_error'],
+                )
+        updated = len(rows)
         self.stdout.write(self.style.SUCCESS(f'Requeued {updated} record(s).'))
 
         if opts.get('push'):

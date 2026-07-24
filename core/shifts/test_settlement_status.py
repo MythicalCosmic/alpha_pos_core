@@ -80,7 +80,10 @@ def test_legacy_zero_count_is_unsubmitted_not_full_shortage():
     data = response['data']
     assert data['card_collected'] == '602000.00'
     assert data['expected_by_tender']['HUMO'] == '602000.00'
+    assert data['expected_by_tender']['CASH'] == '0.00'
     assert data['total_expected_to_receive'] == '602000.00'
+    assert data['tender_totals_source'] == 'DERIVED_INCOMPLETE_FROZEN'
+    assert data['frozen_tender_evidence_complete'] is False
     humo = next(row for row in data['settlement'] if row['method'] == 'HUMO')
     assert humo['counted'] == '0.00'
     assert humo['status'] == 'UNCOUNTED'

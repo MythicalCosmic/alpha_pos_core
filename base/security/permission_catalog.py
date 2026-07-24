@@ -31,7 +31,7 @@ PERMISSIONS = [
     ('hr.manage',        'Manage HR',              'HR'),
 
     ('reports.view',     'View reports',           'Reports'),
-    ('inkassa.manage',   'Manage cash register',   'Reports'),
+    ('inkassa.manage',   'Manage branch cash collection',   'Reports'),
 
     ('users.manage',     'Manage users',           'Administration'),
     ('settings.manage',  'Manage settings',        'Administration'),

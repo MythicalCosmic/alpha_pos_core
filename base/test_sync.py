@@ -151,6 +151,151 @@ class TestPushKeepsRejectedRecordsQueued:
         assert parent_row.last_error.startswith('[REJECTED]')
         assert child_row.attempts == 0
 
+    def test_permanent_rejection_retains_sanitized_receiver_reason(
+        self, settings, monkeypatch,
+    ):
+        from base.models import SyncQueueRecord
+        from base.services.sync import service as sync_service
+        from base.services.sync.queue import SyncQueue
+
+        settings.SYNC_ENABLED = True
+        settings.DEPLOYMENT_MODE = 'local'
+        settings.CLOUD_SYNC_URL = 'https://cloud.test'
+        settings.CLOUD_SYNC_TOKEN = 'tok'
+
+        rejected_uuid = str(uuidlib.uuid4())
+        SyncQueue.add(
+            'product', rejected_uuid,
+            {'uuid': rejected_uuid, 'name': 'Invalid product'},
+        )
+        monkeypatch.setattr(sync_service, 'check_health', lambda: True)
+        monkeypatch.setattr(
+            sync_service.SyncService, '_reconcile_unsynced',
+            classmethod(lambda cls: None),
+        )
+        monkeypatch.setattr(
+            sync_service.SyncService, '_notify_error',
+            staticmethod(lambda *args, **kwargs: None),
+        )
+
+        reason = (
+            'Parent belongs to another branch.\n'
+            'Do not retry\tthis payload.\x00'
+            + ('x' * 800)
+        )
+
+        def fake_send_batch(model_name, records, retry=True):
+            return {
+                'success': True,
+                'acknowledged_uuids': [],
+                'retryable_uuids': [],
+                'rejected_uuids': [rejected_uuid],
+                'record_results': [{
+                    'uuid': rejected_uuid,
+                    'action': 'rejected',
+                    'disposition': 'rejected',
+                    'reason_code': 'CROSS BRANCH/PARENT\r\n',
+                    'reason': reason,
+                }],
+            }
+
+        monkeypatch.setattr(sync_service, 'send_batch', fake_send_batch)
+
+        result = sync_service.SyncService.push()
+
+        row = SyncQueueRecord.objects.get(
+            model_name='product', record_uuid=uuidlib.UUID(rejected_uuid),
+        )
+        assert result['success'] is False
+        assert row.attempts == settings.SYNC_MAX_QUEUE_ATTEMPTS
+        assert row.last_error.startswith(
+            '[REJECTED] CROSS_BRANCH_PARENT: '
+            'Parent belongs to another branch. Do not retry this payload.',
+        )
+        assert '\n' not in row.last_error
+        assert '\r' not in row.last_error
+        assert '\t' not in row.last_error
+        assert '\x00' not in row.last_error
+        assert len(row.last_error) <= 500
+
+    def test_rejection_reasons_are_uuid_scoped_with_safe_fallback(
+        self, settings, monkeypatch,
+    ):
+        from base.models import SyncQueueRecord
+        from base.services.sync import service as sync_service
+        from base.services.sync.queue import SyncQueue
+
+        settings.SYNC_ENABLED = True
+        settings.DEPLOYMENT_MODE = 'local'
+        settings.CLOUD_SYNC_URL = 'https://cloud.test'
+        settings.CLOUD_SYNC_TOKEN = 'tok'
+
+        detailed_uuid = str(uuidlib.uuid4())
+        fallback_uuid = str(uuidlib.uuid4())
+        unrelated_uuid = str(uuidlib.uuid4())
+        for record_uuid in (detailed_uuid, fallback_uuid):
+            SyncQueue.add(
+                'product', record_uuid,
+                {'uuid': record_uuid, 'name': 'Rejected product'},
+            )
+        monkeypatch.setattr(sync_service, 'check_health', lambda: True)
+        monkeypatch.setattr(
+            sync_service.SyncService, '_reconcile_unsynced',
+            classmethod(lambda cls: None),
+        )
+        monkeypatch.setattr(
+            sync_service.SyncService, '_notify_error',
+            staticmethod(lambda *args, **kwargs: None),
+        )
+
+        def fake_send_batch(model_name, records, retry=True):
+            return {
+                'success': True,
+                'acknowledged_uuids': [],
+                'retryable_uuids': [],
+                'rejected_uuids': [detailed_uuid, fallback_uuid],
+                'record_results': [
+                    {
+                        'uuid': detailed_uuid,
+                        'disposition': 'rejected',
+                        'reason_code': 'INVALID_RECORD',
+                        'reason': 'Product payload is invalid',
+                    },
+                    {
+                        # Contradictory evidence must not label a rejected UUID.
+                        'uuid': fallback_uuid,
+                        'disposition': 'acknowledged',
+                        'reason_code': 'FORGED_DETAIL',
+                        'reason': 'must be ignored',
+                    },
+                    {
+                        # Evidence cannot expand the validated partition.
+                        'uuid': unrelated_uuid,
+                        'disposition': 'rejected',
+                        'reason_code': 'UNRELATED',
+                        'reason': 'must also be ignored',
+                    },
+                ],
+            }
+
+        monkeypatch.setattr(sync_service, 'send_batch', fake_send_batch)
+
+        result = sync_service.SyncService.push()
+
+        rows = {
+            str(row.record_uuid): row
+            for row in SyncQueueRecord.objects.filter(model_name='product')
+        }
+        assert result['success'] is False
+        assert rows[detailed_uuid].last_error == (
+            '[REJECTED] INVALID_RECORD: Product payload is invalid'
+        )
+        assert rows[fallback_uuid].last_error == (
+            '[REJECTED] receiver permanently rejected record(s)'
+        )
+        assert 'FORGED_DETAIL' not in rows[fallback_uuid].last_error
+        assert unrelated_uuid not in rows
+
     def test_systemic_failures_never_dead_letter_valid_money_records(
         self, settings, monkeypatch,
     ):

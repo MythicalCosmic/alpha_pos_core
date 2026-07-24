@@ -1,4 +1,7 @@
 import logging
+import re
+import unicodedata
+from collections import defaultdict
 from django.utils import timezone
 from base.services.sync.config import (
     SYNC_ORDER, SyncConfig, get_branch_id, is_local_mode,
@@ -12,6 +15,9 @@ from base.services.sync.status import SyncStatus
 logger = logging.getLogger(__name__)
 
 LOCK_TTL = 120
+REJECTION_CODE_MAX_LENGTH = 80
+REJECTION_REASON_MAX_LENGTH = 400
+REJECTION_DETAIL_MAX_LENGTH = 480
 
 
 def _lease_ttl():
@@ -240,13 +246,28 @@ class SyncService:
                                 generations=batch_generations,
                             )
                         if rejected_in_batch:
-                            marked_rejected = SyncQueue.mark_batch_rejected(
-                                rejected_in_batch,
-                                'receiver permanently rejected record(s)',
-                                model_name=model_name,
-                                generations=batch_generations,
+                            rejection_errors = (
+                                cls._rejection_errors_by_uuid(
+                                    result, rejected_in_batch,
+                                )
                             )
-                            rejected_this_push += len(marked_rejected or ())
+                            rejected_by_error = defaultdict(list)
+                            for record_uuid in rejected_in_batch:
+                                rejected_by_error[
+                                    rejection_errors[record_uuid]
+                                ].append(record_uuid)
+                            for rejection_error, rejected_uuids in (
+                                rejected_by_error.items()
+                            ):
+                                marked_rejected = SyncQueue.mark_batch_rejected(
+                                    rejected_uuids,
+                                    rejection_error,
+                                    model_name=model_name,
+                                    generations=batch_generations,
+                                )
+                                rejected_this_push += len(
+                                    marked_rejected or (),
+                                )
                         unacknowledged = [
                             *retryable_in_batch, *rejected_in_batch,
                         ]
@@ -869,6 +890,74 @@ class SyncService:
                 'acknowledgement partition does not exactly match the batch'
             )
         return normalized, None
+
+    @classmethod
+    def _rejection_errors_by_uuid(cls, result, rejected_uuids):
+        """Return bounded operator-safe receiver reasons for rejected UUIDs.
+
+        The acknowledgement partition remains the sole authority for whether a
+        record is rejected. ``record_results`` is optional observability
+        evidence only: malformed, contradictory, duplicate, or unrelated
+        entries can never add a UUID to the rejected partition.
+        """
+        fallback = 'receiver permanently rejected record(s)'
+        rejected = set(rejected_uuids)
+        errors = {record_uuid: fallback for record_uuid in rejected_uuids}
+        record_results = result.get('record_results')
+        if not isinstance(record_results, list):
+            return errors
+
+        recorded = set()
+        for evidence in record_results:
+            if not isinstance(evidence, dict):
+                continue
+            record_uuid = evidence.get('uuid')
+            if (
+                record_uuid not in rejected
+                or record_uuid in recorded
+                or evidence.get('disposition') != 'rejected'
+            ):
+                continue
+            reason_code = cls._sanitize_rejection_code(
+                evidence.get('reason_code'),
+            )
+            reason = cls._sanitize_rejection_text(
+                evidence.get('reason'),
+                REJECTION_REASON_MAX_LENGTH,
+            )
+            if not reason_code and not reason:
+                continue
+            if reason_code and reason:
+                detail = f'{reason_code}: {reason}'
+            else:
+                detail = reason_code or reason
+            errors[record_uuid] = detail[:REJECTION_DETAIL_MAX_LENGTH].rstrip()
+            recorded.add(record_uuid)
+        return errors
+
+    @staticmethod
+    def _sanitize_rejection_code(value):
+        value = SyncService._sanitize_rejection_text(
+            value, REJECTION_CODE_MAX_LENGTH * 2,
+        )
+        if not value:
+            return ''
+        value = re.sub(r'[^A-Za-z0-9_.-]+', '_', value)
+        return value.strip('_.-')[:REJECTION_CODE_MAX_LENGTH]
+
+    @staticmethod
+    def _sanitize_rejection_text(value, limit):
+        if not isinstance(value, str):
+            return ''
+        # Remove control/format/surrogate characters (including newlines,
+        # terminal escapes, and bidi overrides), then collapse all whitespace
+        # so an untrusted receiver cannot forge multiline support output.
+        safe = ''.join(
+            ' ' if unicodedata.category(character).startswith('C')
+            else character
+            for character in value
+        )
+        return ' '.join(safe.split())[:limit].rstrip()
 
     @staticmethod
     def _apply_global_user_alias(old_uuid, canonical_uuid):

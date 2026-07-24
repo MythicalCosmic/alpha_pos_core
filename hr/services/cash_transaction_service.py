@@ -69,13 +69,51 @@ class CashTransactionService:
 
     @staticmethod
     def _locked_branch_register() -> CashRegister:
-        """Lock only the configured branch's drawer for a balance snapshot.
+        """Lock only the configured branch's accounting cursor.
 
-        Every ledger row carries the physical cash balance before/after the
-        event, including non-cash events.  Taking the branch-scoped row lock
-        keeps that snapshot coherent while still mutating it only for CASH.
+        Every ledger row carries the branch cash cursor before/after the event,
+        including non-cash events. Taking the branch-scoped row lock keeps that
+        snapshot coherent while still mutating it only for CASH.
         """
         return CashRegisterRepository.get_or_create_current(for_update=True)
+
+    @staticmethod
+    def _unresolved_shift_error(register, payment_method):
+        """Refuse generic cash mutations while a shift owns branch cash.
+
+        Shift handover derives its expected cash only from paid orders, refunds
+        and ``CashboxExpense`` rows. A generic HR cash deposit/withdrawal used
+        to change ``CashRegister`` without changing any shift, so the physical
+        drawer and the close report could diverge invisibly.
+        """
+        if payment_method != CashTransaction.PaymentMethod.CASH:
+            return None
+        from base.models import Shift
+
+        unresolved = list(
+            Shift.objects.filter(
+                is_deleted=False,
+                branch_id=register.branch_id,
+                status__in=(Shift.Status.ACTIVE, Shift.Status.ENDED),
+            )
+            .order_by('start_time', 'id')
+            .values_list('id', 'status')[:10]
+        )
+        if not unresolved:
+            return None
+        details = ', '.join(
+            f'{shift_id} ({status})' for shift_id, status in unresolved
+        )
+        return ServiceResponse.validation_error(
+            errors={
+                'cash_drawer': (
+                    'Cash is owned by unresolved shift(s): '
+                    f'{details}. Record an active-shift payout through the '
+                    'cashbox expense flow, or reconcile the shift first.'
+                ),
+            },
+            message='Direct cash movement is blocked while a shift drawer is open',
+        )
 
     @classmethod
     def _serialize(cls, txn: CashTransaction) -> Dict[str, Any]:
@@ -186,6 +224,9 @@ class CashTransactionService:
             return method_error
 
         register = cls._locked_branch_register()
+        shift_error = cls._unresolved_shift_error(register, payment_method)
+        if shift_error:
+            return shift_error
 
         balance_before = register.current_balance
         if payment_method == CashTransaction.PaymentMethod.CASH:
@@ -231,6 +272,9 @@ class CashTransactionService:
             return method_error
 
         register = cls._locked_branch_register()
+        shift_error = cls._unresolved_shift_error(register, payment_method)
+        if shift_error:
+            return shift_error
         if (payment_method == CashTransaction.PaymentMethod.CASH
                 and register.current_balance < amount):
             return ServiceResponse.error(
@@ -287,6 +331,9 @@ class CashTransactionService:
             return method_error
 
         register = cls._locked_branch_register()
+        shift_error = cls._unresolved_shift_error(register, payment_method)
+        if shift_error:
+            return shift_error
         balance_before = register.current_balance
         balance_after = balance_before
 
