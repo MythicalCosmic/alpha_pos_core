@@ -1954,6 +1954,10 @@ class ShiftService:
                 'total_expected_to_receive': '0.00',
                 'tender_totals_source': 'UNAVAILABLE',
                 'frozen_tender_evidence_complete': False,
+                'tender_attribution_complete': False,
+                'unattributed_expected_amount': '0.00',
+                'frozen_tender_evidence_issues': ['EVIDENCE_UNAVAILABLE'],
+                'frozen_tender_discrepancies': {},
                 'settlement': [],
                 'reconciled_count': 0,
                 'cashbox_expenses': [],
@@ -1991,6 +1995,7 @@ class ShiftService:
                 owner = (s.branch_id, s.user_id)
                 by_owner[owner].append((s.start_time, end, s.id))
                 shift_branches[s.id] = s.branch_id
+            shifts_by_id = {shift.id: shift for shift in valid}
             window_indexes = {
                 owner: _ShiftWindowIndex(windows)
                 for owner, windows in by_owner.items()
@@ -2028,15 +2033,20 @@ class ShiftService:
                 paid_at__gte=min_start, paid_at__lt=max_end,
             ).values_list(
                 'id', 'branch_id', 'cashier_id', 'paid_at',
-                'total_amount', 'payment_method'))
+                'total_amount', 'payment_method', 'payment_action_id'))
             _ops = defaultdict(list)
             if money_rows:
-                for _oid, _m, _a in OrderPayment.objects.filter(
+                for _oid, _m, _a, _action, _line_index in OrderPayment.objects.filter(
                         is_deleted=False, order_id__in=[r[0] for r in money_rows],
-                ).values_list('order_id', 'method', 'amount'):
-                    _ops[_oid].append((_m, _a))
+                ).values_list(
+                    'order_id', 'method', 'amount',
+                    'payment_action_id', 'line_index',
+                ):
+                    _ops[_oid].append((_m, _a, _action, _line_index))
             _courier = _courier_rows_by_order([r[0] for r in money_rows])
-            for oid, branch_id, cid, paid_at, amt, method in money_rows:
+            for (
+                oid, branch_id, cid, paid_at, amt, method, payment_action_id,
+            ) in money_rows:
                 sid = bucket(branch_id, cid, paid_at)
                 if sid is None:
                     continue
@@ -2048,6 +2058,7 @@ class ShiftService:
                     order_payments,
                     courier_payments,
                     order_id=oid,
+                    payment_action_id=payment_action_id,
                 )
                 acc = mix_acc[sid]
                 for _k in ('cash', 'card', 'payme', 'unknown'):
@@ -2067,7 +2078,7 @@ class ShiftService:
             refund_total = defaultdict(lambda: Decimal('0.00'))
             for (
                 sid, row_branch, amount, cash, drawer_cash, card, payme,
-                unknown, card_detail,
+                unknown, card_detail, refunded_at,
             ) in OrderRefund.objects.filter(
                 is_deleted=False,
                 shift_id__in=list(out.keys()),
@@ -2075,9 +2086,22 @@ class ShiftService:
             ).values_list(
                 'shift_id', 'branch_id', 'amount', 'cash_amount',
                 'drawer_cash_amount', 'card_amount', 'payme_amount',
-                'unknown_amount', 'card_detail',
+                'unknown_amount', 'card_detail', 'refunded_at',
             ):
                 if shift_branches.get(sid) != row_branch:
+                    continue
+                shift = shifts_by_id.get(sid)
+                # ACTIVE metrics are an as-of snapshot. A future-dated refund
+                # already linked to the shift must not leak into totals before
+                # the shared caller timestamp. Closed shifts deliberately keep
+                # full FK semantics: their immutable refund bundle owns every
+                # row assigned to that shift, regardless of event clock skew.
+                if (
+                    shift is not None
+                    and shift.status == 'ACTIVE'
+                    and not shift.end_time
+                    and refunded_at >= now
+                ):
                     continue
                 acc = mix_acc[sid]
                 acc['cash'] -= cash or zero
@@ -2169,6 +2193,7 @@ class ShiftService:
                 .values(
                     f'{REFUND_EVENT_ALIAS}__shift_id',
                     f'{REFUND_EVENT_ALIAS}__branch_id',
+                    f'{REFUND_EVENT_ALIAS}__refunded_at',
                     'order__branch_id',
                 )
                 .annotate(q=Coalesce(Sum(
@@ -2178,28 +2203,28 @@ class ShiftService:
             for row in refund_unit_rows:
                 sid = row[f'{REFUND_EVENT_ALIAS}__shift_id']
                 refund_branch = row[f'{REFUND_EVENT_ALIAS}__branch_id']
+                refunded_at = row[f'{REFUND_EVENT_ALIAS}__refunded_at']
                 if not (
                     shift_branches.get(sid)
                     == refund_branch
                     == row['order__branch_id']
                 ):
                     continue
+                shift = shifts_by_id.get(sid)
+                if (
+                    shift is not None
+                    and shift.status == 'ACTIVE'
+                    and not shift.end_time
+                    and refunded_at >= now
+                ):
+                    continue
                 units[sid] -= int(row['q'] or 0)
 
-            # Drawer expenses: CashboxExpense HAS a shift FK -> DB GROUP BY, no bucketing.
+            # Drawer expenses have a shift FK. Load them once for both the sum
+            # and receipt list so ACTIVE shifts can share the exact same `now`
+            # snapshot as their paid orders/refunds. Closed shifts retain full
+            # FK semantics even when a device clock put created_at past end_time.
             exp_total = defaultdict(lambda: Decimal('0.00'))
-            for r in (CashboxExpense.objects
-                      .filter(
-                          shift_id__in=list(out.keys()),
-                          branch_id__in=branch_ids,
-                          is_deleted=False,
-                      )
-                      .values('shift_id', 'branch_id')
-                      .annotate(t=Coalesce(Sum('amount'), zero, output_field=DecimalField()))):
-                if shift_branches.get(r['shift_id']) != r['branch_id']:
-                    continue
-                exp_total[r['shift_id']] = r['t'] or zero
-
             expense_items = defaultdict(list)
             for expense in (
                 CashboxExpense.objects.filter(
@@ -2212,6 +2237,15 @@ class ShiftService:
             ):
                 if shift_branches.get(expense.shift_id) != expense.branch_id:
                     continue
+                shift = shifts_by_id.get(expense.shift_id)
+                if (
+                    shift is not None
+                    and shift.status == 'ACTIVE'
+                    and not shift.end_time
+                    and expense.created_at >= now
+                ):
+                    continue
+                exp_total[expense.shift_id] += expense.amount or zero
                 expense_items[expense.shift_id].append(
                     ShiftService._serialize_cashbox_expense(expense)
                 )
@@ -2232,7 +2266,6 @@ class ShiftService:
                     is_deleted=False,
                 ).values_list('shift_id', flat=True)
             )
-            shifts_by_id = {shift.id: shift for shift in valid}
 
             def money(d):
                 return str((d or zero).quantize(zero))   # always 2dp, e.g. "100.00"
@@ -2265,31 +2298,88 @@ class ShiftService:
                 } for row in frozen]
                 frozen_methods = {row.method for row in frozen}
                 expected_methods = set(PAYMENT_METHODS)
-                frozen_complete = frozen_methods == expected_methods
-                expected_by_tender = (
-                    {
-                        row.method: money(row.expected_amount)
-                        for row in frozen
-                    }
-                    if frozen_complete else {}
-                )
-                if not frozen_complete:
-                    # Active/legacy/incomplete-sync fallback from the same source
-                    # rows as the canonical drawer engine. A single arrived
-                    # ShiftPaymentTotal used to suppress this fallback and make
-                    # the other four tenders disappear from both the row and the
-                    # global summary. Keep acquirer identities instead of
-                    # collapsing HUMO/UZCARD/CARD into a generic card bucket.
-                    exact = tender_acc.get(sid, {})
-                    expected_by_tender = {
-                        method: money(
-                            exact.get(method, zero)
-                            - (exp_total.get(sid, zero) if method == 'CASH' else zero)
+                exact = tender_acc.get(sid, {})
+                derived = {
+                    method: (
+                        exact.get(method, zero)
+                        - (
+                            exp_total.get(sid, zero)
+                            if method == 'CASH' else zero
                         )
-                        for method in PAYMENT_METHODS
+                    )
+                    for method in PAYMENT_METHODS
+                }
+                unknown_expected = exact.get('UNKNOWN', zero)
+                frozen_expected = {
+                    row.method: row.expected_amount for row in frozen
+                }
+                missing_methods = sorted(expected_methods - frozen_methods)
+                unexpected_methods = sorted(frozen_methods - expected_methods)
+                discrepancies = {}
+                for method in sorted(expected_methods):
+                    if method not in frozen_expected:
+                        if frozen:
+                            discrepancies[method] = {
+                                'frozen': None,
+                                'derived': money(derived[method]),
+                                'derived_minus_frozen': None,
+                            }
+                        continue
+                    frozen_amount = frozen_expected[method]
+                    if frozen_amount != derived[method]:
+                        discrepancies[method] = {
+                            'frozen': money(frozen_amount),
+                            'derived': money(derived[method]),
+                            'derived_minus_frozen': money(
+                                derived[method] - frozen_amount
+                            ),
+                        }
+                for method in unexpected_methods:
+                    discrepancies[method] = {
+                        'frozen': money(frozen_expected[method]),
+                        'derived': None,
+                        'derived_minus_frozen': None,
                     }
-                    if exact.get('UNKNOWN'):
-                        expected_by_tender['UNKNOWN'] = money(exact['UNKNOWN'])
+                if unknown_expected:
+                    # UNKNOWN is intentionally not a frozen canonical tender.
+                    # Its presence means the five named rows cannot prove where
+                    # this money went. Treat the absent frozen side as zero so
+                    # the exact uncovered amount is visible to operators.
+                    discrepancies['UNKNOWN'] = {
+                        'frozen': None,
+                        'derived': money(unknown_expected),
+                        'derived_minus_frozen': money(unknown_expected),
+                    }
+
+                evidence_issues = []
+                if not frozen:
+                    evidence_issues.append('NO_FROZEN_TENDER_ROWS')
+                elif missing_methods:
+                    evidence_issues.append('MISSING_FROZEN_METHODS')
+                if unexpected_methods:
+                    evidence_issues.append('UNEXPECTED_FROZEN_METHODS')
+                if any(
+                    method in discrepancies for method in expected_methods
+                    if method in frozen_expected
+                ):
+                    evidence_issues.append('FROZEN_EXPECTED_MISMATCH')
+                if unknown_expected:
+                    evidence_issues.append('UNATTRIBUTED_TENDER_EVIDENCE')
+
+                # Five method names alone are not proof. A frozen close is
+                # complete only when its expected figures exactly match the
+                # canonical net derivation (refunds included; CASH additionally
+                # net of drawer expenses) and no amount remains unattributed.
+                frozen_complete = bool(frozen) and not evidence_issues
+                expected_by_tender = {
+                    method: money(amount)
+                    for method, amount in (
+                        frozen_expected.items()
+                        if frozen_complete else derived.items()
+                    )
+                }
+                if not frozen_complete and unknown_expected:
+                    expected_by_tender['UNKNOWN'] = money(unknown_expected)
                 if frozen_complete:
                     tender_source = 'FROZEN_COMPLETE'
                 elif frozen:
@@ -2317,6 +2407,10 @@ class ShiftService:
                     'total_expected_to_receive': money(total_expected),
                     'tender_totals_source': tender_source,
                     'frozen_tender_evidence_complete': frozen_complete,
+                    'tender_attribution_complete': unknown_expected == zero,
+                    'unattributed_expected_amount': money(unknown_expected),
+                    'frozen_tender_evidence_issues': evidence_issues,
+                    'frozen_tender_discrepancies': discrepancies,
                     'settlement': settlement,
                     'reconciled_count': len(settlement) if reconciled else 0,
                     'cashbox_expenses': expense_items.get(sid, []),

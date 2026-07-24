@@ -15,7 +15,9 @@ That is exactly what the till credits to the drawer (customers.order_service
 ``mark_as_paid``: ``cash_to_drawer = effective_total - noncash_sum``) and what the
 cancel path reverses. Summing the raw CASH lines over-reports cash by the change.
 
-An order is attributed by this ladder (first match wins):
+An action-identified order must have complete, positive concrete payment
+evidence whose methods agree with its rolled-up ``payment_method``. An
+action-less (legacy) order is attributed by this ladder (first match wins):
 
   1. complete till and/or external payment lines -> cash = total - all noncash
   2. no lines, payment_method NULL | CASH      -> cash  = total   (documented legacy)
@@ -77,17 +79,64 @@ def _dec(v):
     return v if isinstance(v, Decimal) else Decimal(str(v or 0))
 
 
-def split_from_rows(total, payment_method, op_rows=(), courier_rows=(), order_id=None):
+def _finite_dec(value):
+    """Return a finite Decimal, or None when a plain-data row is malformed."""
+    try:
+        value = _dec(value)
+    except (ArithmeticError, TypeError, ValueError):
+        return None
+    return value if value.is_finite() else None
+
+
+def _concrete_method(method):
+    """Strict stored tender for evidence rows; unlike headers, NULL is not CASH."""
+    if not isinstance(method, str):
+        return None
+    normalized = method.strip().upper()
+    return normalized if normalized in KNOWN_METHODS else None
+
+
+def _row_parts(row):
+    """Return method/amount plus optional checkout identity from a money row."""
+    try:
+        values = tuple(row)
+    except TypeError:
+        values = ()
+    return (
+        values[0] if len(values) > 0 else None,
+        values[1] if len(values) > 1 else None,
+        values[2] if len(values) > 2 else None,
+        values[3] if len(values) > 3 else None,
+    )
+
+
+def split_from_rows(
+    total,
+    payment_method,
+    op_rows=(),
+    courier_rows=(),
+    order_id=None,
+    *,
+    payment_action_id=None,
+    require_concrete=False,
+):
     """Pure ladder over plain data. Returns (split, card_detail).
 
-    `op_rows` / `courier_rows` are iterables of (method, amount). The latter is
-    the exact non-drawer collection stream: canonical ExternalOrderPayment rows
-    plus a de-duplicated legacy CourierPayment fallback. The returned split
-    sums EXACTLY to `total`.
+    `op_rows` accepts ``(method, amount)`` legacy tuples or
+    ``(method, amount, payment_action_id, line_index)`` checkout evidence.
+    `courier_rows` is the exact non-drawer collection stream: canonical
+    ExternalOrderPayment rows plus a de-duplicated legacy CourierPayment
+    fallback. The returned split sums EXACTLY to `total`.
+
+    A non-null Order.payment_action_id is a post-upgrade completeness contract,
+    not merely a retry hint. Such an order must have positive, finite,
+    same-action, contiguous OrderPayment children whose concrete method set
+    agrees with the rolled-up header. Legacy payment_method fallback is kept
+    only for action-less orders.
     """
     total = _dec(total)
     split, detail = empty_split(), empty_detail()
-    if total <= ZERO:
+    if not total.is_finite() or total <= ZERO:
         return split, detail            # nothing to attribute (incl. 100% discount)
 
     def _derive(rows, source):
@@ -99,16 +148,17 @@ def split_from_rows(total, payment_method, op_rows=(), courier_rows=(), order_id
         silently appear as cash.
         """
         noncash, cash_tendered, per = ZERO, ZERO, {}
-        for method, amount in rows:
-            m = normalize_method(method)
-            if m not in KNOWN_METHODS:
+        for row in rows:
+            method, amount, _action_id, _line_index = _row_parts(row)
+            m = _concrete_method(method)
+            if m is None:
                 logger.error('tender: order %s has %s line with unrecognised method '
                              '%r -> unknown', order_id, source, method)
                 return None
-            amt = _dec(amount)
-            if amt < ZERO:
+            amt = _finite_dec(amount)
+            if amt is None or amt < ZERO:
                 logger.error(
-                    'tender: order %s has negative %s line %s=%s -> unknown',
+                    'tender: order %s has invalid %s line %s=%s -> unknown',
                     order_id, source, m, amt,
                 )
                 return None
@@ -141,15 +191,114 @@ def split_from_rows(total, payment_method, op_rows=(), courier_rows=(), order_id
     # and collection at the door, so neither source may hide the other.
     op_rows = list(op_rows)
     courier_rows = list(courier_rows)
+    if payment_action_id is not None:
+        if not op_rows and not courier_rows:
+            logger.error(
+                'tender: action-identified order %s has no concrete payment '
+                'children -> unknown',
+                order_id,
+            )
+            split['unknown'] = total
+            return split, detail
+        action = str(payment_action_id)
+        action_methods = set()
+        line_indexes = []
+        for row in op_rows:
+            method, amount, row_action, line_index = _row_parts(row)
+            normalized = _concrete_method(method)
+            amount = _finite_dec(amount)
+            if (
+                normalized is None
+                or amount is None
+                or amount <= ZERO
+                or row_action is None
+                or str(row_action) != action
+                or line_index is None
+            ):
+                logger.error(
+                    'tender: action-identified order %s has invalid or '
+                    'different-action child evidence -> unknown',
+                    order_id,
+                )
+                split['unknown'] = total
+                return split, detail
+            try:
+                line_index = int(line_index)
+            except (TypeError, ValueError):
+                split['unknown'] = total
+                return split, detail
+            if line_index < 0:
+                split['unknown'] = total
+                return split, detail
+            action_methods.add(normalized)
+            line_indexes.append(line_index)
+        for row in courier_rows:
+            method, amount, _row_action, _line_index = _row_parts(row)
+            normalized = _concrete_method(method)
+            amount = _finite_dec(amount)
+            if normalized is None or amount is None or amount <= ZERO:
+                logger.error(
+                    'tender: action-identified order %s has invalid external '
+                    'payment evidence -> unknown',
+                    order_id,
+                )
+                split['unknown'] = total
+                return split, detail
+            action_methods.add(normalized)
+        if sorted(line_indexes) != list(range(len(line_indexes))):
+            logger.error(
+                'tender: action-identified order %s has missing/duplicate '
+                'payment line indexes -> unknown',
+                order_id,
+            )
+            split['unknown'] = total
+            return split, detail
+        rolled_up = (
+            payment_method.strip().upper()
+            if isinstance(payment_method, str)
+            else ''
+        )
+        if (
+            (rolled_up == 'MIXED' and len(action_methods) < 2)
+            or (
+                rolled_up != 'MIXED'
+                and (
+                    rolled_up not in KNOWN_METHODS
+                    or action_methods != {rolled_up}
+                )
+            )
+        ):
+            logger.error(
+                'tender: action-identified order %s header=%s disagrees '
+                'with child methods=%s -> unknown',
+                order_id,
+                rolled_up,
+                sorted(action_methods),
+            )
+            split['unknown'] = total
+            return split, detail
+    elif require_concrete and not op_rows and not courier_rows:
+        logger.error(
+            'tender: order %s requires concrete payment evidence -> unknown',
+            order_id,
+        )
+        split['unknown'] = total
+        return split, detail
+
     if op_rows or courier_rows:
         # A till CASH line is cash tendered and may contain change. External
         # collections are exact settled amounts, so they may never borrow the
         # till-CASH change rule to hide an over-collection.
         external_total = ZERO
-        for method, amount in courier_rows:
-            normalized = normalize_method(method)
-            amount = _dec(amount)
-            if normalized not in KNOWN_METHODS or amount <= ZERO:
+        for row in courier_rows:
+            method, amount, _action_id, _line_index = _row_parts(row)
+            normalized = _concrete_method(method)
+            amount = _finite_dec(amount)
+            if (
+                normalized is None
+                or amount is None
+                or amount <= ZERO
+            ):
                 logger.error(
                     'tender: order %s has invalid external payment %r=%s '
                     '-> unknown', order_id, method, amount,
@@ -157,12 +306,16 @@ def split_from_rows(total, payment_method, op_rows=(), courier_rows=(), order_id
                 split['unknown'] = total
                 return split, detail
             external_total += amount
-        till_noncash = sum(
-            (_dec(amount) for method, amount in op_rows
-             if normalize_method(method) in NONCASH_METHODS
-             and _dec(amount) > ZERO),
-            ZERO,
-        )
+        till_noncash = ZERO
+        for row in op_rows:
+            method, amount, _action_id, _line_index = _row_parts(row)
+            amount = _finite_dec(amount)
+            if (
+                _concrete_method(method) in NONCASH_METHODS
+                and amount is not None
+                and amount > ZERO
+            ):
+                till_noncash += amount
         if external_total + till_noncash > total:
             logger.error(
                 'tender: order %s exact external=%s plus till noncash=%s '
@@ -252,12 +405,15 @@ def order_tender_sources(order):
     courier row exists we never guess that its cash entered the POS drawer.
     """
     from base.models import OrderPayment
-    ops = list(OrderPayment.objects.filter(is_deleted=False, order_id=order.id)
-               .values_list('method', 'amount'))
+    ops = list(
+        OrderPayment.objects.filter(is_deleted=False, order_id=order.id)
+        .values_list('method', 'amount', 'payment_action_id', 'line_index')
+    )
     courier = _courier_rows_by_order([order.id]).get(order.id, [])
     split, detail = split_from_rows(
         order.total_amount, order.payment_method,
         ops, courier, order_id=order.id,
+        payment_action_id=order.payment_action_id,
     )
     drawer_cash = _drawer_cash_from_sources(
         order.total_amount, split, ops, courier,
@@ -267,22 +423,31 @@ def order_tender_sources(order):
 
 def _drawer_cash_from_sources(total, split, ops, courier):
     """Physical till cash represented by already-loaded tender evidence."""
+    # UNKNOWN means the evidence contract failed. Never let the raw CASH row
+    # that caused (or accompanied) that failure leak back into drawer/refund
+    # arithmetic through this secondary derivation.
+    if split['unknown'] > ZERO:
+        return ZERO
     if not ops and not courier:
         return split['cash']
-    tendered = sum(
-        (_dec(amount) for method, amount in ops
-         if normalize_method(method) == CASH and _dec(amount) > ZERO),
-        ZERO,
-    )
-    till_noncash = sum(
-        (_dec(amount) for method, amount in ops
-         if normalize_method(method) in NONCASH_METHODS
-         and _dec(amount) > ZERO),
-        ZERO,
-    )
-    courier_collected = sum(
-        (max(_dec(amount), ZERO) for _method, amount in courier), ZERO,
-    )
+    tendered = ZERO
+    till_noncash = ZERO
+    for row in ops:
+        method, amount, _action_id, _line_index = _row_parts(row)
+        amount = _finite_dec(amount)
+        if amount is None or amount <= ZERO:
+            continue
+        normalized = _concrete_method(method)
+        if normalized == CASH:
+            tendered += amount
+        elif normalized in NONCASH_METHODS:
+            till_noncash += amount
+    courier_collected = ZERO
+    for row in courier:
+        _method, amount, _action_id, _line_index = _row_parts(row)
+        amount = _finite_dec(amount)
+        if amount is not None and amount > ZERO:
+            courier_collected += amount
     drawer_bill_residual = max(
         _dec(total) - till_noncash - courier_collected,
         ZERO,
@@ -302,7 +467,9 @@ def breakdown_sources_for_orders(order_qs):
     """
     from base.models import OrderPayment
 
-    rows = list(order_qs.values('id', 'total_amount', 'payment_method'))
+    rows = list(order_qs.values(
+        'id', 'total_amount', 'payment_method', 'payment_action_id',
+    ))
     if not rows:
         return empty_split(), empty_detail(), ZERO
     ids = [r['id'] for r in rows]
@@ -310,9 +477,16 @@ def breakdown_sources_for_orders(order_qs):
     ops = {}
     # OrderPayment.objects is a SyncManager and does NOT filter soft-deletes; spell
     # it out (mirrors cashbox/services/drawer.py).
-    for oid, method, amount in OrderPayment.objects.filter(
-            is_deleted=False, order_id__in=ids).values_list('order_id', 'method', 'amount'):
-        ops.setdefault(oid, []).append((method, amount))
+    for oid, method, amount, action_id, line_index in (
+        OrderPayment.objects.filter(is_deleted=False, order_id__in=ids)
+        .values_list(
+            'order_id', 'method', 'amount',
+            'payment_action_id', 'line_index',
+        )
+    ):
+        ops.setdefault(oid, []).append(
+            (method, amount, action_id, line_index)
+        )
 
     courier = _courier_rows_by_order(ids)
 
@@ -324,6 +498,7 @@ def breakdown_sources_for_orders(order_qs):
         s, d = split_from_rows(
             r['total_amount'], r['payment_method'],
             order_ops, order_courier, order_id=oid,
+            payment_action_id=r['payment_action_id'],
         )
         for k in BUCKETS:
             split[k] += s[k]
@@ -386,18 +561,30 @@ def noncash_total_for_orders(order_qs):
 
 
 def unattributed_orders(order_qs=None):
-    """CANARY: paid, non-deleted orders that have no concrete payment rows
-    and a non-cash rolled-up method — i.e. money a breakdown cannot attribute from
-    payment lines. Must be 0. A non-zero count is the detector for the sync
-    dead-letter hole (an Order lands on the cloud, its payments never do)."""
+    """CANARY for paid orders with no concrete payment rows.
+
+    An action identity promises concrete children, including when the rolled-up
+    method is CASH. Legacy orders retain the historical non-cash canary.
+    Zero-total orders and orders with external collection evidence remain valid.
+    """
     from django.db.models import Count, Q
     from base.models import ExternalOrderPayment, Order
     qs = order_qs if order_qs is not None else Order.objects.filter(
         is_deleted=False, is_paid=True)
-    missing = (qs.annotate(_n=Count('payments', filter=Q(payments__is_deleted=False)))
-                 .filter(_n=0)
-                 .exclude(payment_method=CASH)
-                 .exclude(payment_method__isnull=True))
+    missing = (
+        qs.annotate(
+            _n=Count('payments', filter=Q(payments__is_deleted=False))
+        )
+        .filter(_n=0, total_amount__gt=ZERO)
+        .filter(
+            Q(payment_action_id__isnull=False)
+            | (
+                Q(payment_action_id__isnull=True)
+                & Q(payment_method__isnull=False)
+                & ~Q(payment_method=CASH)
+            )
+        )
+    )
     external_orders = ExternalOrderPayment.objects.filter(
         is_deleted=False, order_id__in=missing.values('pk'),
     ).values('order_id')
@@ -423,17 +610,25 @@ def tender_integrity_issues(order_qs, *, require_concrete=False):
     settlement-eligible shift must prove every positive sale with either an
     OrderPayment or a completed CourierPayment before it can be handed over.
     """
-    rows = list(order_qs.values('id', 'total_amount', 'payment_method'))
+    rows = list(order_qs.values(
+        'id', 'total_amount', 'payment_method', 'payment_action_id',
+    ))
     if not rows:
         return []
     ids = [row['id'] for row in rows]
 
     from base.models import OrderPayment
     till = {}
-    for order_id, method, amount in OrderPayment.objects.filter(
-        is_deleted=False, order_id__in=ids,
-    ).values_list('order_id', 'method', 'amount'):
-        till.setdefault(order_id, []).append((method, amount))
+    for order_id, method, amount, action_id, line_index in (
+        OrderPayment.objects.filter(is_deleted=False, order_id__in=ids)
+        .values_list(
+            'order_id', 'method', 'amount',
+            'payment_action_id', 'line_index',
+        )
+    ):
+        till.setdefault(order_id, []).append(
+            (method, amount, action_id, line_index)
+        )
     courier = _courier_rows_by_order(ids)
 
     issues = []
@@ -441,11 +636,24 @@ def tender_integrity_issues(order_qs, *, require_concrete=False):
         order_id = row['id']
         payment_rows = till.get(order_id, ())
         courier_rows = courier.get(order_id, ())
+        if (
+            row['payment_action_id'] is not None
+            and _dec(row['total_amount']) == ZERO
+            and (payment_rows or courier_rows)
+        ):
+            issues.append({
+                'order_id': order_id,
+                'amount': ZERO,
+                'payment_method': row['payment_method'],
+                'reason': 'zero-total order has concrete payment evidence',
+            })
+            continue
         if not payment_rows and not courier_rows:
             if (
                 _dec(row['total_amount']) > ZERO
                 and (
                     require_concrete
+                    or row['payment_action_id'] is not None
                     or normalize_method(row['payment_method']) != CASH
                 )
             ):
@@ -459,6 +667,8 @@ def tender_integrity_issues(order_qs, *, require_concrete=False):
         split, _detail = split_from_rows(
             row['total_amount'], row['payment_method'],
             payment_rows, courier_rows, order_id=order_id,
+            payment_action_id=row['payment_action_id'],
+            require_concrete=require_concrete,
         )
         if split['unknown']:
             issues.append({

@@ -259,6 +259,44 @@ def test_legacy_actionless_split_remains_accepted_during_rolling_upgrade(
     assert OrderPayment.objects.filter(order=order, is_deleted=False).count() == 2
 
 
+@pytest.mark.parametrize('incoming_action', ['matching', None])
+def test_branch_rejects_positive_payment_child_for_zero_total_order(
+    order_factory, cashier_user, settings, incoming_action,
+):
+    """Fully discounted orders have an action but never collect tender."""
+    from base.models import Order, OrderPayment
+    from base.services.sync.receiver import CloudReceiver
+
+    order, action_id, _ = _settled_order(order_factory, cashier_user)
+    Order.objects.filter(pk=order.pk).update(
+        subtotal=Decimal('10.00'),
+        discount_amount=Decimal('10.00'),
+        discount_percent=Decimal('100.00'),
+        total_amount=Decimal('0.00'),
+        payment_method=None,
+    )
+    order.refresh_from_db()
+    settings.DEPLOYMENT_MODE = 'cloud'
+    action = action_id if incoming_action == 'matching' else None
+    index = 0 if incoming_action == 'matching' else None
+
+    instance, result = CloudReceiver._create_or_update(
+        OrderPayment,
+        _payment_payload(
+            order,
+            action_id=action,
+            line_index=index,
+            method='CASH',
+            amount='1.00',
+        ),
+        'branch1',
+    )
+
+    assert instance is None
+    assert result == 'skipped'
+    assert not OrderPayment.objects.filter(order=order).exists()
+
+
 def test_database_rejects_duplicate_live_action_line_but_allows_legacy_rows(
     order_factory, cashier_user,
 ):

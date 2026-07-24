@@ -2727,7 +2727,21 @@ class OrderPayment(SyncMixin, models.Model):
             amount = Decimal(str(values.get('amount')))
         except (InvalidOperation, TypeError, ValueError):
             return False
-        return amount.is_finite() and amount > 0
+        if not amount.is_finite() or amount <= 0:
+            return False
+
+        # A zero/negative bill cannot legitimately collect a positive tender.
+        # The hardened checkout records a fully discounted order with its
+        # immutable action identity but deliberately creates no OrderPayment
+        # child. Reject impossible children at branch admission as well as
+        # reporting them later through the tender-integrity canary; otherwise a
+        # corrupted/malicious positive child could be stored and silently
+        # ignored because the parent contributes zero revenue.
+        try:
+            parent_total = Decimal(str(order.total_amount))
+        except (InvalidOperation, TypeError, ValueError):
+            return False
+        return parent_total.is_finite() and parent_total > 0
 
     class Meta:
         db_table = 'order_payment'
