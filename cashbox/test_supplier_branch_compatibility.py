@@ -12,6 +12,11 @@ from stock.models import Supplier
 pytestmark = pytest.mark.django_db
 
 
+@pytest.fixture(autouse=True)
+def _upgraded_terminal(settings):
+    settings.DEVICE_ID = 'test-device'
+
+
 def _funded_shift(branch='branch-legacy'):
     user = User.objects.create(
         first_name='Cash', last_name='Ier', email=f'{branch}@example.test',
@@ -19,6 +24,7 @@ def _funded_shift(branch='branch-legacy'):
     )
     shift = Shift.objects.create(
         user=user, start_time=timezone.now(), status='ACTIVE', branch_id=branch,
+        device_id='test-device',
     )
     order = Order.objects.create(
         user=user, cashier=user, status='COMPLETED', is_paid=True,

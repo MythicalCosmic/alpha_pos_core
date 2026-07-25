@@ -34,7 +34,11 @@ def lock_active_cashier_shift(cashier_id, *, branch_id=''):
     # surrounding transaction commits.
     cashier = (
         User.objects.select_for_update()
-        .filter(pk=cashier_id, is_deleted=False)
+        .filter(
+            pk=cashier_id,
+            is_deleted=False,
+            status=User.UserStatus.ACTIVE,
+        )
         .first()
     )
     if cashier is None:
@@ -61,6 +65,14 @@ def lock_active_cashier_shift(cashier_id, *, branch_id=''):
         )
 
     shift = shifts[0]
+    # Upgraded cashier money writes are installation-owned. Legacy blank-device
+    # shifts remain closable, but cannot silently authorize checkout/refund on
+    # whichever desktop happens to hold an old login session.
+    from base.services.shift_device import cashier_shift_device_error
+    device_error = cashier_shift_device_error(cashier, shift)
+    if device_error:
+        raise SettlementInvariantError(device_error)
+
     expected_branch = str(branch_id or '').strip()
     explicit_shift_branch = str(shift.branch_id or '').strip()
     cashier_branch = str(cashier.branch_id or '').strip()

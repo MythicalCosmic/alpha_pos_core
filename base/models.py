@@ -5,6 +5,8 @@ from django.db.models.functions import Now
 from django.db.models.fields.files import FieldFile
 from django.conf import settings
 
+from base.services.sync.context import is_authoritative_cloud_pull
+
 
 class SyncQuerySet(models.QuerySet):
     def unsynced(self):
@@ -70,6 +72,7 @@ class SyncMixin(models.Model):
         mode = None
         publish_cloud_change = False
         queue_local_change = False
+        lock_existing_write = False
         if not syncing:
             mode = getattr(settings, 'DEPLOYMENT_MODE', 'local')
             node_branch = str(getattr(settings, 'BRANCH_ID', '') or '').strip()
@@ -98,6 +101,18 @@ class SyncMixin(models.Model):
                 self.branch_id = node_branch
             if self.pk:
                 self.sync_version += 1
+                # Every ordinary writer (terminal or hub) must serialize its
+                # version bump against the row actually persisted at commit
+                # time. This is broader than natural-key rekey protection: a
+                # stale Order instance can otherwise soft-delete version 4
+                # after another request committed version 9, or a stale cloud
+                # admin edit can publish a generation the terminal rejects.
+                #
+                # The authoritative branch-record merge path is the one
+                # exception. It already owns this row lock and intentionally
+                # changes the persisted UUID A to the cloud's UUID B before
+                # publishing the locally-owned merged generation.
+                lock_existing_write = not is_authoritative_cloud_pull()
             update_fields = kwargs.get('update_fields')
             content_changed = update_fields is None or any(
                 f not in ['synced_at', 'sync_version'] for f in update_fields
@@ -134,18 +149,36 @@ class SyncMixin(models.Model):
                 from base.services.sync.config import SyncConfig
                 queue_local_change = SyncConfig.is_enabled()
 
-        if queue_local_change:
-            # The content row and its DB-backed outbound slot are one durability
-            # unit.  SYNC_ON_SAVE used to suppress this enqueue (default=False),
-            # leaving a locally-edited cloud row discoverable only by a later
-            # best-effort sweep.  A crash before that sweep lost the edit.  Queue
-            # every local content mutation while sync is enabled and let the
-            # worker schedule control *when* it is sent.
+        if queue_local_change or lock_existing_write:
+            # The row lock makes every ordinary version bump monotonic. On a
+            # terminal, the content row and its DB-backed outbound slot are also
+            # one durability unit. SYNC_ON_SAVE used to suppress this enqueue
+            # (default=False), leaving a locally-edited cloud row discoverable
+            # only by a later best-effort sweep.
             using = kwargs.get('using') or self._state.db or 'default'
             with transaction.atomic(using=using):
+                if lock_existing_write:
+                    # Re-anchor every stale instance under the row lock before
+                    # either the model write or queue serialization. Besides a
+                    # natural-key UUID rekey, this protects both hub-owned and
+                    # branch-owned rows from version regression.
+                    persisted = (
+                        type(self)._base_manager.using(using)
+                        .select_for_update()
+                        .filter(pk=self.pk)
+                        .values('uuid', 'sync_version')
+                        .first()
+                    )
+                    if persisted is not None:
+                        self.uuid = persisted['uuid']
+                        self.sync_version = max(
+                            int(self.sync_version or 0),
+                            int(persisted['sync_version'] or 0) + 1,
+                        )
                 super().save(*args, **kwargs)
-                from base.services.sync.service import SyncService
-                SyncService.queue_record(self)
+                if queue_local_change:
+                    from base.services.sync.service import SyncService
+                    SyncService.queue_record(self)
         else:
             super().save(*args, **kwargs)
         if publish_cloud_change:
@@ -160,22 +193,28 @@ class SyncMixin(models.Model):
         the same row.  ``synced_at__isnull=True`` also prevents an equal-version
         callback from overwriting a publication that already won the race.
         """
-        from django.utils import timezone
-
         model = type(self)
         pk = self.pk
         sync_version = self.sync_version
+        db_alias = using or self._state.db or 'default'
 
         def publish():
-            published_at = timezone.now()
-            manager = model._base_manager
-            if using:
-                manager = manager.using(using)
-            updated = manager.filter(
-                pk=pk,
-                sync_version=sync_version,
-                synced_at__isnull=True,
-            ).update(synced_at=published_at)
+            from base.services.sync.feed_clock import (
+                allocate_cloud_feed_timestamp,
+            )
+
+            manager = model._base_manager.using(db_alias)
+            # The logical clock advance and model publication are one
+            # transaction. Snapshot allocation therefore observes either both
+            # writes or neither, even when the operating-system clock rolls
+            # backwards.
+            with transaction.atomic(using=db_alias):
+                published_at = allocate_cloud_feed_timestamp(using=db_alias)
+                updated = manager.filter(
+                    pk=pk,
+                    sync_version=sync_version,
+                    synced_at__isnull=True,
+                ).update(synced_at=published_at)
             if (updated and self.pk == pk
                     and self.sync_version == sync_version
                     and self.synced_at is None):
@@ -186,7 +225,7 @@ class SyncMixin(models.Model):
         # into a reported failure that callers may retry as if content rolled
         # back. Robust callbacks are logged by Django and leave synced_at=NULL;
         # the change feed's NULL safety lane will keep serving that version.
-        transaction.on_commit(publish, using=using, robust=True)
+        transaction.on_commit(publish, using=db_alias, robust=True)
 
     @staticmethod
     def _is_sync_on_save():
@@ -213,34 +252,17 @@ class SyncMixin(models.Model):
         # enqueue a soft-delete sync record in the same transaction so peers
         # also remove the record. Without this, hard deletes on one branch
         # never propagate and leave dangling FK references on others.
-        from base.services.sync.config import SyncConfig
         mode = getattr(settings, 'DEPLOYMENT_MODE', 'local')
         using = kwargs.get('using') or self._state.db or 'default'
-        pending_tombstone = None
         # Unlike an ordinary save, a physical deletion cannot be discovered by
-        # the later unsynced-row reconcile sweep. Therefore its tombstone must
-        # be queued whenever local sync is enabled, even when SYNC_ON_SAVE is
-        # deliberately false (the default).
-        if (mode == 'local' and SyncConfig.is_enabled()
-                and not self._sync_local_only and self.pk):
-            try:
-                from base.services.sync.service import SyncService
-                model_name = self.__class__.__name__.lower()
-                tombstone = self.to_sync_dict()
-                tombstone['is_deleted'] = True
-                tombstone['sync_version'] = (self.sync_version or 0) + 1
-                uuid_val = str(self.uuid)
-                pending_tombstone = (SyncService, model_name, uuid_val, tombstone)
-            except Exception:
-                import logging
-                logging.getLogger(__name__).warning(
-                    f"Failed to prepare tombstone for {self.__class__.__name__} pk={self.pk}",
-                    exc_info=True,
-                )
-                # A physical delete without its only durable sync marker would
-                # permanently diverge the peer. Fail closed: leave the source
-                # row intact so the operation can be retried safely.
-                raise
+        # the later unsynced-row reconcile sweep. Therefore a sync-capable local
+        # deployment must persist its tombstone even while transport is
+        # disabled; it will be delivered after sync is enabled again.
+        queue_tombstone = (
+            mode == 'local'
+            and not self._sync_local_only
+            and bool(self.pk)
+        )
 
         # The source row and its durable queue record live in the same database,
         # so they must commit as one unit.  Deferring the enqueue to on_commit
@@ -249,6 +271,50 @@ class SyncMixin(models.Model):
         # safely composes with this transaction: either both writes commit or
         # the deletion rolls back and can be retried.
         with transaction.atomic(using=using):
+            pending_tombstone = None
+            if self.pk:
+                # Hard deletion must serialize against every model's current
+                # row, not only models with natural keys. A caller may hold a
+                # stale Order instance while another request has advanced its
+                # version; queueing the stale identity/version would make the
+                # only delete marker rejectable or attach it to a retired UUID.
+                persisted = (
+                    type(self)._base_manager.using(using)
+                    .select_for_update()
+                    .filter(pk=self.pk)
+                    .values('uuid', 'sync_version')
+                    .first()
+                )
+                if persisted is not None:
+                    self.uuid = persisted['uuid']
+                    self.sync_version = persisted['sync_version']
+            if queue_tombstone:
+                try:
+                    from base.services.sync.service import SyncService
+                    model_name = self.__class__.__name__.lower()
+                    tombstone = self.to_sync_dict()
+                    tombstone['is_deleted'] = True
+                    tombstone['sync_version'] = (
+                        self.sync_version or 0
+                    ) + 1
+                    uuid_val = str(self.uuid)
+                    pending_tombstone = (
+                        SyncService,
+                        model_name,
+                        uuid_val,
+                        tombstone,
+                    )
+                except Exception:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        'Failed to prepare tombstone for %s pk=%s',
+                        self.__class__.__name__,
+                        self.pk,
+                        exc_info=True,
+                    )
+                    # A physical delete without its only durable sync marker
+                    # would permanently diverge the peer. Fail closed.
+                    raise
             result = super().delete(*args, **kwargs)
             if pending_tombstone is not None:
                 service, model_name, uuid_val, tombstone = pending_tombstone
@@ -360,7 +426,23 @@ class SyncMixin(models.Model):
             if value in (None, ''):
                 return None
             lookup[k] = value
-        return cls.objects.filter(**lookup).first()
+        queryset = cls.objects
+        from django.db import transaction
+        if transaction.get_connection().in_atomic_block:
+            # Natural-key reconciliation can replace the transport UUID. Lock
+            # that identity exactly as the ordinary UUID path does so a writer
+            # cannot publish one more generation under the retired UUID while
+            # the pull is rebasing it.
+            queryset = queryset.select_for_update()
+        # A soft-deleted row is immutable history, not an identity slot which
+        # an unrelated incoming UUID may adopt or resurrect. Partial unique
+        # constraints on live natural keys allow the new identity to coexist
+        # with that history. Explicit ordering keeps reconciliation
+        # deterministic even in a legacy database containing duplicate lives.
+        return queryset.filter(
+            is_deleted=False,
+            **lookup,
+        ).order_by('pk').first()
 
     @classmethod
     def _effective_denylist(cls, mode=None):
@@ -753,7 +835,12 @@ class SyncMixin(models.Model):
             if not should:
                 return instance, 'skipped'
             # A locally-tombstoned row is terminal — never resurrect it.
-            if instance.is_deleted and not is_deleted:
+            cloud_owned_pull = (
+                getattr(settings, 'DEPLOYMENT_MODE', 'local') == 'local'
+                and getattr(cls, 'SYNC_PULL_SCOPE', 'branch') == 'global'
+                and is_authoritative_cloud_pull()
+            )
+            if instance.is_deleted and not is_deleted and not cloud_owned_pull:
                 return instance, 'skipped'
             update_values = cls._strip_sync_denied(data, creating=False)
             update_values = cls._strip_sync_branch_rewrites(
@@ -802,6 +889,29 @@ class SyncMixin(models.Model):
             )
             if natural is not None:
                 instance = natural
+                rebase_pending_local = False
+                if (
+                    getattr(settings, 'DEPLOYMENT_MODE', 'local') == 'local'
+                    and getattr(cls, 'SYNC_PULL_SCOPE', 'branch') == 'branch'
+                    and not is_deleted
+                ):
+                    # Natural-key convergence changes the transport identity
+                    # (local UUID A -> cloud UUID B). If A still represents an
+                    # unsent local generation, preserve the locally-owned
+                    # merged fields as a new B generation instead of stamping
+                    # them synced and stranding the queue row under A.
+                    rebase_pending_local = instance.synced_at is None
+                    if not rebase_pending_local:
+                        try:
+                            queue_model = apps.get_model(
+                                'base', 'SyncQueueRecord',
+                            )
+                            rebase_pending_local = queue_model.objects.filter(
+                                model_name=cls.__name__.lower(),
+                                record_uuid=instance.uuid,
+                            ).exists()
+                        except Exception:  # noqa: BLE001 - NULL is the backstop
+                            rebase_pending_local = False
                 instance.uuid = uuid_val
                 # Reconcile onto an existing row → an UPDATE: protect denied
                 # fields just like the version-matched update branch.
@@ -824,12 +934,19 @@ class SyncMixin(models.Model):
                 instance.sync_version = sync_version
                 if 'is_deleted' not in settled_frozen:
                     instance.is_deleted = is_deleted
-                instance.synced_at = timezone.now()
                 instance.branch_id = incoming_branch or instance.branch_id or ''
-                instance.save(_syncing=True)
-                cls._restore_sync_automatic_values(
-                    instance, automatic_values, creating=False,
-                )
+                if rebase_pending_local:
+                    instance.synced_at = None
+                    # Publish the locally-owned merge under the canonical UUID.
+                    # SyncMixin increments incoming_version and durably queues
+                    # the replacement in the same transaction.
+                    instance.save()
+                else:
+                    instance.synced_at = timezone.now()
+                    instance.save(_syncing=True)
+                    cls._restore_sync_automatic_values(
+                        instance, automatic_values, creating=False,
+                    )
                 return instance, 'updated'
 
             instance = cls(
@@ -852,6 +969,20 @@ class SyncMixin(models.Model):
 
     @classmethod
     def _should_replace(cls, instance, incoming_version, incoming_data, incoming_branch):
+        mode = getattr(settings, 'DEPLOYMENT_MODE', 'local')
+        if (
+            mode == 'local'
+            and getattr(cls, 'SYNC_PULL_SCOPE', 'branch') == 'global'
+            and is_authoritative_cloud_pull()
+        ):
+            # Global identities/catalog/configuration are authored exclusively
+            # by the cloud. A terminal can nevertheless have a numerically
+            # larger legacy version after old builds treated local runtime
+            # activity (for example User.last_login_at) as a replicated edit.
+            # Ownership must outrank that polluted branch counter or genuine
+            # cloud renames/password/status changes remain stale forever.
+            return True
+
         # Higher sync_version always wins — that's normal forward progress and
         # must apply regardless of where the record came from.
         if incoming_version > instance.sync_version:
@@ -865,17 +996,10 @@ class SyncMixin(models.Model):
         # locally (e.g. last_login_at on login) would REJECT an authoritative
         # cloud change to that same record (a password reset, a price edit) on a
         # version tie. Deterministic; no dependence on cross-machine clock skew.
-        mode = getattr(settings, 'DEPLOYMENT_MODE', 'local')
         if mode == 'cloud':
             # The hub accepts the branch push (branches own their transactional
             # data). Cloud-owned fields are still protected by the direction-aware
             # SYNC_DENY_FROM_BRANCH denylist, so this can't rewrite credentials.
-            return True
-        if getattr(cls, 'SYNC_PULL_SCOPE', 'branch') == 'global':
-            # Global catalog/configuration is cloud-owned. A local edit may
-            # independently reach the same version, but it is never allowed to
-            # win the tie and make an authoritative cloud menu/price/user update
-            # disappear. Branch pushes for these models are refused by the hub.
             return True
         # On a branch: keep our row ONLY when it's THIS branch's OWN record
         # (orders, drawer, the till's transactions) — that's the "local
@@ -986,6 +1110,22 @@ class User(SyncMixin, models.Model):
         ]
 
     objects = SyncManager()
+
+    def to_sync_dict(self):
+        data = super().to_sync_dict()
+        # Authentication telemetry describes activity on this node. Replicating
+        # it previously turned every login into identity conflict noise and let
+        # a cloud pull erase the terminal's own recent-login evidence.
+        data.pop('last_login_at', None)
+        data.pop('last_login_api', None)
+        return data
+
+    @classmethod
+    def from_sync_dict(cls, data, branch_id=None):
+        values = data.copy()
+        values.pop('last_login_at', None)
+        values.pop('last_login_api', None)
+        return super().from_sync_dict(values, branch_id=branch_id)
 
     def __str__(self):
         return f"{self.first_name} {self.last_name}"
@@ -2298,10 +2438,11 @@ class Shift(SyncMixin, models.Model):
     cash_collected = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     notes = models.TextField(blank=True, default='')
     # Stable install identity for CASHIER shifts opened by an upgraded till.
-    # Non-cashier and pre-upgrade shifts deliberately keep this blank so a
-    # manager/waiter can work on the same till and rolling upgrades remain
-    # compatible. The conditional unique constraint below makes the non-empty
-    # value the exclusive live cashier slot for that physical device.
+    # Non-cashier and cloud shifts deliberately keep this blank so a
+    # manager/waiter can work on the same till. Pre-upgrade blank cashier shifts
+    # may still close, but upgraded settlement code rejects them for new money
+    # writes. The conditional unique constraint below makes the non-empty value
+    # the exclusive live cashier slot for that physical device.
     device_id = models.CharField(max_length=128, blank=True, default='')
     # Rollout eligibility for the reconciliation->SAFE lifecycle. Migration
     # 0048 leaves every already-ended historical shift false because its money

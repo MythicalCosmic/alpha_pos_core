@@ -1,8 +1,26 @@
 from functools import wraps
 from django.apps import apps
 from django.http import JsonResponse
-from base.helpers.request import get_session_key, get_user_agent
+from base.helpers.request import (
+    SESSION_CREDENTIAL_CONFLICT_CODE,
+    SESSION_CREDENTIAL_CONFLICT_MESSAGE,
+    SessionCredentialConflict,
+    get_user_agent,
+    resolve_session_credential,
+)
 from base.repositories import SessionRepository
+
+
+def session_credential_conflict_response():
+    """Stable, token-free response for ambiguous session credentials."""
+    return JsonResponse(
+        {
+            "success": False,
+            "message": SESSION_CREDENTIAL_CONFLICT_MESSAGE,
+            "code": SESSION_CREDENTIAL_CONFLICT_CODE,
+        },
+        status=401,
+    )
 
 
 def is_courier_identity(user):
@@ -44,7 +62,10 @@ def _ua_matches(session, request) -> bool:
 def login_required(view_func):
     @wraps(view_func)
     def wrapper(request, *args, **kwargs):
-        session_key = get_session_key(request)
+        try:
+            session_key, credential_source = resolve_session_credential(request)
+        except SessionCredentialConflict:
+            return session_credential_conflict_response()
         if not session_key:
             return JsonResponse(
                 {"success": False, "message": "Authentication required"},
@@ -92,6 +113,7 @@ def login_required(view_func):
             )
         request.user = session.user_id
         request.session_key = session_key
+        request.session_credential_source = credential_source
         return view_func(request, *args, **kwargs)
     return wrapper
 

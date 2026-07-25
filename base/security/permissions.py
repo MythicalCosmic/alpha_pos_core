@@ -1,8 +1,15 @@
 from functools import wraps
 from django.http import JsonResponse
-from base.helpers.request import get_session_key
+from base.helpers.request import (
+    SessionCredentialConflict,
+    resolve_session_credential,
+)
 from base.repositories import SessionRepository
-from base.security.auth import _ua_matches, is_courier_identity
+from base.security.auth import (
+    _ua_matches,
+    is_courier_identity,
+    session_credential_conflict_response,
+)
 
 
 def _session_role_required(allowed_roles, denied_message):
@@ -17,7 +24,10 @@ def _session_role_required(allowed_roles, denied_message):
     def decorator(view_func):
         @wraps(view_func)
         def wrapper(request, *args, **kwargs):
-            session_key = get_session_key(request)
+            try:
+                session_key, credential_source = resolve_session_credential(request)
+            except SessionCredentialConflict:
+                return session_credential_conflict_response()
             if not session_key:
                 return JsonResponse(
                     {"success": False, "message": "Authentication required"},
@@ -66,6 +76,7 @@ def _session_role_required(allowed_roles, denied_message):
                 )
             request.user = session.user_id
             request.session_key = session_key
+            request.session_credential_source = credential_source
             return view_func(request, *args, **kwargs)
         return wrapper
     return decorator

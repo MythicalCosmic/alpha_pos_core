@@ -127,6 +127,39 @@ class SyncQueue:
         return dict(grouped)
 
     @classmethod
+    def get_snapshots(cls, model_name, uuids, *, lock=False):
+        """Return immutable-generation snapshots for selected queue slots.
+
+        Callers which perform cleanup after other database work must not delete
+        by UUID alone: a concurrent save may replace that slot with a newer
+        generation while the work is in flight.  Feeding these snapshots to
+        :meth:`acknowledge` removes only the generations observed here.
+        """
+        from base.models import SyncQueueRecord
+
+        coerced = []
+        for value in uuids:
+            try:
+                coerced.append(_coerce_uuid(value))
+            except (ValueError, TypeError):
+                continue
+        if not coerced:
+            return []
+        queryset = SyncQueueRecord.objects.filter(
+            model_name=model_name,
+            record_uuid__in=coerced,
+        )
+        if lock:
+            # Callers use this only inside the same transaction which applies
+            # the corresponding model row. A concurrent queue upsert then
+            # cannot rotate the observed generation before exact ACK cleanup.
+            queryset = queryset.select_for_update()
+        return [
+            cls._to_dict(row)
+            for row in queryset.iterator()
+        ]
+
+    @classmethod
     def dead_letter_count(cls):
         from base.models import SyncQueueRecord
         from base.services.sync.config import get_sync_max_queue_attempts

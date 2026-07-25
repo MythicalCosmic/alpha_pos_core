@@ -19,7 +19,6 @@ import time
 
 from django.conf import settings
 from django.core.cache import cache
-from django.db.models import Q
 
 logger = logging.getLogger('base.presence')
 
@@ -118,12 +117,10 @@ def resolve_active_cashier(branch_id=None):
             shift_qs = shift_qs.filter(branch_id=effective_branch)
         entry_device = str(entry.get('device_id') or '').strip()
         if entry_device:
-            # A bound shift belongs only to its owning install. Blank is the
-            # rolling-upgrade lane for shifts opened before device ownership
-            # existed; it preserves the old presence behavior until they end.
-            shift_qs = shift_qs.filter(
-                Q(device_id=entry_device) | Q(device_id=''),
-            )
+            # A connected upgraded till may advertise only its exact owned
+            # shift. Legacy blank-device rows can close, but they are no longer
+            # dispatch/checkout authorization evidence.
+            shift_qs = shift_qs.filter(device_id=entry_device)
         if cashier_ref and not str(cashier_ref).isdigit():
             try:
                 import uuid
@@ -161,11 +158,9 @@ def device_presence_headers():
         if local_branch:
             shifts = shifts.filter(branch_id=local_branch)
         ordered = shifts.select_related('user').order_by('-start_time')
-        # Prefer the cashier shift explicitly owned by this install. Fall back
-        # only to a blank legacy shift; never advertise another device's shift.
+        # Advertise only the cashier shift explicitly owned by this install.
+        # A blank legacy row is deliberately not an authorization fallback.
         shift = ordered.filter(device_id=device_id).first()
-        if shift is None:
-            shift = ordered.filter(device_id='').first()
         if shift:
             headers['X-Active-Cashier'] = str(shift.user.uuid)
     except Exception:  # noqa: BLE001 — never break a sync over presence

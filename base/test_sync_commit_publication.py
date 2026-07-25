@@ -216,3 +216,61 @@ def test_null_rows_are_promoted_in_bounded_slices_on_successive_pulls(
     # ties may make the response replay the prior slice too, but never promote
     # the unbounded remainder in one request.
     assert Category.objects.filter(synced_at__isnull=True).count() == 3
+
+
+def test_failed_null_promotion_makes_response_cursor_non_publishable(
+    settings, monkeypatch,
+):
+    """A fallback-only response must not skip an omitted timestamped row."""
+    from base.models import Category
+
+    snapshot = timezone.now().replace(microsecond=0)
+    since = snapshot - timedelta(hours=1)
+    timed = Category.objects.bulk_create([
+        Category(
+            name='Timestamped row must replay',
+            slug='timestamped-row-must-replay',
+            branch_id='cloud',
+            synced_at=snapshot - timedelta(minutes=5),
+        ),
+    ])[0]
+    crash_safe = Category.objects.bulk_create([
+        Category(
+            name='NULL publication fallback',
+            slug='null-publication-fallback',
+            branch_id='cloud',
+            synced_at=None,
+        ),
+    ])[0]
+
+    original_update = QuerySet.update
+
+    def fail_category_promotion(queryset, **kwargs):
+        if (
+            queryset.model is Category
+            and kwargs.get('synced_at') == snapshot
+        ):
+            raise RuntimeError('injected bounded promotion failure')
+        return original_update(queryset, **kwargs)
+
+    monkeypatch.setattr(timezone, 'now', lambda: snapshot)
+    monkeypatch.setattr(QuerySet, 'update', fail_category_promotion)
+
+    body = _changes(
+        settings,
+        branch_id='branch-a',
+        since=since,
+        per_page=1,
+    )
+    returned = {
+        row['uuid']
+        for rows in body['data'].values()
+        for row in rows
+    }
+
+    assert str(crash_safe.uuid) in returned
+    assert str(timed.uuid) not in returned
+    assert body['has_more'] is True
+    assert body['next_since'] == since.isoformat()
+    assert body['server_timestamp'] == since.isoformat()
+    assert body['cursor_publishable'] is False

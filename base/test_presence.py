@@ -21,7 +21,7 @@ def _cashier(email):
                                role='CASHIER', status='ACTIVE', password='!')
 
 
-def _shift(user, branch_id='branch-1', status='ACTIVE', device_id=''):
+def _shift(user, branch_id='branch-1', status='ACTIVE', device_id='dev-A'):
     from base.models import Shift
     return Shift.objects.create(user=user, start_time=timezone.now(), status=status,
                                 branch_id=branch_id, device_id=device_id)
@@ -67,9 +67,9 @@ class TestPresence:
 
     def test_resolve_prefers_most_recent_device(self):
         u1 = _cashier('r5a@x.local')
-        _shift(u1)
+        _shift(u1, device_id='dev-OLD')
         u2 = _cashier('r5b@x.local')
-        _shift(u2)
+        _shift(u2, device_id='dev-NEW')
         presence.mark_device_live('dev-OLD', 'branch-1', u1.id)
         presence.mark_device_live('dev-NEW', 'branch-1', u2.id)   # marked later -> newer ts
         res = presence.resolve_active_cashier()
@@ -77,7 +77,7 @@ class TestPresence:
 
     def test_resolve_stable_cashier_uuid_instead_of_foreign_local_pk(self):
         u = _cashier('uuid-ref@x.local')
-        _shift(u)
+        _shift(u, device_id='dev-UUID')
         presence.mark_device_live('dev-UUID', 'branch-1', str(u.uuid))
 
         res = presence.resolve_active_cashier()
@@ -94,8 +94,15 @@ class TestPresence:
 
     def test_blank_legacy_device_branch_still_obeys_requested_branch(self):
         u = _cashier('blank-entry-branch@x.local')
-        _shift(u, branch_id='branch-2')
+        _shift(u, branch_id='branch-2', device_id='')
         presence.mark_device_live('dev-LEGACY', '', str(u.uuid))
+
+        assert presence.resolve_active_cashier(branch_id='branch-1') is None
+
+    def test_blank_legacy_shift_is_not_connected_checkout_evidence(self):
+        u = _cashier('blank-legacy@x.local')
+        _shift(u, device_id='')
+        presence.mark_device_live('dev-A', 'branch-1', str(u.uuid))
 
         assert presence.resolve_active_cashier(branch_id='branch-1') is None
 
@@ -117,7 +124,7 @@ class TestPresenceHeaders:
         settings.DEVICE_ID = 'dev-Z'
         settings.BRANCH_ID = 'branch-1'
         u = _cashier('h1@x.local')
-        _shift(u)
+        _shift(u, device_id='dev-Z')
         headers = presence.device_presence_headers()
         assert headers['X-Device-Id'] == 'dev-Z'
         assert headers['X-Active-Cashier'] == str(u.uuid)
@@ -127,12 +134,22 @@ class TestPresenceHeaders:
         settings.BRANCH_ID = 'branch-1'
         own = _cashier('own-branch@x.local')
         other = _cashier('other-branch@x.local')
-        _shift(own, branch_id='branch-1')
-        _shift(other, branch_id='branch-2')
+        _shift(own, branch_id='branch-1', device_id='dev-Z')
+        _shift(other, branch_id='branch-2', device_id='dev-Y')
 
         headers = presence.device_presence_headers()
 
         assert headers['X-Active-Cashier'] == str(own.uuid)
+
+    def test_header_does_not_advertise_blank_legacy_shift(self, settings):
+        settings.DEVICE_ID = 'dev-Z'
+        settings.BRANCH_ID = 'branch-1'
+        legacy = _cashier('legacy-header@x.local')
+        _shift(legacy, device_id='')
+
+        headers = presence.device_presence_headers()
+
+        assert headers == {'X-Device-Id': 'dev-Z'}
 
     def test_header_uses_owned_cashier_and_ignores_non_cashier_shift(self, settings):
         from base.models import Shift, User

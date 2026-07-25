@@ -103,6 +103,10 @@ MIDDLEWARE = [
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
+    # A custom session cookie and Bearer token may coexist in browser/Electron
+    # requests. Refuse ambiguous credentials and require an explicit logout
+    # before /auth-login changes the browser to a different custom User.
+    'base.middlewares.login_transition_guard.LoginTransitionGuardMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
     'base.middlewares.force_json_middleware.JSONOnlyMiddleware'

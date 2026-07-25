@@ -127,6 +127,81 @@ def test_non_cashier_shift_does_not_consume_cashier_device_slot():
     assert Shift.objects.get(user=cashier).device_id == 'device-a'
 
 
+@override_settings(
+    DEPLOYMENT_MODE='local', BRANCH_ID='branch-a', DEVICE_ID='',
+)
+def test_cashier_start_fails_closed_without_installation_identity():
+    from base.models import Shift
+    from base.services.shift_device import TERMINAL_DEVICE_ID_MISSING
+    from core.shifts.service import ShiftService
+
+    cashier = _staff(branch='branch-a')
+
+    result, status = ShiftService.start_shift(cashier.id, actor=cashier)
+
+    assert status == 400, result
+    assert result['message'] == TERMINAL_DEVICE_ID_MISSING
+    assert not Shift.objects.filter(user=cashier).exists()
+
+
+@pytest.mark.parametrize('legacy_device', ['', 'device-b'])
+@override_settings(
+    DEPLOYMENT_MODE='local', BRANCH_ID='branch-a', DEVICE_ID='device-a',
+)
+def test_cashier_start_cannot_resume_blank_or_other_installation_shift(
+    legacy_device,
+):
+    from base.models import Shift
+    from base.services.shift_device import CASHIER_SHIFT_NOT_BOUND_TO_TERMINAL
+    from core.shifts.service import ShiftService
+
+    cashier = _staff(branch='branch-a')
+    legacy = Shift.objects.create(
+        user=cashier,
+        status=Shift.Status.ACTIVE,
+        start_time=timezone.now(),
+        branch_id='branch-a',
+        device_id=legacy_device,
+    )
+
+    result, status = ShiftService.start_shift(cashier.id, actor=cashier)
+
+    assert status == 400, result
+    assert result['message'] == CASHIER_SHIFT_NOT_BOUND_TO_TERMINAL
+    legacy.refresh_from_db()
+    assert legacy.status == Shift.Status.ACTIVE
+    assert legacy.end_time is None
+
+
+@pytest.mark.parametrize('legacy_device', ['', 'device-b'])
+@override_settings(
+    DEPLOYMENT_MODE='local', BRANCH_ID='branch-a', DEVICE_ID='device-a',
+)
+def test_cashier_can_close_legacy_or_other_installation_shift(
+    legacy_device,
+):
+    from base.models import Shift
+    from core.shifts.service import ShiftService
+
+    cashier = _staff(branch='branch-a')
+    legacy = Shift.objects.create(
+        user=cashier,
+        status=Shift.Status.ACTIVE,
+        start_time=timezone.now() - timedelta(hours=1),
+        branch_id='branch-a',
+        device_id=legacy_device,
+    )
+
+    result, status = ShiftService.end_shift(
+        legacy.id, cashier.id, notes='upgrade handoff', actor=cashier,
+    )
+
+    assert status == 200, result
+    legacy.refresh_from_db()
+    assert legacy.status == Shift.Status.ENDED
+    assert legacy.end_time is not None
+
+
 def test_database_device_constraint_and_blank_legacy_lane():
     from base.models import Shift
 

@@ -10,7 +10,7 @@ from django.utils import timezone
 pytestmark = pytest.mark.django_db
 
 
-def _cashier_and_shift(*, branch='branch-a'):
+def _cashier_and_shift(*, branch='branch-a', device_id=''):
     from base.models import Shift, User
 
     cashier = User.objects.create(
@@ -27,6 +27,7 @@ def _cashier_and_shift(*, branch='branch-a'):
         start_time=timezone.now() - timedelta(hours=1),
         status=Shift.Status.ACTIVE,
         branch_id=branch,
+        device_id=device_id,
     )
     return cashier, shift
 
@@ -54,7 +55,9 @@ def _paid_cash_order(cashier, *, amount='100.00', branch='branch-a'):
     return order
 
 
-@override_settings(DEPLOYMENT_MODE='local', BRANCH_ID='branch-a')
+@override_settings(
+    DEPLOYMENT_MODE='local', BRANCH_ID='branch-a', DEVICE_ID='test-device',
+)
 def test_local_cash_refund_cannot_make_register_negative():
     from base.models import CashRegister, OrderRefund
     from base.services.order_refund import (
@@ -62,7 +65,7 @@ def test_local_cash_refund_cannot_make_register_negative():
         record_paid_order_refund,
     )
 
-    cashier, _shift = _cashier_and_shift()
+    cashier, _shift = _cashier_and_shift(device_id='test-device')
     order = _paid_cash_order(cashier)
     register = CashRegister.objects.get(
         branch_id='branch-a', is_deleted=False,
@@ -223,7 +226,9 @@ def test_remote_cash_command_stays_deferred_when_drawer_is_short():
     assert register.remote_cash_out_applied_total == Decimal('30.00')
 
 
-@override_settings(DEPLOYMENT_MODE='local', BRANCH_ID='branch-a')
+@override_settings(
+    DEPLOYMENT_MODE='local', BRANCH_ID='branch-a', DEVICE_ID='test-device',
+)
 def test_active_shift_branch_ownership_is_fail_closed():
     from base.models import Shift, User
     from base.services.order_refund import (
@@ -231,7 +236,7 @@ def test_active_shift_branch_ownership_is_fail_closed():
         lock_active_cashier_shift,
     )
 
-    cashier, shift = _cashier_and_shift()
+    cashier, shift = _cashier_and_shift(device_id='test-device')
     # QuerySet.update deliberately bypasses SyncMixin's default branch fill so
     # this reproduces a damaged/legacy ownership record.
     User.objects.filter(pk=cashier.pk).update(branch_id='')

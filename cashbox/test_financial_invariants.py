@@ -10,6 +10,11 @@ from django.utils import timezone
 pytestmark = pytest.mark.django_db
 
 
+@pytest.fixture(autouse=True)
+def _upgraded_terminal(settings):
+    settings.DEVICE_ID = 'test-device'
+
+
 def _user(email=None, *, branch='main', role='CASHIER'):
     from base.models import User
 
@@ -34,6 +39,7 @@ def _shift(user, *, status='ACTIVE', start=None, end=None, branch='main',
         start_time=start or timezone.now() - timedelta(hours=1),
         end_time=end,
         branch_id=branch,
+        device_id='test-device' if user.role == 'CASHIER' else '',
         treasury_settlement_eligible=treasury_eligible,
     )
 
@@ -574,7 +580,9 @@ def test_end_shift_settlement_rows_inherit_shift_branch():
     assert set(rows.values_list('branch_id', flat=True)) == {'branch-a'}
 
 
-@override_settings(DEPLOYMENT_MODE='local', BRANCH_ID='main')
+@override_settings(
+    DEPLOYMENT_MODE='local', BRANCH_ID='main', DEVICE_ID='test-device',
+)
 def test_updated_start_shift_explicitly_opts_into_safe_settlement():
     from base.models import Shift
     from core.shifts.service import ShiftService

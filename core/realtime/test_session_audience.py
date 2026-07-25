@@ -69,3 +69,27 @@ def test_realtime_rejects_and_revokes_expired_session():
     assert consumer._session_user() is None
     assert not Session.objects.filter(pk=session.pk).exists()
     assert SessionRepository.get_by_session_key(raw) is None
+
+
+def test_realtime_handshake_rejects_split_browser_identity():
+    consumer = OrderQueueConsumer()
+    consumer.scope = {
+        'query_string': f'token={secrets.token_hex(32)}'.encode(),
+        'headers': [
+            (b'authorization', f'Bearer {secrets.token_hex(32)}'.encode()),
+        ],
+    }
+    assert consumer._handshake_token() is None
+
+
+def test_realtime_handshake_accepts_matching_query_header_and_cookie():
+    raw = secrets.token_hex(32)
+    consumer = OrderQueueConsumer()
+    consumer.scope = {
+        'query_string': f'token={raw}'.encode(),
+        'headers': [
+            (b'authorization', f'bEaReR {raw}'.encode()),
+            (b'cookie', f'other=x; session_key={raw}'.encode()),
+        ],
+    }
+    assert consumer._handshake_token() == raw

@@ -37,25 +37,113 @@ class TestSyncConflictTiebreaker:
         local.refresh_from_db()
         assert local.first_name == 'New'
 
-    def test_lower_version_does_not_overwrite(self):
-        from base.models import User
+    @override_settings(DEPLOYMENT_MODE='local', BRANCH_ID='branch1')
+    def test_lower_version_does_not_overwrite_branch_owned_record(self):
+        from base.models import Customer
 
-        local = User.objects.create(
-            first_name='Local', last_name='Name', email='u@test.local',
-            password='hashed', role='USER', sync_version=5,
+        local = Customer.objects.create(
+            name='Local', sync_version=5, branch_id='branch1',
         )
-        User.from_sync_dict({
+        Customer.from_sync_dict({
             'uuid': str(local.uuid),
             'sync_version': 3,
             'is_deleted': False,
-            'first_name': 'Old',
-            'last_name': 'Name',
-            'email': 'u@test.local',
-            'password': 'hashed',
-            'role': 'USER',
-        })
+            'name': 'Old cloud echo',
+            'branch_id': 'branch1',
+        }, branch_id='branch1')
         local.refresh_from_db()
-        assert local.first_name == 'Local', 'older version must not overwrite'
+        assert local.name == 'Local', 'older branch echo must not overwrite'
+
+    @override_settings(DEPLOYMENT_MODE='local', BRANCH_ID='branch1')
+    def test_cloud_owned_user_repairs_polluted_higher_local_version(self):
+        """Cloud ownership outranks a terminal's legacy login-inflated counter."""
+        from base.models import User
+        from base.services.sync.service import SyncService
+
+        local = User.objects.create(
+            first_name='Stale', last_name='Label', email='u@test.local',
+            password='stale-hash', role='CASHIER', status='ACTIVE',
+            sync_version=165, branch_id='cloud',
+        )
+        result = SyncService._apply_records(User, [{
+            'uuid': str(local.uuid),
+            'sync_version': 3,
+            'is_deleted': False,
+            'first_name': 'Authoritative',
+            'last_name': 'Cloud',
+            'email': 'u@test.local',
+            'password': 'cloud-hash',
+            'role': 'CASHIER',
+            'status': 'ACTIVE',
+            'permissions': [],
+            'branch_id': 'cloud',
+        }], source_branch='cloud', authoritative_cloud=True)
+
+        assert result['updated'] == 1
+        local.refresh_from_db()
+        assert local.first_name == 'Authoritative'
+        assert local.last_name == 'Cloud'
+        assert local.password == 'cloud-hash'
+        assert local.sync_version == 3
+
+    @override_settings(DEPLOYMENT_MODE='local', BRANCH_ID='branch1')
+    def test_cloud_owned_user_repairs_accidental_local_tombstone(self):
+        from base.models import User
+        from base.services.sync.service import SyncService
+
+        local = User.objects.create(
+            first_name='Stale', last_name='Deleted', email='u@test.local',
+            password='stale-hash', role='CASHIER', status='ACTIVE',
+            sync_version=20, branch_id='cloud', is_deleted=True,
+        )
+        result = SyncService._apply_records(User, [{
+            'uuid': str(local.uuid),
+            'sync_version': 4,
+            'is_deleted': False,
+            'first_name': 'Live',
+            'last_name': 'Cloud',
+            'email': 'u@test.local',
+            'password': 'cloud-hash',
+            'role': 'CASHIER',
+            'status': 'ACTIVE',
+            'permissions': [],
+            'branch_id': 'cloud',
+        }], source_branch='cloud', authoritative_cloud=True)
+
+        local.refresh_from_db()
+        assert result['updated'] == 1
+        assert local.is_deleted is False
+        assert local.first_name == 'Live'
+
+    @override_settings(DEPLOYMENT_MODE='local', BRANCH_ID='branch1')
+    def test_direct_global_payload_has_no_implicit_cloud_authority(self):
+        """Only authenticated pull plumbing may override a newer local row."""
+        from base.models import User
+
+        local = User.objects.create(
+            first_name='Newer', last_name='Local', email='u@test.local',
+            password='local-hash', role='CASHIER', status='ACTIVE',
+            sync_version=20, branch_id='cloud',
+        )
+        _, action = User.from_sync_dict({
+            'uuid': str(local.uuid),
+            'sync_version': 4,
+            'is_deleted': False,
+            'first_name': 'Untrusted',
+            'last_name': 'Payload',
+            'email': 'u@test.local',
+            'password': 'payload-hash',
+            'role': 'CASHIER',
+            'status': 'ACTIVE',
+            'permissions': [],
+            'branch_id': 'cloud',
+        }, branch_id='cloud')
+
+        local.refresh_from_db()
+        assert action == 'skipped'
+        assert local.first_name == 'Newer'
+        assert local.password == 'local-hash'
+        assert local.sync_version == 20
 
     @override_settings(BRANCH_ID='branch1')
     def test_tie_branch_keeps_its_own_record(self):
@@ -152,6 +240,33 @@ class TestUserCredentialSync:
         assert local.password == 'new-hash'
         assert local.permissions == ['stock.view']
 
+    def test_login_telemetry_is_node_local(self):
+        from base.models import User
+
+        local_login = timezone.now()
+        local = User.objects.create(
+            first_name='Local', last_name='Name', email='u@test.local',
+            password='old-hash', role='USER', sync_version=2,
+            last_login_at=local_login, last_login_api='127.0.0.1',
+        )
+        payload = local.to_sync_dict()
+        assert 'last_login_at' not in payload
+        assert 'last_login_api' not in payload
+
+        User.from_sync_dict({
+            **payload,
+            'sync_version': 3,
+            'first_name': 'Cloud',
+            'last_login_at': (
+                local_login - timedelta(days=30)
+            ).isoformat(),
+            'last_login_api': '203.0.113.40',
+        })
+        local.refresh_from_db()
+        assert local.first_name == 'Cloud'
+        assert local.last_login_at == local_login
+        assert local.last_login_api == '127.0.0.1'
+
     def test_pull_reconciles_email_collision_instead_of_dropping(self):
         # A server-created user whose email matches an existing local row (e.g.
         # a bootstrap admin) must reconcile onto that row, not raise an
@@ -160,7 +275,7 @@ class TestUserCredentialSync:
         from base.models import User
         import uuid as uuid_module
 
-        local = User.objects.create(
+        User.objects.create(
             first_name='Boot', last_name='Admin', email='admin@test.local',
             password='boot-hash', role='ADMIN', sync_version=1,
         )
@@ -248,7 +363,6 @@ class TestDurableSyncQueue:
 
     def test_count_distinguishes_failed(self):
         from base.services.sync.queue import SyncQueue
-        from base.models import SyncQueueRecord
         import uuid as uuid_module
 
         u1, u2 = uuid_module.uuid4(), uuid_module.uuid4()

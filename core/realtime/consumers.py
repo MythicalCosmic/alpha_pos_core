@@ -10,11 +10,12 @@ session token on the handshake — otherwise these sockets would stream live ord
 data to any anonymous internet client. The licensing kill-switch is enforced here
 too, because HTTP middleware does not run for the 'websocket' protocol.
 """
-from urllib.parse import parse_qs
-
 from asgiref.sync import async_to_sync
 from channels.generic.websocket import JsonWebsocketConsumer
 from django.conf import settings
+
+from base.helpers.request import SessionCredentialConflict
+from base.helpers.websocket import resolve_websocket_session_credential
 
 # Group names. Single-branch (one till) for now; multi-branch can suffix BRANCH_ID.
 ORDERS_GROUP = 'orders'
@@ -111,13 +112,11 @@ class _GroupConsumer(JsonWebsocketConsumer):
         return session.user_id
 
     def _handshake_token(self):
-        qs = parse_qs((self.scope.get('query_string') or b'').decode('utf-8', 'ignore'))
-        if qs.get('token'):
-            return qs['token'][0]
-        for key, val in (self.scope.get('headers') or []):
-            if key == b'authorization' and val.startswith(b'Bearer '):
-                return val[7:].decode('utf-8', 'ignore')
-        return None
+        try:
+            token, _source = resolve_websocket_session_credential(self.scope)
+        except SessionCredentialConflict:
+            return None
+        return token
 
 
 class OrderQueueConsumer(_GroupConsumer):

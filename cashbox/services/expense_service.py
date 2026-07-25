@@ -85,6 +85,14 @@ class CashboxExpenseService:
             return auth_error
         if shift.status != Shift.Status.ACTIVE:
             return ServiceResponse.error('Can only record expenses on an active shift')
+        # Preserve explicit manager/admin intervention, but require a cashier
+        # acting on their own drawer to own this exact installation's shift.
+        # This matches checkout/refund authorization and blocks an old blank or
+        # foreign-device ACTIVE shift from moving drawer money.
+        from base.services.shift_device import cashier_shift_device_error
+        device_error = cashier_shift_device_error(actor, shift)
+        if device_error:
+            return ServiceResponse.error(device_error)
 
         raw_amount = amount
         amt = _to_dec(raw_amount)

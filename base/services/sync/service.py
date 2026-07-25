@@ -11,6 +11,7 @@ from base.services.sync.config import (
 from base.services.sync.queue import SyncQueue
 from base.services.sync.transport import check_health, send_batch, fetch_changes
 from base.services.sync.status import SyncStatus
+from base.services.sync.context import authoritative_cloud_pull
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +46,10 @@ class SyncService:
     @classmethod
     def queue_tombstone(cls, model_name, uuid_val, payload):
         # Push a delete-marker payload for a record that has been hard-deleted
-        # locally, so the peer applies the same deletion semantics.
-        if not SyncConfig.is_enabled():
-            return
+        # locally, so the peer applies the same deletion semantics. Unlike an
+        # ordinary unsynced source row, this is the only surviving evidence of
+        # the deletion, so it must remain durable even while transport is
+        # disabled and wait for a later enable.
         SyncQueue.add(model_name, uuid_val, payload)
 
     @classmethod
@@ -419,6 +421,7 @@ class SyncService:
         # Must happen after migrations and before reading the old cursor. It is
         # idempotent and local-only; cloud aggregate state is never cleared.
         SyncStatus.ensure_scope_epoch()
+        SyncStatus.ensure_pull_contract_epoch()
 
         pull_token = cls._acquire_lock('pull')
         if not pull_token:
@@ -431,7 +434,7 @@ class SyncService:
 
             SyncStatus.set_online(True)
 
-            cursor = SyncStatus.get_cursor()
+            cursor, pull_generation = SyncStatus.get_pull_checkpoint()
             persisted_cursor = cursor
 
             models = get_all_models()
@@ -444,6 +447,8 @@ class SyncService:
             deferred_by_model = {}
             fully_drained = False
             final_server_ts = None
+            replay_queued = False
+            lease_owned = True
             # Page through the change set. The server caps each response at
             # per_page and returns has_more + next_since (the frontier that is
             # safe to resume from). We must follow that frontier instead of
@@ -453,6 +458,7 @@ class SyncService:
             for _ in range(MAX_PAGES):
                 if not cls._renew_lock('pull', pull_token):
                     errors.append('Pull lease ownership was lost')
+                    lease_owned = False
                     break
                 result = fetch_changes(since_timestamp=cursor)
                 if not result['success']:
@@ -465,13 +471,40 @@ class SyncService:
                             'created': total_created, 'updated': total_updated}
 
                 data = result.get('data', {})
+                schema_error = cls._pull_feed_schema_error(data, models)
+                if schema_error:
+                    # Applying an older client's known subset and publishing
+                    # this page's frontier would permanently skip every record
+                    # belonging to the newer/unknown model. Fail the entire
+                    # checkpoint instead; already-applied earlier pages are
+                    # idempotently replayed on the next compatible build.
+                    logger.error('Pull: %s', schema_error)
+                    cls._notify_error(f'Pull failed: {schema_error}')
+                    SyncStatus.set_last_pull(
+                        total_created, total_updated, [schema_error],
+                    )
+                    return {
+                        'success': False,
+                        'message': schema_error,
+                        'created': total_created,
+                        'updated': total_updated,
+                        'errors': [schema_error],
+                        'schema_error': True,
+                    }
                 for name in SYNC_ORDER:
                     if name not in data:
                         continue
                     model_class = models.get(name)
-                    if not model_class:
+                    if model_class is None:
+                        # Empty entries for models absent from this optional
+                        # deployment are harmless; nonempty ones were rejected
+                        # by the schema gate above.
                         continue
-                    apply_result = cls._apply_records(model_class, data[name])
+                    apply_result = cls._apply_records(
+                        model_class,
+                        data[name],
+                        authoritative_cloud=True,
+                    )
                     total_created += apply_result['created']
                     total_updated += apply_result['updated']
                     if apply_result['errors']:
@@ -527,7 +560,11 @@ class SyncService:
                 next_deferred = {}
                 progressed = False
                 for model_class, recs in deferred_by_model.items():
-                    retry_result = cls._apply_records(model_class, recs)
+                    retry_result = cls._apply_records(
+                        model_class,
+                        recs,
+                        authoritative_cloud=True,
+                    )
                     total_created += retry_result['created']
                     total_updated += retry_result['updated']
                     if retry_result['created'] or retry_result['updated']:
@@ -558,22 +595,55 @@ class SyncService:
             # of this run so the server redelivers that evidence next cycle.
             if not deferred_by_model:
                 cursor_to_persist = final_server_ts if fully_drained else cursor
-                if cursor_to_persist and cursor_to_persist != persisted_cursor:
-                    SyncStatus.set_cursor(cursor_to_persist)
+                cursor_published = True
+                if (
+                    cursor_to_persist
+                    and lease_owned
+                    and not cls._renew_lock('pull', pull_token)
+                ):
+                    lease_owned = False
+                    errors.append('Pull lease ownership was lost')
+                if cursor_to_persist and lease_owned:
+                    cursor_published = SyncStatus.publish_pull_cursor(
+                        cursor_to_persist,
+                        pull_generation,
+                        completes_full_pull=(
+                            fully_drained and persisted_cursor is None
+                        ),
+                    )
+                    if not cursor_published:
+                        logger.info(
+                            'Pull cursor publication skipped because a newer '
+                            'full replay was requested while this pull ran',
+                        )
+                        replay_queued = True
 
-            SyncStatus.set_last_pull(total_created, total_updated, [str(e) for e in errors[:1]])
+            replay_message = (
+                'A newer full replay was requested while this pull ran; '
+                'the replay remains queued'
+            )
+            status_errors = [str(e) for e in errors[:1]]
+            if replay_queued and not status_errors:
+                status_errors = [replay_message]
+            SyncStatus.set_last_pull(
+                total_created, total_updated, status_errors,
+            )
 
             total = total_created + total_updated
-            if total > 0 and not errors:
+            if total > 0 and not errors and not replay_queued:
                 cls._notify_pull_success(total_created, total_updated)
             elif errors:
                 cls._notify_error(f'Pull errors: {errors[0]}')
 
             return {
-                'success': not errors and not deferred_by_model,
+                'success': (
+                    not errors and not deferred_by_model and not replay_queued
+                ),
                 'created': total_created,
                 'updated': total_updated,
                 'errors': [str(e) for e in errors],
+                'replay_queued': replay_queued,
+                **({'message': replay_message} if replay_queued else {}),
             }
         finally:
             cls._release_lock('pull', pull_token)
@@ -596,12 +666,70 @@ class SyncService:
             'is_online': status_data.get('is_online', False),
             'last_sync': status_data.get('last_sync'),
             'last_pull': SyncStatus.get_cursor(),
+            'last_pull_at': status_data.get('last_pull_at'),
+            'last_pull_error': status_data.get('last_pull_error'),
             'pending_count': pending,
             'failed_count': failed,
             'dead_letter_count': SyncQueue.dead_letter_count(),
-            'last_error': status_data.get('last_error'),
+            'last_error': (
+                status_data.get('last_error')
+                or status_data.get('last_pull_error')
+            ),
             'pending_by_model': SyncQueue.get_summary(),
+            'full_pull_requested_at': status_data.get(
+                'full_pull_requested_at',
+            ),
+            'full_pull_completed_at': status_data.get(
+                'full_pull_completed_at',
+            ),
+            'full_pull_request_generation': status_data.get(
+                'full_pull_request_generation',
+            ),
+            'full_pull_completed_generation': status_data.get(
+                'full_pull_completed_generation',
+            ),
+            'full_pull_pending': status_data.get(
+                'full_pull_pending', False,
+            ),
+            'full_pull_state': status_data.get(
+                'full_pull_state', 'not_requested',
+            ),
         }
+
+    @staticmethod
+    def _pull_feed_schema_error(data, models):
+        """Return a fail-closed error for an incompatible cloud feed page."""
+        if not isinstance(data, dict):
+            return 'Cloud change feed data must be an object'
+
+        unresolved = sorted(
+            str(name)
+            for name, records in data.items()
+            if records
+            and (
+                name not in SYNC_ORDER
+                or models.get(name) is None
+            )
+        )
+        if unresolved:
+            return (
+                'Cloud change feed contains unsupported nonempty model(s): '
+                + ', '.join(unresolved)
+            )
+
+        for name, records in data.items():
+            if not records:
+                continue
+            if not isinstance(records, list):
+                return (
+                    f'Cloud change feed model {name} must contain a list'
+                )
+            if any(not isinstance(record, dict) for record in records):
+                return (
+                    f'Cloud change feed model {name} contains a malformed '
+                    'record'
+                )
+        return None
 
     @classmethod
     def full_push(cls):
@@ -624,9 +752,51 @@ class SyncService:
                 qs = qs.filter(branch_id=branch)
 
             for obj in qs.iterator():
-                SyncQueue.add(name, str(obj.uuid), obj.to_sync_dict())
+                cls._queue_current_row(
+                    model_class,
+                    name,
+                    obj.pk,
+                    branch=branch,
+                )
 
         return cls.push()
+
+    @classmethod
+    def _queue_current_row(
+        cls,
+        model_class,
+        model_name,
+        pk,
+        *,
+        branch=None,
+        unsynced_only=False,
+    ):
+        """Queue a row snapshot under the identity current at lock time.
+
+        Iterators in full-push/reconcile can preload UUID A just before a pull
+        converges that same database row onto UUID B. Reloading under the model
+        lock serializes with natural-key rekey and prevents an obsolete A queue
+        slot from being created after the pull has retired it.
+        """
+        from django.db import transaction
+
+        with transaction.atomic():
+            current = model_class._base_manager.select_for_update().filter(
+                pk=pk,
+            )
+            if branch:
+                current = current.filter(branch_id=branch)
+            if unsynced_only:
+                current = current.filter(synced_at__isnull=True)
+            current = current.first()
+            if current is None:
+                return False
+            SyncQueue.add(
+                model_name,
+                str(current.uuid),
+                current.to_sync_dict(),
+            )
+            return True
 
     @classmethod
     def status_report(cls):
@@ -702,8 +872,14 @@ class SyncService:
                         # Identical payloads retain their generation/retry
                         # count; newer edits rotate generation and revive a
                         # corrected dead letter.
-                        SyncQueue.add(name, str(obj.uuid), obj.to_sync_dict())
-                        requeued += 1
+                        if cls._queue_current_row(
+                            model_class,
+                            name,
+                            obj.pk,
+                            branch=branch,
+                            unsynced_only=True,
+                        ):
+                            requeued += 1
                     except Exception as e:  # noqa: BLE001 - isolate poison row
                         # One legacy/corrupt row must never prevent every later
                         # order/payment of the same model from entering the
@@ -720,8 +896,63 @@ class SyncService:
             logger.info('Sync reconcile: refreshed %d unsynced record(s)', requeued)
         return requeued
 
+    @staticmethod
+    def _resolve_natural_key_fks(model_class, record):
+        """Resolve only FK fields used by this model's sync natural key.
+
+        The wire format carries ``shift_uuid``/``order_uuid`` rather than a
+        Django ``shift``/``order`` value. Resolving those parents before natural
+        key lookup lets the pull lock and snapshot the old UUID's outbound queue
+        generation before ``from_sync_dict`` rekeys it.
+        """
+        natural_keys = set(
+            getattr(model_class, 'SYNC_NATURAL_KEYS', ()) or (),
+        )
+        if not natural_keys:
+            return {}
+
+        from django.apps import apps
+        from base.services.sync.config import FK_UUID_MAPPINGS
+
+        resolved = {}
+        for uuid_field, (
+            app_label, related_model_name, fk_field,
+        ) in FK_UUID_MAPPINGS.items():
+            if fk_field not in natural_keys or uuid_field not in record:
+                continue
+            uuid_value = record.get(uuid_field)
+            if uuid_value in (None, ''):
+                continue
+            try:
+                model_field = model_class._meta.get_field(fk_field)
+                related_model = apps.get_model(
+                    app_label, related_model_name,
+                )
+                if (
+                    not getattr(model_field, 'remote_field', None)
+                    or model_field.remote_field.model is not related_model
+                ):
+                    continue
+                related = (
+                    related_model.objects.select_for_update()
+                    .filter(uuid=uuid_value)
+                    .first()
+                )
+            except (LookupError, TypeError, ValueError):
+                related = None
+            if related is not None:
+                resolved[fk_field] = related
+        return resolved
+
     @classmethod
-    def _apply_records(cls, model_class, records, source_branch=None):
+    def _apply_records(
+        cls,
+        model_class,
+        records,
+        source_branch=None,
+        *,
+        authoritative_cloud=False,
+    ):
         # `deferred` holds records that couldn't be applied yet because a
         # required FK parent isn't present (or a transient error hit). The pull
         # loop retries them once the rest of the change set has landed, so a
@@ -733,9 +964,16 @@ class SyncService:
         model_label = model_class.__name__
         for record in records:
             try:
+                pull_scope = getattr(
+                    model_class, 'SYNC_PULL_SCOPE', 'branch',
+                )
+                queue_model_name = model_class.__name__.lower()
+                global_queue_snapshots = []
+                natural_queue_snapshots = []
+                incoming_uuid = record.get('uuid')
                 if (
                     getattr(settings, 'DEPLOYMENT_MODE', 'local') == 'local'
-                    and getattr(model_class, 'SYNC_PULL_SCOPE', 'branch') == 'branch'
+                    and pull_scope == 'branch'
                 ):
                     own_branch = str(getattr(settings, 'BRANCH_ID', '') or '')
                     record_branch = str(
@@ -757,17 +995,99 @@ class SyncService:
                 # path could read a row, then a concurrent writer commits, and
                 # the pull's stale save() clobbers the newer version.
                 with transaction.atomic():
+                    incoming_pk = None
+                    if incoming_uuid:
+                        incoming_pk = (
+                            model_class._base_manager.select_for_update()
+                            .filter(uuid=incoming_uuid)
+                            .values_list('pk', flat=True)
+                            .first()
+                        )
+                    incoming_exists = incoming_pk is not None
+                    if (
+                        authoritative_cloud
+                        and pull_scope == 'global'
+                        and incoming_uuid
+                    ):
+                        global_queue_snapshots = SyncQueue.get_snapshots(
+                            queue_model_name,
+                            [incoming_uuid],
+                            lock=True,
+                        )
+                    if incoming_uuid and not incoming_exists:
+                        # Discover and lock the natural-key owner before
+                        # snapshotting its queue generation. Re-keying A -> B
+                        # makes A undiscoverable afterward; capturing outside
+                        # this transaction let a concurrent save rotate A after
+                        # the snapshot and strand that new generation forever.
+                        try:
+                            resolved_natural_fks = (
+                                cls._resolve_natural_key_fks(
+                                    model_class, record,
+                                )
+                            )
+                            natural = model_class._find_by_natural_key(
+                                record,
+                                resolved_natural_fks,
+                                incoming_branch=(
+                                    record.get('branch_id') or source_branch
+                                ),
+                            )
+                        except (AttributeError, TypeError, ValueError):
+                            natural = None
+                        if natural is not None:
+                            natural_queue_snapshots = SyncQueue.get_snapshots(
+                                queue_model_name,
+                                [natural.uuid],
+                                lock=True,
+                            )
+                            if (
+                                authoritative_cloud
+                                and pull_scope == 'global'
+                            ):
+                                global_queue_snapshots.extend(
+                                    natural_queue_snapshots,
+                                )
                     quarantine_marker = SyncStatus.restore_quarantined_target(
                         model_class, record,
                     )
-                    instance, action = model_class.from_sync_dict(
-                        record, branch_id=source_branch,
-                    )
+                    with authoritative_cloud_pull(authoritative_cloud):
+                        instance, action = model_class.from_sync_dict(
+                            record, branch_id=source_branch,
+                        )
                     if action == 'deferred' and quarantine_marker:
                         # Roll back the temporary restore and all partial work;
                         # the durable marker remains for the retry.
                         raise _QuarantinedRecordDeferred()
                     SyncStatus.finish_quarantine_restore(quarantine_marker)
+                    if (
+                        action in ('created', 'updated', 'skipped')
+                        and authoritative_cloud
+                        and pull_scope == 'global'
+                        and global_queue_snapshots
+                    ):
+                        # Retire the exact global generation before releasing
+                        # either its queue lock or the corresponding model
+                        # identity lock. A reconcile/full-push worker cannot
+                        # recreate a stale slot in the commit-to-ACK gap.
+                        SyncQueue.acknowledge(
+                            global_queue_snapshots,
+                            queue_model_name,
+                        )
+                    elif (
+                        action == 'updated'
+                        and pull_scope == 'branch'
+                        and natural_queue_snapshots
+                        and instance is not None
+                        and str(instance.uuid) == str(incoming_uuid)
+                    ):
+                        # The pending local payload was re-published under the
+                        # cloud's canonical UUID by from_sync_dict. Retire the
+                        # locked old-UUID generation in this same transaction.
+                        SyncQueue.acknowledge(
+                            natural_queue_snapshots,
+                            queue_model_name,
+                        )
                 if action == 'deferred':
                     results['deferred'].append(record)
                 elif action in ('created', 'updated', 'skipped'):

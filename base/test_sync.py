@@ -405,6 +405,86 @@ class TestPullCursorNotClobbered:
         assert 'last_pull_at' in data
 
 
+class TestDurableFullPull:
+    def test_pull_contract_epoch_rewinds_once_and_survives_restart(
+        self, settings,
+    ):
+        from base.models import SyncState
+        from base.services.sync.status import SyncStatus
+
+        settings.DEPLOYMENT_MODE = 'local'
+        settings.BRANCH_ID = 'main'
+        SyncStatus.set_cursor('2026-07-25T10:00:00+00:00')
+        SyncState.objects.filter(
+            key=SyncStatus.pull_contract_epoch_key(),
+        ).delete()
+
+        assert SyncStatus.ensure_pull_contract_epoch() is True
+        assert SyncStatus.get_cursor() is None
+
+        # Once a successful replay publishes its new frontier, a restart must
+        # not clear it and repeat an expensive full history scan.
+        SyncStatus.set_cursor('2026-07-25T11:00:00+00:00')
+        assert SyncStatus.ensure_pull_contract_epoch() is False
+        assert SyncStatus.get_cursor() == '2026-07-25T11:00:00+00:00'
+
+    def test_manual_full_pull_request_is_durable(self, settings):
+        from base.services.sync.status import SyncStatus
+
+        settings.DEPLOYMENT_MODE = 'local'
+        settings.BRANCH_ID = 'main'
+        SyncStatus.set_cursor('2026-07-25T10:00:00+00:00')
+
+        assert SyncStatus.request_full_pull() is True
+        assert SyncStatus.get_cursor() is None
+        assert SyncStatus.get()['full_pull_requested_at']
+        assert SyncStatus.get()['full_pull_completed_at'] is None
+
+    def test_authoritative_global_pull_retires_stale_local_queue(
+        self, settings,
+    ):
+        from base.models import SyncQueueRecord, User
+        from base.services.sync.service import SyncService
+
+        settings.DEPLOYMENT_MODE = 'local'
+        settings.BRANCH_ID = 'main'
+        user = User.objects.create(
+            first_name='Stale', last_name='Local',
+            email='global-pull@test.local', password='old',
+            role='CASHIER', status='ACTIVE', sync_version=165,
+            branch_id='cloud',
+        )
+        SyncQueueRecord.objects.create(
+            model_name='user',
+            record_uuid=user.uuid,
+            payload=user.to_sync_dict(),
+            attempts=25,
+            last_error='[REJECTED] GLOBAL_MODEL_WRITE_REFUSED',
+        )
+
+        result = SyncService._apply_records(User, [{
+            'uuid': str(user.uuid),
+            'sync_version': 3,
+            'is_deleted': False,
+            'first_name': 'Cloud',
+            'last_name': 'Current',
+            'email': user.email,
+            'password': 'new',
+            'role': 'CASHIER',
+            'status': 'ACTIVE',
+            'permissions': [],
+            'branch_id': 'cloud',
+        }], source_branch='cloud', authoritative_cloud=True)
+
+        user.refresh_from_db()
+        assert result['updated'] == 1
+        assert user.first_name == 'Cloud'
+        assert user.sync_version == 3
+        assert not SyncQueueRecord.objects.filter(
+            model_name='user', record_uuid=user.uuid,
+        ).exists()
+
+
 class TestPullTruthfulFailureStatus:
     def _configure(self, settings, monkeypatch):
         from base.services.sync import service as sync_service
@@ -502,9 +582,15 @@ class TestPullCursorWaitsForDeferredRecords:
         )
 
         responses = iter(apply_results)
+        apply_calls = []
+
+        def apply_records(cls, model, records, **kwargs):
+            apply_calls.append(kwargs)
+            return next(responses)
+
         monkeypatch.setattr(
             sync_service.SyncService, '_apply_records',
-            classmethod(lambda cls, model, records: next(responses)),
+            classmethod(apply_records),
         )
         monkeypatch.setattr(sync_service, 'fetch_changes', lambda **kwargs: {
             'success': True,
@@ -515,14 +601,14 @@ class TestPullCursorWaitsForDeferredRecords:
         })
         SyncStatus.clear()
         SyncStatus.set_cursor('2026-07-13T11:00:00+00:00')
-        return sync_service, SyncStatus
+        return sync_service, SyncStatus, apply_calls
 
     def test_unresolved_record_holds_back_cursor(self, settings, monkeypatch):
         deferred = {
             'created': 0, 'updated': 0, 'skipped': 0,
             'errors': [], 'deferred': [{'uuid': 'child'}],
         }
-        sync_service, status = self._configure(
+        sync_service, status, apply_calls = self._configure(
             settings, monkeypatch, [deferred, deferred],
         )
 
@@ -531,6 +617,10 @@ class TestPullCursorWaitsForDeferredRecords:
         assert result['success'] is False
         assert result['errors']
         assert status.get_cursor() == '2026-07-13T11:00:00+00:00'
+        assert apply_calls == [
+            {'authoritative_cloud': True},
+            {'authoritative_cloud': True},
+        ]
 
     def test_resolved_retry_publishes_terminal_cursor(self, settings, monkeypatch):
         deferred = {
@@ -541,7 +631,7 @@ class TestPullCursorWaitsForDeferredRecords:
             'created': 1, 'updated': 0, 'skipped': 0,
             'errors': [], 'deferred': [],
         }
-        sync_service, status = self._configure(
+        sync_service, status, apply_calls = self._configure(
             settings, monkeypatch, [deferred, resolved],
         )
 
@@ -550,6 +640,10 @@ class TestPullCursorWaitsForDeferredRecords:
         assert result['success'] is True
         assert not result['errors']
         assert status.get_cursor() == '2026-07-13T12:00:00+00:00'
+        assert apply_calls == [
+            {'authoritative_cloud': True},
+            {'authoritative_cloud': True},
+        ]
 
 
 def _configure_local_push(settings, monkeypatch):

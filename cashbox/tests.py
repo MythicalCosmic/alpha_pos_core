@@ -8,6 +8,11 @@ from django.utils import timezone
 pytestmark = pytest.mark.django_db
 
 
+@pytest.fixture(autouse=True)
+def _upgraded_terminal(settings):
+    settings.DEVICE_ID = 'test-device'
+
+
 def _user(email='cashier@t.local', *, role='CASHIER'):
     from base.models import User
     return User.objects.create(
@@ -22,6 +27,7 @@ def _shift(user):
         start_time=timezone.now(),
         status='ACTIVE',
         branch_id=user.branch_id,
+        device_id='test-device' if user.role == 'CASHIER' else '',
         treasury_settlement_eligible=True,
     )
 

@@ -977,6 +977,21 @@ class ShiftService:
         from base.services.accounting_cursor import lock_branch_accounting
         lock_branch_accounting(operational_branch)
 
+        # Managers/admins/waiters do not own the till's exclusive cashier slot.
+        # A local CASHIER does, and upgraded code must never create another
+        # anonymous legacy shift when installation identity is missing.
+        from base.services.shift_device import (
+            cashier_shift_device_error,
+            terminal_device_id,
+            terminal_device_identity_error,
+        )
+        device_id = ''
+        if user.role == User.RoleChoices.CASHIER and mode != 'cloud':
+            identity_error = terminal_device_identity_error()
+            if identity_error:
+                return ServiceResponse.error(identity_error)
+            device_id = terminal_device_id()
+
         active = Shift.objects.filter(
             is_deleted=False,
             user=user,
@@ -984,20 +999,17 @@ class ShiftService:
             end_time__isnull=True,
         ).first()
         if active:
+            device_error = cashier_shift_device_error(user, active)
+            if device_error:
+                return ServiceResponse.error(device_error)
             return ServiceResponse.error("User already has an active shift")
 
         # DEVICE_ID is minted once per desktop install and is already used by
         # sync presence. Persist it only for CASHIER shifts: managers, admins,
         # and waiters may work alongside the cashier on the same physical till
-        # without taking its exclusive cash-drawer slot. Cloud-created and
-        # pre-upgrade shifts stay blank for rolling-upgrade compatibility.
-        device_id = ''
-        if user.role == User.RoleChoices.CASHIER and mode != 'cloud':
-            device_id = str(getattr(settings, 'DEVICE_ID', '') or '').strip()
-            if len(device_id) > Shift._meta.get_field('device_id').max_length:
-                return ServiceResponse.error(
-                    'This terminal has an invalid device identity',
-                )
+        # without taking its exclusive cash-drawer slot. Cloud-created shifts
+        # stay blank; pre-upgrade blank rows may close but cannot settle new
+        # cashier money after upgraded local code starts.
         if device_id and Shift.objects.filter(
             is_deleted=False,
             device_id=device_id,

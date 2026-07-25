@@ -507,27 +507,36 @@ def changes(request):
     )
 
     since_param = request.GET.get('since')
-    since_dt = parse_datetime(since_param) if since_param else None
+    try:
+        since_dt = parse_datetime(since_param) if since_param else None
+    except (TypeError, ValueError, OverflowError):
+        since_dt = None
+    if since_param and since_dt is None:
+        return JsonResponse(
+            {'error': 'since must be a valid ISO-8601 datetime'},
+            status=400,
+        )
     try:
         per_page = min(max(1, safe_per_page(request, 1000)), 5000)
     except (TypeError, ValueError):
         per_page = 1000
 
-    # Freeze the high-water mark *before* reading any model.  Capturing it after
-    # the per-model queries creates a lost-update window: a row committed after
-    # its model was read but before the response timestamp would be absent from
-    # this response yet older than (or equal to) the cursor the client stores.
-    # The next pull would then skip it forever.  The terminal cursor is kept
-    # one database-precision unit behind the cutoff below: an on_commit
-    # publisher can receive the exact same microsecond as ``snapshot_cutoff``,
-    # and a strict ``> since`` cursor must replay that boundary to remain safe.
-    from django.utils import timezone
-    snapshot_cutoff = timezone.now()
+    # Freeze a database-serialized high-water mark *before* reading any model.
+    # A raw wall-clock timestamp is not a safe cursor: if NTP/manual correction
+    # moves the cloud clock backwards, a later publication could receive a
+    # timestamp behind the terminal's stored cursor and disappear forever.
+    # The durable logical clock serializes this snapshot with every cloud
+    # publisher, so later commits are always strictly beyond this cutoff.
+    from django.db import transaction
+    from base.services.sync.feed_clock import allocate_cloud_feed_timestamp
+    with transaction.atomic():
+        snapshot_cutoff = allocate_cloud_feed_timestamp()
 
     models = get_all_models()
     data = {}
     total_records = 0
     has_more = False
+    cursor_publishable = True
     # The cursor we tell the client to resume from. With per-model paging we
     # can only safely advance to the *least* complete model's frontier — i.e.
     # the smallest "max synced_at returned" among the models that overflowed.
@@ -591,6 +600,14 @@ def changes(request):
                     model_class.__name__,
                     exc_info=True,
                 )
+                # We intentionally return the crash-safe NULL slice below, but
+                # must not publish a terminal cursor for this response. Timed
+                # rows for this model are omitted to keep the emergency lane
+                # bounded; advancing to snapshot_cutoff would make every such
+                # omitted row permanent. ``has_more`` plus a non-advancing
+                # ``next_since`` makes old and new clients retain their prior
+                # cursor and retry the same range.
+                cursor_publishable = False
                 null_fallback = list(
                     base_qs.filter(
                         pk__in=null_pks, synced_at__isnull=True,
@@ -636,6 +653,9 @@ def changes(request):
     # receiving an idempotent duplicate is safe, losing a change is not.
     from datetime import timedelta
     resume_cutoff = snapshot_cutoff - timedelta(microseconds=1)
+    if not cursor_publishable:
+        has_more = True
+        next_since = since_dt
 
     return JsonResponse({
         'success': True,
@@ -643,7 +663,12 @@ def changes(request):
         'total_records': total_records,
         'has_more': has_more,
         'next_since': next_since.isoformat() if next_since else None,
-        'server_timestamp': resume_cutoff.isoformat(),
+        'server_timestamp': (
+            resume_cutoff.isoformat()
+            if cursor_publishable
+            else (since_dt.isoformat() if since_dt else None)
+        ),
+        'cursor_publishable': cursor_publishable,
     })
 
 

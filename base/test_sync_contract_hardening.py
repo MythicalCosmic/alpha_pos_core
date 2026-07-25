@@ -211,6 +211,7 @@ def test_generic_contract_keeps_tombstone_terminal(settings):
 
 def test_equal_version_cloud_catalog_change_wins_on_branch(settings):
     from base.models import Category, Product
+    from base.services.sync.service import SyncService
 
     settings.DEPLOYMENT_MODE = 'local'
     settings.BRANCH_ID = 'branch-a'
@@ -227,12 +228,17 @@ def test_equal_version_cloud_catalog_change_wins_on_branch(settings):
         'price': '55000',
     })
 
-    instance, action = Product.from_sync_dict(payload, branch_id='cloud')
+    result = SyncService._apply_records(
+        Product,
+        [payload],
+        source_branch='cloud',
+        authoritative_cloud=True,
+    )
 
-    assert action == 'updated'
-    instance.refresh_from_db()
-    assert instance.name == 'Authoritative menu name'
-    assert instance.price == 55000
+    assert result['updated'] == 1
+    product.refresh_from_db()
+    assert product.name == 'Authoritative menu name'
+    assert product.price == 55000
 
 
 @pytest.mark.parametrize('receiver_path', ['pull', 'push'])
