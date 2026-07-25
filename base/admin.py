@@ -5,6 +5,13 @@ from .models import (
     ShiftTemplate, Shift, CashReconciliation,
 )
 
+# Django's built-in ``delete_selected`` action calls QuerySet.delete(), which
+# bypasses SyncMixin.delete(). On the cloud that physically removed synced rows
+# without publishing a tombstone, so terminals could retain them forever.
+# Individual admin deletion remains available and calls the model's ordinary
+# soft-delete path; only the unsafe bulk shortcut is disabled globally.
+admin.site.disable_action('delete_selected')
+
 
 @admin.register(User)
 class UserAdmin(admin.ModelAdmin):
