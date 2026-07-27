@@ -109,7 +109,8 @@ class OrderNotificationDispatchAdmin(admin.ModelAdmin):
     search_fields = ('order_id',)
     list_filter = ('new_sent', 'ready_sent')
     readonly_fields = ('order_id', 'new_sent', 'ready_sent', 'paid_sent',
-                       'cancelled_sent', 'new_message_ids', 'created_at', 'updated_at')
+                       'cancelled_sent', 'new_recipient_ids', 'new_message_ids',
+                       'created_at', 'updated_at')
 
 
 @admin.register(NotificationLog)

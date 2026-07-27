@@ -3,8 +3,9 @@
 These now fire on the SERVER edition only — the server is the single notification
 source. As orders sync up from the tills, a post_save(Order) signal (see
 notifications/signals.py) calls `OrderNotification.dispatch(order)`, which fires
-each message exactly once via OrderNotificationDispatch and reply-threads
-`order.ready` under the original `order.new` message.
+each lifecycle transition exactly once via OrderNotificationDispatch. `order.new`
+creates one message per configured chat; `order.ready` edits that message in
+place with the final preparation details.
 
 The local edition still has these methods on its call paths, but the EDITION
 gate makes them no-ops there (the till no longer sends — no more one-bot-per-till
@@ -47,6 +48,13 @@ def _cashier_name(order):
     return '—'
 
 
+def _format_timestamp(value):
+    if not value:
+        return '—'
+    date_str, time_str = format_datetime(value)
+    return f'{date_str} {time_str}'
+
+
 class OrderNotification:
 
     # ── server-side idempotent dispatcher (called from the post_save signal) ──
@@ -84,15 +92,20 @@ class OrderNotification:
                 # orders (smartfood/admin) already have items in the same txn.
                 if not order.items.filter(is_deleted=False).exists():
                     return
-                cls.on_new_order(order)
+                if not cls.on_new_order(order):
+                    # Disabled/template-less/no-recipient creation is not a
+                    # delivery.  Leave the transition pending so a later order
+                    # save can retry after configuration is repaired.
+                    return
                 disp.new_sent = True
                 changed.append('new_sent')
-            # READY replies under the order.new message (worker resolves reply ids).
-            # Only after order.new has gone out (new_sent set above or earlier).
+            # READY replaces the order.new text in place (the worker resolves the
+            # per-chat Telegram message ids). Only edit after order.new has gone
+            # out (new_sent set above or earlier).
             if status == 'READY' and disp.new_sent and not disp.ready_sent:
-                cls.on_order_ready(order.id)
-                disp.ready_sent = True
-                changed.append('ready_sent')
+                if cls.on_order_ready(order.id):
+                    disp.ready_sent = True
+                    changed.append('ready_sent')
             if changed:
                 changed.append('updated_at')
                 disp.save(update_fields=changed)
@@ -101,40 +114,51 @@ class OrderNotification:
     @classmethod
     def on_new_order(cls, order):
         if not _is_server():
-            return
-        _, time_str = format_datetime()
-        SenderService.send('order.new', {
+            return False
+        accepted_at = _format_timestamp(order.created_at)
+        _, legacy_time = format_datetime(order.created_at)
+        return SenderService.send('order.new', {
             'display_id': order.id,  # NOT order.display_id — the till counter isn't synced (always 1 on the server)
             'cashier_name': _cashier_name(order),
             'order_type': ORDER_TYPE_LABELS.get(order.order_type, order.order_type),
             'total_amount': format_money(order.total_amount),
             'items_list': _items_list(order),
-            'time': time_str,
+            'accepted_at': accepted_at,
+            # Kept for operator-customized legacy templates.
+            'time': legacy_time,
         }, order_id=order.id, thread_role='new')
 
     @classmethod
     def on_order_ready(cls, order_id):
         if not _is_server():
-            return
+            return False
         from base.models import Order
         try:
-            order = Order.objects.get(id=order_id)
+            order = Order.objects.select_related('cashier').get(id=order_id)
         except Order.DoesNotExist:
-            return
+            return False
 
         prep_time = '—'
         if order.ready_at and order.created_at:
             seconds = (order.ready_at - order.created_at).total_seconds()
-            prep_time = format_prep_time(seconds)
+            if seconds >= 0:
+                prep_time = '0:00' if seconds == 0 else format_prep_time(seconds)
 
-        _, time_str = format_datetime()
-        SenderService.send('order.ready', {
+        accepted_at = _format_timestamp(order.created_at)
+        ready_at = _format_timestamp(order.ready_at)
+        _, legacy_time = format_datetime(order.ready_at)
+        return SenderService.send('order.ready', {
             'display_id': order.id,  # NOT order.display_id — the till counter isn't synced (always 1 on the server)
+            'cashier_name': _cashier_name(order),
+            'order_type': ORDER_TYPE_LABELS.get(order.order_type, order.order_type),
             'prep_time': prep_time,
             'total_amount': format_money(order.total_amount),
             'items_list': _items_list(order),
-            'time': time_str,
-        }, order_id=order.id, thread_role='reply')
+            'accepted_at': accepted_at,
+            'ready_at': ready_at,
+            # Kept for operator-customized legacy templates.
+            'time': legacy_time,
+        }, order_id=order.id, thread_role='edit')
 
     @classmethod
     def on_order_cancelled(cls, order_id):

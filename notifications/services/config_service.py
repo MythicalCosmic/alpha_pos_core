@@ -71,4 +71,5 @@ class ConfigService:
             'is_enabled': cls.load().is_enabled,
             'bot_online': TelegramService.is_online(),
             'queue_count': QueueService.count(),
+            'dead_letter_count': QueueService.dead_letter_count(),
         })

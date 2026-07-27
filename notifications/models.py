@@ -415,9 +415,10 @@ class OrderNotificationDispatch(models.Model):
     """Per-order staff-notification state (server-side, NOT synced).
 
     Drives idempotent firing of the staff order notifications as orders sync up
-    from the tills (the server is the single notification source). `new_message_ids`
-    stores the Telegram message id of the `order.new` message in each chat so the
-    later `order.ready` message can be sent as a REPLY threaded under it.
+    from the tills (the server is the single notification source).
+    `new_recipient_ids` freezes the chats targeted at creation time and
+    `new_message_ids` stores the Telegram message id in each chat, so the later
+    `order.ready` transition edits exactly those original messages in place.
     One row per base.Order id.
     """
     order_id = models.IntegerField(unique=True, db_index=True)
@@ -425,6 +426,9 @@ class OrderNotificationDispatch(models.Model):
     ready_sent = models.BooleanField(default=False)
     paid_sent = models.BooleanField(default=False)
     cancelled_sent = models.BooleanField(default=False)
+    # The chats selected for order.new. Keep the lifecycle audience stable even
+    # when notification routing changes while an order is being prepared.
+    new_recipient_ids = models.JSONField(default=list, blank=True)
     # {"<chat_id>": <telegram_message_id>} of the order.new message per chat.
     new_message_ids = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
