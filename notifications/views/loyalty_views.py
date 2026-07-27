@@ -20,7 +20,8 @@ from base.security.audit import audit
 from base.security.idempotency import idempotent
 from base.security.permissions import admin_required
 from base.security.rate_limit import rate_limit, rate_limit_by
-from base.models import AuditLog
+from base.models import AuditLog, Customer
+from base.services.branch_scope import resolve_actor_branch
 from notifications.models import LoyaltyAccount, LoyaltySettings
 from notifications.services import loyalty_service
 
@@ -34,12 +35,63 @@ def _serialize_settings(s):
     }
 
 
-def _serialize_account(a):
+def _customer_identity(phone, actor):
+    """Return one exact branch-authorized Customer match.
+
+    Legacy duplicate phone rows are ambiguous, so fail closed instead of
+    guessing which customer owns the loyalty account.
+    """
+    branch_id = resolve_actor_branch(actor)
+    phone = Customer.normalize_phone(phone)
+    if not branch_id or not phone:
+        return None
+    matches = list(
+        Customer.objects.filter(
+            branch_id=branch_id,
+            phone_number=phone,
+            is_deleted=False,
+        )
+        .order_by("id")
+        .values("id", "name")[:2]
+    )
+    return matches[0] if len(matches) == 1 else None
+
+
+def _customer_identities(accounts, actor):
+    """Batch the list endpoint's exact phone matches without an N+1 query."""
+    branch_id = resolve_actor_branch(actor)
+    phones = {
+        Customer.normalize_phone(account.phone_number)
+        for account in accounts
+        if Customer.normalize_phone(account.phone_number)
+    }
+    if not branch_id or not phones:
+        return {}
+    candidates = Customer.objects.filter(
+        branch_id=branch_id,
+        phone_number__in=phones,
+        is_deleted=False,
+    ).order_by("id").values("id", "name", "phone_number")
+    grouped = {}
+    for customer in candidates:
+        grouped.setdefault(customer["phone_number"], []).append(customer)
+    return {
+        phone: rows[0]
+        for phone, rows in grouped.items()
+        if len(rows) == 1
+    }
+
+
+def _serialize_account(a, actor=None, customer=None):
+    if actor is not None:
+        customer = _customer_identity(a.phone_number, actor)
     return {
         'phone_number': a.phone_number,
         'stamps_balance': a.stamps_balance,
         'stamps_earned_total': a.stamps_earned_total,
         'stamps_redeemed_total': a.stamps_redeemed_total,
+        'customer_id': customer['id'] if customer else None,
+        'customer_name': customer['name'] if customer else None,
         'created_at': a.created_at.isoformat(),
         'updated_at': a.updated_at.isoformat(),
     }
@@ -90,7 +142,10 @@ def account_view(request, phone):
             {'success': False, 'message': 'No loyalty account for that phone'},
             status=404,
         )
-    return JsonResponse({'success': True, 'data': _serialize_account(account)})
+    return JsonResponse({
+        'success': True,
+        'data': _serialize_account(account, request.user),
+    })
 
 
 @csrf_exempt
@@ -137,14 +192,28 @@ def redeem_view(request, phone):
             'stamps_per_reward': settings.stamps_per_reward,
         },
     )
-    return JsonResponse({'success': True, 'data': _serialize_account(account)})
+    return JsonResponse({
+        'success': True,
+        'data': _serialize_account(account, request.user),
+    })
 
 
 @require_GET
 @admin_required
 def list_accounts(request):
-    accounts = LoyaltyAccount.objects.order_by('-stamps_balance')[:100]
+    accounts = list(
+        LoyaltyAccount.objects.order_by('-stamps_balance')[:100]
+    )
+    customers = _customer_identities(accounts, request.user)
     return JsonResponse({
         'success': True,
-        'data': [_serialize_account(a) for a in accounts],
+        'data': [
+            _serialize_account(
+                account,
+                customer=customers.get(
+                    Customer.normalize_phone(account.phone_number)
+                ),
+            )
+            for account in accounts
+        ],
     })
