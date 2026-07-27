@@ -505,7 +505,7 @@ def call_ai_tools(
     tool_calls_completed = 0
     unresolved_tool_error = False
 
-    def _create(include_tools):
+    def _create(include_tools, *, prevent_tool_use=False):
         # One create() call, retrying transient provider overloads (529 / 'high
         # demand') with backoff — same policy as call_ai's single-shot path.
         kwargs = {'model': model, 'max_tokens': max_tokens, 'messages': messages}
@@ -513,7 +513,9 @@ def call_ai_tools(
             kwargs['system'] = _cache_system(system)
         if include_tools:
             kwargs['tools'] = _cache_tools(tools)
-            if (
+            if prevent_tool_use:
+                kwargs['tool_choice'] = {'type': 'none'}
+            elif (
                 unresolved_tool_error
                 or (require_tool and tool_calls_completed == 0)
             ):
@@ -614,7 +616,10 @@ def call_ai_tools(
             return None, 'data_tool_failed'
         if tool_calls_completed == 0:
             return None, 'tool_iteration_limit'
-        resp, err = _create(include_tools=False)
+        # Anthropic requires a tool-result continuation to retain the same tool
+        # definitions. Explicit ``none`` keeps that continuation valid while
+        # guaranteeing this last request can only synthesize prose.
+        resp, err = _create(include_tools=True, prevent_tool_use=True)
         if err:
             return None, err
         return _final_text(resp)

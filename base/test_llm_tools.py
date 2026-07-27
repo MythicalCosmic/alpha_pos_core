@@ -595,8 +595,8 @@ def test_claude_clean_tool_iteration_limit_synthesizes_final_answer(
     assert err is None and text == 'SYNTHESIZED ANSWER'
     assert len(msgs.calls) == 2
     assert 'tools' in msgs.calls[0]
-    assert 'tools' not in msgs.calls[1]
-    assert 'tool_choice' not in msgs.calls[1]
+    assert 'tools' in msgs.calls[1]
+    assert msgs.calls[1]['tool_choice'] == {'type': 'none'}
     assert 'timeout' in msgs.calls[1]
     assert any(
         message.get('role') == 'user'
