@@ -232,9 +232,57 @@ def test_provider_rate_limit_classifier_excludes_billing_and_bad_keys():
     assert not llm.is_provider_rate_limited('401 invalid_api_key')
 
 
-def test_data_tool_failure_never_falls_back_to_capped_snapshot(monkeypatch):
+def test_tool_provider_configuration_failure_uses_configured_snapshot_fallback(
+        settings,
+        monkeypatch,
+):
     from stock.services.ai_tools_service import AIToolbox
 
+    settings.AI_PROVIDER = 'openai'
+    settings.AI_FALLBACK_PROVIDERS = 'gemini'
+    monkeypatch.setattr(llm, 'can_use_tools', lambda: True)
+    monkeypatch.setattr(
+        llm,
+        'call_ai_tools',
+        lambda *args, **kwargs: (
+            None,
+            '429 insufficient_quota: check billing',
+        ),
+    )
+    fallback_calls = []
+
+    def fallback_call(prompt, *args, **kwargs):
+        fallback_calls.append((prompt, kwargs))
+        return 'RECOVERED THROUGH GEMINI', None
+
+    monkeypatch.setattr(llm, 'call_ai', fallback_call)
+    monkeypatch.setattr(
+        AIToolbox,
+        'execute',
+        classmethod(lambda cls, *args, **kwargs: '{}'),
+    )
+    monkeypatch.setattr(
+        AIStockAssistant,
+        '_snapshot_prompt',
+        classmethod(lambda cls, *args, **kwargs: 'VERIFIED SNAPSHOT'),
+    )
+
+    result = AIStockAssistant.process_query('exact sales total')
+
+    assert result['success'] is True
+    assert result['response'] == 'RECOVERED THROUGH GEMINI'
+    assert len(fallback_calls) == 1
+    assert fallback_calls[0][0] == 'VERIFIED SNAPSHOT'
+    assert fallback_calls[0][1]['providers'] == ['gemini']
+
+
+def test_data_tool_failure_never_falls_back_to_capped_snapshot(
+        settings,
+        monkeypatch,
+):
+    from stock.services.ai_tools_service import AIToolbox
+
+    settings.AI_FALLBACK_PROVIDERS = 'gemini'
     monkeypatch.setattr(llm, 'can_use_tools', lambda: True)
     monkeypatch.setattr(
         llm,

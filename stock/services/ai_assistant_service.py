@@ -1885,7 +1885,8 @@ Follow all language and formatting rules from your instructions."""
             request_deadline = (
                 time.monotonic() + _request_deadline_seconds()
             )
-            if can_use_tools():
+            used_tool_path = can_use_tools()
+            if used_tool_path:
                 # Claude path: hand the model read-only tools so it can drill into
                 # any order/shift/date/cashier/product itself — true "see everything"
                 # detail that never fits in a single pre-computed snapshot.
@@ -1924,6 +1925,83 @@ every number on tool results. Follow all language and formatting rules."""
                     history=history,
                     deadline=request_deadline,
                 )
+
+            # Keep the configured tool-capable provider as the primary path, but
+            # recover from provider/account/network failures through explicitly
+            # configured backups. A backup receives a fresh, verified ORM snapshot
+            # rather than the tool prompt's small overview. Grounding/tool errors
+            # never enter this path: incomplete database evidence must still fail
+            # closed instead of being converted into a guessed answer.
+            provider_failure_categories = {
+                'configuration',
+                'rate_limit',
+                'timeout',
+                'connection',
+                'empty_response',
+                'bad_request',
+                'provider',
+            }
+            if (
+                used_tool_path
+                and err
+                and error_category(err) in provider_failure_categories
+            ):
+                from django.conf import settings as django_settings
+
+                primary_provider = get_provider()
+                fallback_providers = []
+                for raw_provider in str(
+                    getattr(django_settings, 'AI_FALLBACK_PROVIDERS', '') or ''
+                ).split(','):
+                    provider = raw_provider.strip().lower()
+                    if (
+                        provider in {'openai', 'claude', 'gemini'}
+                        and provider != primary_provider
+                        and provider not in fallback_providers
+                    ):
+                        fallback_providers.append(provider)
+
+                if fallback_providers:
+                    primary_error = err
+                    fallback_prompt = cls._snapshot_prompt(
+                        query,
+                        preamble,
+                        data_context.location_id,
+                    )
+                    text, err = call_ai(
+                        fallback_prompt,
+                        system=SYSTEM_PROMPT,
+                        max_tokens=2048,
+                        history=history,
+                        providers=fallback_providers,
+                        deadline=request_deadline,
+                    )
+                    if err is None and (text or '').strip():
+                        logging.getLogger(__name__).warning(
+                            'AI tool provider recovered through snapshot fallback '
+                            'primary=%s fallback=%s',
+                            primary_provider,
+                            fallback_providers[0],
+                        )
+                    elif err:
+                        fallback_failures = list(
+                            getattr(err, 'failures', None) or []
+                        )
+                        if not fallback_failures:
+                            fallback_failures = [{
+                                'provider': fallback_providers[0],
+                                'category': error_category(err),
+                                'attempts': 1,
+                            }]
+                        err = LLMRequestFailure(
+                            'llm_tool_provider_and_fallback_failed',
+                            failures=[{
+                                'provider': primary_provider,
+                                'category': error_category(primary_error),
+                                'attempts': 1,
+                            }, *fallback_failures],
+                            stage='provider',
+                        )
             if err == 'llm_key_missing':
                 return build_ai_error(
                     "no_api_key", AI_NOT_CONFIGURED_MESSAGE,
