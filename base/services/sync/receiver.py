@@ -174,6 +174,358 @@ def _record_replay_matches(
     return True
 
 
+_DIRECT_SHIFT_FINANCIAL_MODELS = frozenset({
+    'base.orderrefund',
+    'cashbox.cashboxexpense',
+    'cashbox.shiftpaymenttotal',
+})
+_ORDER_FINANCIAL_CHILD_MODELS = frozenset({
+    'base.externalorderpayment',
+    'base.orderitem',
+    'base.orderpayment',
+})
+
+
+def _order_settlement_state(order):
+    """Return the fields that decide whether an Order belongs to a shift."""
+    if order is None:
+        return None
+    return {
+        'branch_id': str(getattr(order, 'branch_id', '') or ''),
+        'cashier_id': getattr(order, 'cashier_id', None),
+        'is_paid': bool(getattr(order, 'is_paid', False)),
+        'paid_at': getattr(order, 'paid_at', None),
+        'is_deleted': bool(getattr(order, 'is_deleted', False)),
+    }
+
+
+def _incoming_order_settlement_state(
+    existing, cleaned, resolved_fks, incoming_branch, is_deleted,
+):
+    """Project the receiver-visible Order membership after this payload."""
+    current = _order_settlement_state(existing) or {
+        'branch_id': str(incoming_branch or ''),
+        'cashier_id': None,
+        'is_paid': False,
+        'paid_at': None,
+        'is_deleted': False,
+    }
+    projected = dict(current)
+    # Cloud receive never lets a payload steal a non-empty branch owner.
+    if existing is None or not current['branch_id']:
+        projected['branch_id'] = str(incoming_branch or '')
+    if 'cashier' in resolved_fks:
+        cashier = resolved_fks['cashier']
+        projected['cashier_id'] = cashier.pk if cashier is not None else None
+    for field_name in ('is_paid', 'paid_at'):
+        if field_name in cleaned:
+            projected[field_name] = cleaned[field_name]
+    projected['is_deleted'] = bool(is_deleted)
+    return projected
+
+
+def _sale_shift_ids_for_states(states):
+    """Find every shift window whose immutable manifest can contain a sale."""
+    from django.db.models import Q
+    from base.models import Shift
+
+    shift_ids = set()
+    for state in states:
+        if not state or state.get('is_deleted') or not state.get('is_paid'):
+            continue
+        branch_id = str(state.get('branch_id') or '')
+        cashier_id = state.get('cashier_id')
+        paid_at = state.get('paid_at')
+        if not branch_id or not cashier_id or paid_at is None:
+            continue
+        shift_ids.update(
+            Shift._base_manager.filter(
+                branch_id=branch_id,
+                user_id=cashier_id,
+                is_deleted=False,
+                start_time__lte=paid_at,
+            ).filter(
+                Q(end_time__gt=paid_at) | Q(end_time__isnull=True),
+            ).values_list('pk', flat=True)
+        )
+    return shift_ids
+
+
+def _refund_shift_ids_for_orders(order_ids):
+    """OrderItem evidence also belongs to every refund shift for its order."""
+    if not order_ids:
+        return set()
+    from base.models import OrderRefund
+
+    return set(
+        OrderRefund._base_manager.filter(
+            order_id__in=order_ids,
+            shift_id__isnull=False,
+            is_deleted=False,
+        ).values_list('shift_id', flat=True)
+    )
+
+
+def _financial_owner_plan(
+    model_class,
+    uuid_val,
+    cleaned,
+    resolved_fks,
+    incoming_branch,
+    is_deleted,
+):
+    """Plan the Shift→Order→child lock order for settlement evidence writes.
+
+    The plan is deliberately computed before the transaction only to identify
+    candidate rows. `_lock_financial_owners` re-fetches and locks every parent
+    Order inside the transaction and aborts for retry if membership changed.
+    """
+    if getattr(settings, 'DEPLOYMENT_MODE', 'local') != 'cloud':
+        return None
+
+    label = model_class._meta.label_lower
+    if (
+        label not in _DIRECT_SHIFT_FINANCIAL_MODELS
+        and label not in _ORDER_FINANCIAL_CHILD_MODELS
+        and label != 'base.order'
+    ):
+        return None
+
+    from base.models import Order
+
+    direct_shift_ids = set()
+    order_ids = set()
+    projected_states = []
+    include_refund_shifts = label == 'base.orderitem'
+
+    if label in _DIRECT_SHIFT_FINANCIAL_MODELS:
+        incoming_shift = resolved_fks.get('shift')
+        if incoming_shift is not None:
+            direct_shift_ids.add(incoming_shift.pk)
+        existing_shift_id = (
+            model_class._base_manager.filter(uuid=uuid_val)
+            .values_list('shift_id', flat=True)
+            .first()
+        )
+        if existing_shift_id is not None:
+            direct_shift_ids.add(existing_shift_id)
+
+    elif label in _ORDER_FINANCIAL_CHILD_MODELS:
+        incoming_order = resolved_fks.get('order')
+        if incoming_order is not None:
+            order_ids.add(incoming_order.pk)
+        existing_order_id = (
+            model_class._base_manager.filter(uuid=uuid_val)
+            .values_list('order_id', flat=True)
+            .first()
+        )
+        if existing_order_id is not None:
+            order_ids.add(existing_order_id)
+
+    else:  # base.Order itself
+        existing = (
+            Order._base_manager.filter(uuid=uuid_val)
+            .select_related('cashier')
+            .first()
+        )
+        if existing is not None:
+            order_ids.add(existing.pk)
+            projected_states.append(_order_settlement_state(existing))
+        projected_states.append(_incoming_order_settlement_state(
+            existing,
+            cleaned,
+            resolved_fks,
+            incoming_branch,
+            is_deleted,
+        ))
+
+    orders = list(
+        Order._base_manager.filter(pk__in=order_ids).order_by('pk')
+    )
+    states = [_order_settlement_state(order) for order in orders]
+    states.extend(projected_states)
+    shift_ids = set(direct_shift_ids)
+    shift_ids.update(_sale_shift_ids_for_states(states))
+    if include_refund_shifts:
+        shift_ids.update(_refund_shift_ids_for_orders(order_ids))
+
+    return {
+        'label': label,
+        'direct_shift_ids': direct_shift_ids,
+        'order_ids': order_ids,
+        'projected_states': projected_states,
+        'cleaned': dict(cleaned),
+        'incoming_branch': incoming_branch,
+        'is_deleted': is_deleted,
+        'include_refund_shifts': include_refund_shifts,
+        'shift_ids': shift_ids,
+    }
+
+
+def _lock_financial_owners(plan, resolved_fks):
+    """Lock financial owners before the receiver locks or writes the child."""
+    if not plan:
+        return {'settled_shift_ids': set(), 'locked_shift_ids': set()}
+
+    from base.models import CashReconciliation, Order, Shift
+
+    planned_shift_ids = set(plan['shift_ids'])
+    locked_shifts = list(
+        Shift._base_manager.select_for_update()
+        .filter(pk__in=sorted(planned_shift_ids))
+        .order_by('pk')
+    )
+    locked_shift_ids = {shift.pk for shift in locked_shifts}
+
+    locked_orders = list(
+        Order._base_manager.select_for_update()
+        .filter(pk__in=sorted(plan['order_ids']))
+        .order_by('pk')
+    )
+    locked_orders_by_id = {order.pk: order for order in locked_orders}
+
+    # Replace the pre-transaction FK objects with their locked copies. This is
+    # both a freshness guarantee and a clear Shift→Order→child lock order.
+    incoming_order = resolved_fks.get('order')
+    if (
+        incoming_order is not None
+        and incoming_order.pk in locked_orders_by_id
+    ):
+        resolved_fks['order'] = locked_orders_by_id[incoming_order.pk]
+    incoming_shift = resolved_fks.get('shift')
+    locked_shifts_by_id = {shift.pk: shift for shift in locked_shifts}
+    if (
+        incoming_shift is not None
+        and incoming_shift.pk in locked_shifts_by_id
+    ):
+        resolved_fks['shift'] = locked_shifts_by_id[incoming_shift.pk]
+
+    # If a concurrent parent update changed sale/refund membership between the
+    # planning read and these locks, retry from a fresh deterministic plan. Do
+    # not acquire an unplanned lower-PK Shift after locking Orders: that would
+    # invert the global Shift→Order lock order and permit a deadlock.
+    current_states = [
+        _order_settlement_state(order) for order in locked_orders
+    ]
+    if plan['label'] == 'base.order':
+        # The planning snapshot may have waited behind another receiver. Build
+        # the incoming state again from the now-locked current Order; otherwise
+        # a stale projected paid_at/cashier can omit its real settlement shift.
+        current = locked_orders[0] if locked_orders else None
+        current_states.append(_incoming_order_settlement_state(
+            current,
+            plan['cleaned'],
+            resolved_fks,
+            plan['incoming_branch'],
+            plan['is_deleted'],
+        ))
+    else:
+        current_states.extend(plan['projected_states'])
+    current_shift_ids = set(plan['direct_shift_ids'])
+    current_shift_ids.update(_sale_shift_ids_for_states(current_states))
+    if plan['include_refund_shifts']:
+        current_shift_ids.update(
+            _refund_shift_ids_for_orders(locked_orders_by_id)
+        )
+    unplanned = current_shift_ids - locked_shift_ids
+    if unplanned:
+        raise RetryableSyncError(
+            'Financial parent changed while acquiring settlement locks; retry',
+            reason_code='FINANCIAL_OWNER_CHANGED',
+        )
+
+    reconciled_shift_ids = set(
+        CashReconciliation._base_manager.filter(
+            shift_id__in=locked_shift_ids,
+            is_deleted=False,
+        ).values_list('shift_id', flat=True)
+    )
+    completed_shift_ids = {
+        shift.pk for shift in locked_shifts
+        if shift.status == Shift.Status.COMPLETED
+    }
+    return {
+        'settled_shift_ids':
+            reconciled_shift_ids | completed_shift_ids,
+        'locked_shift_ids': locked_shift_ids,
+    }
+
+
+def _verify_locked_financial_target(plan, owner_guard, instance):
+    """Detect a target re-parented while the receiver waited on its row lock."""
+    if not plan or instance is None:
+        return
+    label = plan['label']
+    if label in _DIRECT_SHIFT_FINANCIAL_MODELS:
+        current_shift_id = getattr(instance, 'shift_id', None)
+        valid = (
+            current_shift_id is None
+            or current_shift_id in owner_guard['locked_shift_ids']
+        )
+    elif label in _ORDER_FINANCIAL_CHILD_MODELS:
+        valid = (
+            getattr(instance, 'order_id', None)
+            in plan['order_ids']
+        )
+    else:
+        valid = instance.pk in plan['order_ids']
+    if not valid:
+        raise RetryableSyncError(
+            'Financial target changed while acquiring settlement locks; retry',
+            reason_code='FINANCIAL_OWNER_CHANGED',
+        )
+
+
+def _settled_shift_admission(
+    owner_guard,
+    model_class,
+    instance,
+    cleaned,
+    resolved_fks,
+    *,
+    is_deleted,
+):
+    """Allow exact replays only; reject mutations of a posted settlement."""
+    settled_shift_ids = set(
+        (owner_guard or {}).get('settled_shift_ids') or (),
+    )
+    if not settled_shift_ids:
+        return None
+
+    if instance is not None:
+        if getattr(model_class, '_sync_append_only', False):
+            exact = (
+                not is_deleted
+                and _append_only_replay_matches(
+                    model_class, instance, cleaned, resolved_fks,
+                )
+            )
+        else:
+            exact = _record_replay_matches(
+                model_class,
+                instance,
+                cleaned,
+                resolved_fks,
+                is_deleted=is_deleted,
+            )
+        if exact:
+            return _acknowledged(
+                instance,
+                'IDEMPOTENT_SETTLED_SHIFT_EVIDENCE_REPLAY',
+                'The settled shift already stores identical evidence',
+            )
+
+    shift_list = ','.join(str(pk) for pk in sorted(settled_shift_ids))
+    return _rejected(
+        instance,
+        'SETTLED_SHIFT_EVIDENCE_REWRITE',
+        (
+            'Financial evidence for a completed/reconciled shift is immutable '
+            f'(shift ids: {shift_list})'
+        ),
+    )
+
+
 def _resolve_foreign_keys(model_class, data, incoming_branch):
     """Resolve UUID-keyed FK references to local PKs.
 
@@ -1185,6 +1537,14 @@ class CloudReceiver:
             cleaned=cleaned,
             incoming_branch=incoming_branch,
         )
+        financial_owner_plan = _financial_owner_plan(
+            model_class,
+            uuid_val,
+            cleaned,
+            resolved_fks,
+            incoming_branch,
+            is_deleted,
+        )
 
         # Per-record atomic + row lock. Without this the get → _should_replace →
         # save sequence is a read-modify-write with no isolation: two concurrent
@@ -1194,10 +1554,19 @@ class CloudReceiver:
         # exceptions, so each record owns its own transaction; a rollback here
         # leaves the row untouched and the UUID is re-queued via failed_uuids.
         with transaction.atomic():
+            financial_owner_guard = _lock_financial_owners(
+                financial_owner_plan,
+                resolved_fks,
+            )
             try:
                 instance = model_class.objects.select_for_update().get(uuid=uuid_val)
                 force_shift_close = False
                 prior_sync_version = instance.sync_version
+                _verify_locked_financial_target(
+                    financial_owner_plan,
+                    financial_owner_guard,
+                    instance,
+                )
 
                 if (
                     getattr(model_class, 'SYNC_PULL_SCOPE', 'branch') == 'branch'
@@ -1214,6 +1583,17 @@ class CloudReceiver:
                         'CROSS_BRANCH_OWNER',
                         'The UUID is owned by a different branch',
                     )
+
+                settled_admission = _settled_shift_admission(
+                    financial_owner_guard,
+                    model_class,
+                    instance,
+                    cleaned,
+                    resolved_fks,
+                    is_deleted=is_deleted,
+                )
+                if settled_admission is not None:
+                    return settled_admission
 
                 if close_manifest:
                     def close_conflict(code, reason):
@@ -1445,6 +1825,17 @@ class CloudReceiver:
                 return instance, 'updated'
 
             except model_class.DoesNotExist:
+                settled_admission = _settled_shift_admission(
+                    financial_owner_guard,
+                    model_class,
+                    None,
+                    cleaned,
+                    resolved_fks,
+                    is_deleted=is_deleted,
+                )
+                if settled_admission is not None:
+                    return settled_admission
+
                 automatic_values = _pop_automatic_values(model_class, cleaned)
 
                 # Reconcile onto an existing row that already owns this model's

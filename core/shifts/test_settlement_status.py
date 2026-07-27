@@ -85,7 +85,9 @@ def test_legacy_zero_count_is_unsubmitted_not_full_shortage():
     assert data['tender_totals_source'] == 'DERIVED_INCOMPLETE_FROZEN'
     assert data['frozen_tender_evidence_complete'] is False
     humo = next(row for row in data['settlement'] if row['method'] == 'HUMO')
-    assert humo['counted'] == '0.00'
+    assert humo['counted'] is None
+    assert humo['difference'] is None
+    assert humo['frozen_difference'] == '-602000.00'
     assert humo['status'] == 'UNCOUNTED'
 
 
@@ -129,7 +131,12 @@ def test_close_manifest_distinguishes_missing_from_explicit_zero_count(
         row for row in response['data']['settlement']
         if row['method'] == 'CASH'
     )
-    assert cash['counted'] == '0.00'
+    if expected_status == 'UNCOUNTED':
+        assert cash['counted'] is None
+        assert cash['difference'] is None
+    else:
+        assert cash['counted'] == '0.00'
+        assert cash['difference'] == '-100.00'
     assert cash['status'] == expected_status
     frozen = list(ShiftPaymentTotal.objects.filter(shift=shift))
     assert _settlement_bundle_error(shift, frozen) is None

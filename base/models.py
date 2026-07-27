@@ -2629,6 +2629,7 @@ class AuditLog(SyncMixin, models.Model):
         ORDER_PAYMENT_REPAIR = (
             "ORDER_PAYMENT_REPAIR", "Order payment repaired"
         )
+        FINANCIAL_REPAIR = "FINANCIAL_REPAIR", "Historical financial repair"
 
     actor = models.ForeignKey(
         User,
