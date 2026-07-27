@@ -28,7 +28,7 @@ from base.models import (
 )
 from stock.models import StockLevel, StockBatch, StockLocation
 from base.services.business_day import business_day_date_expr
-from base.services.revenue import net_line_revenue
+from base.services.revenue import gross_line_revenue, net_line_revenue
 from base.services.refund_lines import (
     REFUND_EVENT_ALIAS, refund_item_events_in_window,
     refund_line_quantity, refund_line_revenue,
@@ -723,7 +723,11 @@ class AIToolbox:
                 'aggregate {"revenue":"sum:total_amount","orders":"count"} '
                 'group_by ["cashier"]. Row example: fields ["id","total_amount","status",'
                 '"cashier__first_name"]. Prefer a specific tool when it already computes the exact '
-                "metric (those are pre-validated); use query_db for anything they can't. Read-only; "
+                "metric (those are pre-validated); use query_db for anything they can't. "
+                "For orderitem, line_total_uzs is a computed gross-line field equal "
+                "to price * quantity before any order-level discount; it can be "
+                "returned or aggregated with sum:line_total_uzs. There is no "
+                "total_price field. Use sales_report for net sales/refunds. Read-only; "
                 "soft-deleted rows and sensitive fields (passwords/tokens/keys) are always excluded."
             ),
             "input_schema": {
@@ -793,7 +797,43 @@ class AIToolbox:
             return {"error": "unknown model '%s'. queryable: %s"
                     % (name, ', '.join(sorted(set(_QUERYABLE_MODELS))))}
 
+        if model is OrderItem:
+            path_values = []
+            for key in ('filters', 'exclude'):
+                value = args.get(key) or {}
+                if isinstance(value, dict):
+                    path_values.extend(value)
+            for key in ('fields', 'group_by', 'order_by'):
+                value = args.get(key) or []
+                path_values.extend([value] if isinstance(value, str) else value)
+            aggregate = args.get('aggregate') or {}
+            if isinstance(aggregate, dict):
+                for spec in aggregate.values():
+                    _fn, _separator, field = str(spec).partition(':')
+                    if field:
+                        path_values.append(field)
+            if any(
+                str(path).lstrip('-').split('__', 1)[0] == 'total_price'
+                for path in path_values
+            ):
+                return {
+                    "error": (
+                        "OrderItem has no total_price field. Use "
+                        "line_total_uzs for price * quantity before any "
+                        "order-level discount, or use sales_report for net "
+                        "sales/refund accounting."
+                    )
+                }
+
         qs = model.objects.all()
+        if model is OrderItem:
+            # A line total is derived rather than stored on OrderItem. Models
+            # can request this explicit gross-line expression in rows, filters,
+            # ordering, or aggregates without pretending it includes order-level
+            # discounts/refunds.
+            qs = qs.annotate(
+                line_total_uzs=gross_line_revenue(),
+            )
         # Exclude soft-deleted rows unless explicitly asked.
         if any(f.name == 'is_deleted' for f in model._meta.concrete_fields) \
                 and args.get('include_deleted') is not True:
@@ -863,7 +903,8 @@ class AIToolbox:
                                 "join fan-out: aggregating an order-level field '%s' while "
                                 "filtering/grouping across a to-many relation (%s) counts each "
                                 "row once per line item and inflates the total. Aggregate on "
-                                "the item side (query model 'orderitem', sum 'quantity*price') "
+                                "the item side (query model 'orderitem', "
+                                "sum:line_total_uzs) "
                                 "or use the sales_report tool." % (_fld, ', '.join(sorted(_to_many)))}
             requested_aggs = aggregate or {'n': 'count'}
             if model is OrderPayment:

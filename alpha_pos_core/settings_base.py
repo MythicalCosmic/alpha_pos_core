@@ -314,7 +314,7 @@ LLM_READ_TIMEOUT_SECONDS = float(
 AI_REQUEST_DEADLINE_SECONDS = float(
     os.environ.get('AI_REQUEST_DEADLINE_SECONDS', '110')
 )
-AI_MAX_TOOL_ITERATIONS = int(os.environ.get('AI_MAX_TOOL_ITERATIONS', '5'))
+AI_MAX_TOOL_ITERATIONS = int(os.environ.get('AI_MAX_TOOL_ITERATIONS', '8'))
 # Optional ordered backups for deployments whose operator has explicitly
 # approved sending AI prompts to more than one vendor.  Keep this opt-in: the
 # prompts can contain restaurant sales, staff, stock, and customer context, so

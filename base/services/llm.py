@@ -422,6 +422,13 @@ def _tool_result_failed(value):
     return isinstance(parsed, dict) and bool(parsed.get('error'))
 
 
+def _tool_result_content(value):
+    """Serialize non-string tool results as valid JSON for provider correction."""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, default=str, ensure_ascii=False)
+
+
 def can_use_tools() -> bool:
     """True when the agentic (tool-use) path is available — the provider is Claude
     or OpenAI and its SDK is importable. Tool use lets the assistant drill into any
@@ -464,10 +471,10 @@ def call_ai_tools(
     if max_iterations is None:
         try:
             max_iterations = int(
-                getattr(settings, 'AI_MAX_TOOL_ITERATIONS', 5) or 5
+                getattr(settings, 'AI_MAX_TOOL_ITERATIONS', 8) or 8
             )
         except (TypeError, ValueError):
-            max_iterations = 5
+            max_iterations = 8
     max_iterations = max(1, min(int(max_iterations), 10))
 
     if (not can_use_tools() or not tools or tool_executor is None):
@@ -496,6 +503,7 @@ def call_ai_tools(
     messages = _history_messages(history) + [{'role': 'user', 'content': prompt}]
 
     tool_calls_completed = 0
+    unresolved_tool_error = False
 
     def _create(include_tools):
         # One create() call, retrying transient provider overloads (529 / 'high
@@ -505,7 +513,10 @@ def call_ai_tools(
             kwargs['system'] = _cache_system(system)
         if include_tools:
             kwargs['tools'] = _cache_tools(tools)
-            if require_tool and tool_calls_completed == 0:
+            if (
+                unresolved_tool_error
+                or (require_tool and tool_calls_completed == 0)
+            ):
                 kwargs['tool_choice'] = {'type': 'any'}
         delay = 1.0
         last_err = None
@@ -551,6 +562,8 @@ def call_ai_tools(
             if err:
                 return None, err
             if getattr(resp, 'stop_reason', None) != 'tool_use':
+                if unresolved_tool_error:
+                    return None, 'data_tool_failed'
                 if require_tool and tool_calls_completed == 0:
                     return None, 'tool_grounding_missing'
                 return _final_text(resp)
@@ -559,28 +572,44 @@ def call_ai_tools(
             # requested tool and return all results in one user turn.
             messages.append({'role': 'assistant', 'content': resp.content})
             results = []
+            unresolved_before_round = unresolved_tool_error
+            round_had_error = False
+            round_had_success = False
             for block in resp.content:
                 if getattr(block, 'type', None) != 'tool_use':
                     continue
                 try:
                     out = tool_executor(block.name, dict(block.input or {}))
+                    result = {
+                        'type': 'tool_result',
+                        'tool_use_id': block.id,
+                        'content': _tool_result_content(out),
+                    }
                     if _tool_result_failed(out):
                         logger.warning(
                             'AI data tool returned an error tool=%s',
                             getattr(block, 'name', '?'),
                         )
-                        return None, 'data_tool_failed'
-                    tool_calls_completed += 1
-                    results.append({
-                        'type': 'tool_result', 'tool_use_id': block.id,
-                        'content': out if isinstance(out, str) else str(out),
-                    })
+                        result['is_error'] = True
+                        round_had_error = True
+                    else:
+                        tool_calls_completed += 1
+                        round_had_success = True
+                    results.append(result)
                 except Exception:  # noqa: BLE001
                     logger.exception('AI tool %s failed', getattr(block, 'name', '?'))
                     return None, 'data_tool_failed'
             messages.append({'role': 'user', 'content': results})
+            # A success from the same assistant turn cannot correct an error the
+            # provider has not seen yet. Only a clean later tool round resolves it.
+            if round_had_error:
+                unresolved_tool_error = True
+            elif unresolved_before_round and round_had_success:
+                unresolved_tool_error = False
 
         # Never force an ungrounded answer after the tool budget is exhausted.
+        if unresolved_tool_error:
+            return None, 'data_tool_failed'
         return None, 'tool_iteration_limit'
     except Exception as e:  # noqa: BLE001
         logger.exception('claude tool loop failed')
@@ -818,13 +847,17 @@ def _openai_tool_loop(prompt, system, tools, tool_executor, max_tokens,
     messages.append({'role': 'user', 'content': prompt})
     ceiling = max(int(max_tokens or 2048), OPENAI_MIN_COMPLETION_TOKENS)
     tool_calls_completed = 0
+    unresolved_tool_error = False
 
     def _create(include_tools):
         kwargs = {'model': model, 'messages': messages, 'max_completion_tokens': ceiling,
                   **_openai_sampling_kwargs(model)}
         if include_tools:
             kwargs['tools'] = oai_tools
-            if require_tool and tool_calls_completed == 0:
+            if (
+                unresolved_tool_error
+                or (require_tool and tool_calls_completed == 0)
+            ):
                 kwargs['tool_choice'] = 'required'
         delay, last_err = 1.0, None
         for attempt in range(retries + 1):
@@ -868,6 +901,8 @@ def _openai_tool_loop(prompt, system, tools, tool_executor, max_tokens,
             msg = resp.choices[0].message if resp.choices else None
             tool_calls = getattr(msg, 'tool_calls', None) if msg else None
             if not tool_calls:
+                if unresolved_tool_error:
+                    return None, 'data_tool_failed'
                 if require_tool and tool_calls_completed == 0:
                     return None, 'tool_grounding_missing'
                 return _final_text(resp)
@@ -882,6 +917,9 @@ def _openai_tool_loop(prompt, system, tools, tool_executor, max_tokens,
                                  'arguments': tc.function.arguments or '{}'},
                 } for tc in tool_calls],
             })
+            unresolved_before_round = unresolved_tool_error
+            round_had_error = False
+            round_had_success = False
             for tc in tool_calls:
                 try:
                     args = json.loads(tc.function.arguments or '{}')
@@ -900,17 +938,27 @@ def _openai_tool_loop(prompt, system, tools, tool_executor, max_tokens,
                             'AI data tool returned an error tool=%s',
                             tc.function.name,
                         )
-                        return None, 'data_tool_failed'
-                    tool_calls_completed += 1
+                        round_had_error = True
+                    else:
+                        tool_calls_completed += 1
+                        round_had_success = True
                 except Exception:  # noqa: BLE001
                     logger.exception('AI tool %s failed', tc.function.name)
                     return None, 'data_tool_failed'
                 messages.append({
                     'role': 'tool', 'tool_call_id': tc.id,
-                    'content': out if isinstance(out, str) else str(out),
+                    'content': _tool_result_content(out),
                 })
+            # A success from the same assistant turn cannot correct an error the
+            # provider has not seen yet. Only a clean later tool round resolves it.
+            if round_had_error:
+                unresolved_tool_error = True
+            elif unresolved_before_round and round_had_success:
+                unresolved_tool_error = False
 
         # Never force an ungrounded answer after the tool budget is exhausted.
+        if unresolved_tool_error:
+            return None, 'data_tool_failed'
         return None, 'tool_iteration_limit'
     except Exception as e:  # noqa: BLE001
         logger.exception('openai tool loop failed')

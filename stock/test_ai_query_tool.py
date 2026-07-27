@@ -32,7 +32,8 @@ def _q(**args):
 
 def test_aggregate_sum_and_count():
     c = _u()
-    _order(c, '100000'); _order(c, '50000')
+    _order(c, '100000')
+    _order(c, '50000')
     _order(c, '30000', status='CANCELED', paid=False)
     r = _q(model='order', filters={'is_paid': True},
            aggregate={'revenue': 'sum:total_amount', 'n': 'count'})
@@ -41,7 +42,9 @@ def test_aggregate_sum_and_count():
 
 def test_group_by():
     c1, c2 = _u(), _u()
-    _order(c1, '100000'); _order(c1, '20000'); _order(c2, '5000')
+    _order(c1, '100000')
+    _order(c1, '20000')
+    _order(c2, '5000')
     r = _q(model='order', aggregate={'rev': 'sum:total_amount'}, group_by=['cashier'])
     by = {row['cashier']: row['rev'] for row in r['result']}
     assert by[c1.id] == 120000.0 and by[c2.id] == 5000.0
@@ -56,6 +59,59 @@ def test_row_mode_fields_and_decimal_floatified():
     row = r['rows'][0]
     assert row['status'] == 'COMPLETED' and row['cashier__first_name'] == 'Ann'
     assert row['total_amount'] == 77000.0            # Decimal -> float
+
+
+def test_orderitem_line_total_is_available_in_rows_and_aggregates():
+    from base.models import Category, OrderItem, Product
+
+    cashier = _u()
+    order = _order(cashier, '7500')
+    category = Category.objects.create(
+        name='Ice cream',
+        slug=f'ice-{secrets.token_hex(4)}',
+    )
+    product = Product.objects.create(
+        category=category,
+        name='Muzqaymoq',
+        price=Decimal('2500'),
+    )
+    OrderItem.objects.create(
+        order=order,
+        product=product,
+        quantity=3,
+        price=Decimal('2500'),
+    )
+
+    rows = _q(
+        model='orderitem',
+        filters={'product__name__icontains': 'Muz'},
+        fields=['price', 'quantity', 'line_total_uzs'],
+    )
+    totals = _q(
+        model='orderitem',
+        filters={'product__name__icontains': 'Muz'},
+        aggregate={'revenue': 'sum:line_total_uzs'},
+    )
+
+    assert rows['rows'] == [{
+        'price': 2500.0,
+        'quantity': 3,
+        'line_total_uzs': 7500.0,
+    }]
+    assert totals['result']['revenue'] == 7500.0
+
+
+def test_orderitem_total_price_gets_a_targeted_safe_correction():
+    row_error = _q(model='orderitem', fields=['id', 'total_price'])
+    aggregate_error = _q(
+        model='orderitem',
+        aggregate={'revenue': 'sum:total_price'},
+    )
+
+    for result in (row_error, aggregate_error):
+        assert 'error' in result
+        assert 'line_total_uzs' in result['error']
+        assert 'sales_report' in result['error']
 
 
 def test_unknown_model_rejected():
@@ -80,7 +136,9 @@ def test_sensitive_field_blocked_everywhere():
 
 def test_soft_deleted_excluded_by_default():
     c = _u()
-    o = _order(c, '9000'); o.is_deleted = True; o.save()
+    o = _order(c, '9000')
+    o.is_deleted = True
+    o.save()
     _order(c, '1000')
     r = _q(model='order', aggregate={'n': 'count'})
     assert r['result']['n'] == 1

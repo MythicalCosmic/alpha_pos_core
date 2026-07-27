@@ -1,5 +1,6 @@
 """call_ai_tools: the Claude tool-use loop that lets the assistant read the live
 database in detail, plus its fallback to a single call for non-Claude providers."""
+import json
 import types
 
 from base.services import llm
@@ -30,6 +31,23 @@ def _fake_anthropic(msgs):
     """A stand-in for the `anthropic` module: .Anthropic(...) -> client.messages."""
     client = types.SimpleNamespace(messages=msgs)
     return types.SimpleNamespace(Anthropic=lambda **kw: client)
+
+
+def _openai_tool_call(call_id, name, args):
+    return types.SimpleNamespace(
+        id=call_id,
+        function=types.SimpleNamespace(
+            name=name,
+            arguments=json.dumps(args),
+        ),
+    )
+
+
+def _openai_response(content=None, tool_calls=None):
+    message = types.SimpleNamespace(content=content, tool_calls=tool_calls)
+    return types.SimpleNamespace(
+        choices=[types.SimpleNamespace(message=message)],
+    )
 
 
 def test_can_use_tools_only_for_claude(settings):
@@ -288,6 +306,233 @@ def test_call_ai_tools_surfaces_tool_errors_without_crashing(settings, monkeypat
     assert text is None and err == 'data_tool_failed'
     assert len(msgs.calls) == 1
     assert 'kaboom' not in str(err)
+
+
+def test_openai_corrects_live_shaped_query_db_field_error(
+        settings,
+        monkeypatch,
+):
+    settings.AI_PROVIDER = 'openai'
+    settings.OPENAI_API_KEY = 'k'
+
+    successful_calls = [
+        _openai_tool_call(
+            f'call_{index}',
+            'query_db',
+            {'model': 'order', 'fields': ['id'], 'offset': index},
+        )
+        for index in range(11)
+    ]
+    invalid_call = _openai_tool_call(
+        'call_invalid',
+        'query_db',
+        {'model': 'orderitem', 'fields': ['total_price']},
+    )
+    corrected_call = _openai_tool_call(
+        'call_corrected',
+        'query_db',
+        {'model': 'orderitem', 'fields': ['line_total_uzs']},
+    )
+    responses = [
+        _openai_response(tool_calls=[*successful_calls, invalid_call]),
+        _openai_response(tool_calls=[corrected_call]),
+        _openai_response(content='CORRECTED ANSWER'),
+    ]
+    calls = []
+
+    class _Completions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return responses.pop(0)
+
+    client = types.SimpleNamespace(chat=types.SimpleNamespace(
+        completions=_Completions(),
+    ))
+    monkeypatch.setattr(
+        llm,
+        'openai',
+        types.SimpleNamespace(OpenAI=lambda **kwargs: client),
+    )
+
+    executed = []
+
+    def executor(name, args):
+        executed.append((name, args))
+        if args.get('fields') == ['total_price']:
+            return {
+                'error': (
+                    "bad fields/order_by (Cannot resolve keyword "
+                    "'total_price' into field.)"
+                ),
+            }
+        return {'rows': [{'line_total_uzs': 200}]}
+
+    text, err = llm.call_ai_tools(
+        'Analyse the order-item totals.',
+        tools=[{'name': 'query_db'}],
+        tool_executor=executor,
+        max_iterations=8,
+    )
+
+    assert err is None and text == 'CORRECTED ANSWER'
+    assert len(executed) == 13
+    # Eleven good calls do not clear an error in that same assistant turn. The
+    # next request is forced to use a tool so the model must correct the query.
+    assert calls[1]['tool_choice'] == 'required'
+    assert 'tool_choice' not in calls[2]
+    error_result = next(
+        message for message in calls[1]['messages']
+        if message.get('role') == 'tool'
+        and message.get('tool_call_id') == 'call_invalid'
+    )
+    assert json.loads(error_result['content'])['error'].startswith(
+        'bad fields/order_by'
+    )
+
+
+def test_claude_corrects_live_shaped_query_db_field_error(
+        settings,
+        monkeypatch,
+):
+    settings.AI_PROVIDER = 'claude'
+    settings.ANTHROPIC_API_KEY = 'k'
+
+    successful_calls = [
+        _Block(
+            type='tool_use',
+            id=f'tu_{index}',
+            name='query_db',
+            input={'model': 'order', 'fields': ['id'], 'offset': index},
+        )
+        for index in range(11)
+    ]
+    invalid_call = _Block(
+        type='tool_use',
+        id='tu_invalid',
+        name='query_db',
+        input={'model': 'orderitem', 'fields': ['total_price']},
+    )
+    corrected_call = _Block(
+        type='tool_use',
+        id='tu_corrected',
+        name='query_db',
+        input={'model': 'orderitem', 'fields': ['line_total_uzs']},
+    )
+    msgs = _Msgs([
+        _Resp([*successful_calls, invalid_call], 'tool_use'),
+        _Resp([corrected_call], 'tool_use'),
+        _Resp([_Block(type='text', text='CORRECTED ANSWER')], 'end_turn'),
+    ])
+    monkeypatch.setattr(llm, 'anthropic', _fake_anthropic(msgs))
+
+    executed = []
+
+    def executor(name, args):
+        executed.append((name, args))
+        if args.get('fields') == ['total_price']:
+            return {
+                'error': (
+                    "bad fields/order_by (Cannot resolve keyword "
+                    "'total_price' into field.)"
+                ),
+            }
+        return {'rows': [{'line_total_uzs': 200}]}
+
+    text, err = llm.call_ai_tools(
+        'Analyse the order-item totals.',
+        tools=[{'name': 'query_db'}],
+        tool_executor=executor,
+        max_iterations=8,
+    )
+
+    assert err is None and text == 'CORRECTED ANSWER'
+    assert len(executed) == 13
+    assert msgs.calls[1]['tool_choice'] == {'type': 'any'}
+    assert 'tool_choice' not in msgs.calls[2]
+    error_result = next(
+        result
+        for message in msgs.calls[1]['messages']
+        if message.get('role') == 'user'
+        and isinstance(message.get('content'), list)
+        for result in message['content']
+        if result.get('tool_use_id') == 'tu_invalid'
+    )
+    assert error_result['is_error'] is True
+    assert json.loads(error_result['content'])['error'].startswith(
+        'bad fields/order_by'
+    )
+
+
+def test_openai_unresolved_structured_tool_error_fails_closed(
+        settings,
+        monkeypatch,
+):
+    settings.AI_PROVIDER = 'openai'
+    settings.OPENAI_API_KEY = 'k'
+    responses = [
+        _openai_response(tool_calls=[
+            _openai_tool_call(
+                'call_invalid',
+                'query_db',
+                {'model': 'orderitem', 'fields': ['total_price']},
+            ),
+        ]),
+        _openai_response(content='UNGROUNDED ANSWER'),
+    ]
+    calls = []
+
+    class _Completions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return responses.pop(0)
+
+    client = types.SimpleNamespace(chat=types.SimpleNamespace(
+        completions=_Completions(),
+    ))
+    monkeypatch.setattr(
+        llm,
+        'openai',
+        types.SimpleNamespace(OpenAI=lambda **kwargs: client),
+    )
+
+    text, err = llm.call_ai_tools(
+        'q',
+        tools=[{'name': 'query_db'}],
+        tool_executor=lambda *args: {'error': 'invalid field'},
+    )
+
+    assert text is None and err == 'data_tool_failed'
+    assert len(calls) == 2
+    assert calls[1]['tool_choice'] == 'required'
+
+
+def test_claude_unresolved_structured_tool_error_fails_closed(
+        settings,
+        monkeypatch,
+):
+    settings.AI_PROVIDER = 'claude'
+    settings.ANTHROPIC_API_KEY = 'k'
+    invalid_call = _Block(
+        type='tool_use',
+        id='tu_invalid',
+        name='query_db',
+        input={'model': 'orderitem', 'fields': ['total_price']},
+    )
+    msgs = _Msgs([
+        _Resp([invalid_call], 'tool_use'),
+        _Resp([_Block(type='text', text='UNGROUNDED ANSWER')], 'end_turn'),
+    ])
+    monkeypatch.setattr(llm, 'anthropic', _fake_anthropic(msgs))
+
+    text, err = llm.call_ai_tools(
+        'q',
+        tools=[{'name': 'query_db'}],
+        tool_executor=lambda *args: {'error': 'invalid field'},
+    )
+
+    assert text is None and err == 'data_tool_failed'
+    assert len(msgs.calls) == 2
+    assert msgs.calls[1]['tool_choice'] == {'type': 'any'}
 
 
 def test_openai_malformed_tool_arguments_fail_closed(settings, monkeypatch):
