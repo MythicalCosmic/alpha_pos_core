@@ -607,10 +607,17 @@ def call_ai_tools(
             elif unresolved_before_round and round_had_success:
                 unresolved_tool_error = False
 
-        # Never force an ungrounded answer after the tool budget is exhausted.
+        # The tool budget limits data-gathering rounds, not the final prose turn.
+        # Synthesize once with tools omitted only when the accumulated evidence
+        # is verified and every structured tool error has been resolved.
         if unresolved_tool_error:
             return None, 'data_tool_failed'
-        return None, 'tool_iteration_limit'
+        if tool_calls_completed == 0:
+            return None, 'tool_iteration_limit'
+        resp, err = _create(include_tools=False)
+        if err:
+            return None, err
+        return _final_text(resp)
     except Exception as e:  # noqa: BLE001
         logger.exception('claude tool loop failed')
         return None, str(e)
@@ -956,10 +963,17 @@ def _openai_tool_loop(prompt, system, tools, tool_executor, max_tokens,
             elif unresolved_before_round and round_had_success:
                 unresolved_tool_error = False
 
-        # Never force an ungrounded answer after the tool budget is exhausted.
+        # The tool budget limits data-gathering rounds, not the final prose turn.
+        # Synthesize once with tools omitted only when the accumulated evidence
+        # is verified and every structured tool error has been resolved.
         if unresolved_tool_error:
             return None, 'data_tool_failed'
-        return None, 'tool_iteration_limit'
+        if tool_calls_completed == 0:
+            return None, 'tool_iteration_limit'
+        resp, err = _create(include_tools=False)
+        if err:
+            return None, err
+        return _final_text(resp)
     except Exception as e:  # noqa: BLE001
         logger.exception('openai tool loop failed')
         return None, str(e)

@@ -312,7 +312,7 @@ LLM_READ_TIMEOUT_SECONDS = float(
     )
 )
 AI_REQUEST_DEADLINE_SECONDS = float(
-    os.environ.get('AI_REQUEST_DEADLINE_SECONDS', '110')
+    os.environ.get('AI_REQUEST_DEADLINE_SECONDS', '150')
 )
 AI_MAX_TOOL_ITERATIONS = int(os.environ.get('AI_MAX_TOOL_ITERATIONS', '8'))
 # Optional ordered backups for deployments whose operator has explicitly

@@ -572,14 +572,17 @@ def test_openai_malformed_tool_arguments_fail_closed(settings, monkeypatch):
     assert called == []
 
 
-def test_tool_iteration_limit_never_forces_ungrounded_answer(
+def test_claude_clean_tool_iteration_limit_synthesizes_final_answer(
         settings,
         monkeypatch,
 ):
     settings.AI_PROVIDER = 'claude'
     settings.ANTHROPIC_API_KEY = 'k'
     tool_use = _Block(type='tool_use', id='tu1', name='get_overview', input={})
-    msgs = _Msgs([_Resp([tool_use], 'tool_use')])
+    msgs = _Msgs([
+        _Resp([tool_use], 'tool_use'),
+        _Resp([_Block(type='text', text='SYNTHESIZED ANSWER')], 'end_turn'),
+    ])
     monkeypatch.setattr(llm, 'anthropic', _fake_anthropic(msgs))
 
     text, err = llm.call_ai_tools(
@@ -589,8 +592,125 @@ def test_tool_iteration_limit_never_forces_ungrounded_answer(
         max_iterations=1,
     )
 
-    assert text is None and err == 'tool_iteration_limit'
+    assert err is None and text == 'SYNTHESIZED ANSWER'
+    assert len(msgs.calls) == 2
+    assert 'tools' in msgs.calls[0]
+    assert 'tools' not in msgs.calls[1]
+    assert 'tool_choice' not in msgs.calls[1]
+    assert 'timeout' in msgs.calls[1]
+    assert any(
+        message.get('role') == 'user'
+        and isinstance(message.get('content'), list)
+        and message['content'][0].get('type') == 'tool_result'
+        for message in msgs.calls[1]['messages']
+    )
+
+
+def test_openai_clean_tool_iteration_limit_synthesizes_final_answer(
+        settings,
+        monkeypatch,
+):
+    settings.AI_PROVIDER = 'openai'
+    settings.OPENAI_API_KEY = 'k'
+    responses = [
+        _openai_response(tool_calls=[
+            _openai_tool_call('call_1', 'get_overview', {}),
+        ]),
+        _openai_response(content='SYNTHESIZED ANSWER'),
+    ]
+    calls = []
+
+    class _Completions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return responses.pop(0)
+
+    client = types.SimpleNamespace(chat=types.SimpleNamespace(
+        completions=_Completions(),
+    ))
+    monkeypatch.setattr(
+        llm,
+        'openai',
+        types.SimpleNamespace(OpenAI=lambda **kwargs: client),
+    )
+
+    text, err = llm.call_ai_tools(
+        'q',
+        tools=[{'name': 'get_overview'}],
+        tool_executor=lambda *args: '{"ok": true}',
+        max_iterations=1,
+    )
+
+    assert err is None and text == 'SYNTHESIZED ANSWER'
+    assert len(calls) == 2
+    assert 'tools' in calls[0]
+    assert 'tools' not in calls[1]
+    assert 'tool_choice' not in calls[1]
+    assert 'timeout' in calls[1]
+    assert any(
+        message.get('role') == 'tool'
+        and message.get('content') == '{"ok": true}'
+        for message in calls[1]['messages']
+    )
+
+
+def test_claude_unresolved_tool_error_rejects_budget_synthesis(
+        settings,
+        monkeypatch,
+):
+    settings.AI_PROVIDER = 'claude'
+    settings.ANTHROPIC_API_KEY = 'k'
+    tool_use = _Block(type='tool_use', id='tu1', name='query_db', input={})
+    msgs = _Msgs([_Resp([tool_use], 'tool_use')])
+    monkeypatch.setattr(llm, 'anthropic', _fake_anthropic(msgs))
+
+    text, err = llm.call_ai_tools(
+        'q',
+        tools=[{'name': 'query_db'}],
+        tool_executor=lambda *args: '{"error": "invalid field"}',
+        max_iterations=1,
+    )
+
+    assert text is None and err == 'data_tool_failed'
     assert len(msgs.calls) == 1
+
+
+def test_openai_unresolved_tool_error_rejects_budget_synthesis(
+        settings,
+        monkeypatch,
+):
+    settings.AI_PROVIDER = 'openai'
+    settings.OPENAI_API_KEY = 'k'
+    responses = [
+        _openai_response(tool_calls=[
+            _openai_tool_call('call_1', 'query_db', {}),
+        ]),
+    ]
+    calls = []
+
+    class _Completions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return responses.pop(0)
+
+    client = types.SimpleNamespace(chat=types.SimpleNamespace(
+        completions=_Completions(),
+    ))
+    monkeypatch.setattr(
+        llm,
+        'openai',
+        types.SimpleNamespace(OpenAI=lambda **kwargs: client),
+    )
+
+    text, err = llm.call_ai_tools(
+        'q',
+        tools=[{'name': 'query_db'}],
+        tool_executor=lambda *args: '{"error": "invalid field"}',
+        max_iterations=1,
+    )
+
+    assert text is None and err == 'data_tool_failed'
+    assert len(calls) == 1
 
 
 def test_openai_tool_timeout_retries_only_once(settings, monkeypatch):
