@@ -87,6 +87,22 @@ class TestKillSwitch:
         resp = _client().get('/api/admins/dashboard/today')
         assert resp.status_code == 503
 
+    @pytest.mark.parametrize('path', [
+        '/api/telegram/webhook/',
+        '/api/customer-bot/webhook/',
+    ])
+    def test_customer_bot_webhooks_ack_without_processing_when_blocked(
+        self, path,
+    ):
+        _unregister_license()
+        response = _client().post(
+            path,
+            data='{"update_id": 1}',
+            content_type='application/json',
+        )
+        assert response.status_code == 200
+        assert response.json() == {'ok': True}
+
     def test_options_passes_so_cors_preflight_works(self):
         # If we 503'd preflight, the browser would never send the real
         # request and the renderer couldn't even see the kill-switch

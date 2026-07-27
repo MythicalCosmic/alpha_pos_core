@@ -37,7 +37,12 @@ ALLOWLIST_PREFIXES = (
 # ever-growing backlog that hammers the host. We ack with 200 and silently
 # drop the update (no order is created while the license is dead).
 ACK_WHEN_BLOCKED_EXACT = frozenset({
+    # Local/core edition webhook.
     '/api/telegram/webhook/',
+    # Cloud/server edition mounts the same customer bot under this explicit
+    # namespace. Keep both aliases in the ACK lane so Telegram never enters a
+    # retry storm while the business API is license-blocked.
+    '/api/customer-bot/webhook/',
 })
 
 
