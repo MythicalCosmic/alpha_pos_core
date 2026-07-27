@@ -297,7 +297,7 @@ GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
 GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash')
 # OpenAI. GPT-5-class models use max_completion_tokens (handled in base.services.llm).
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
-OPENAI_MODEL = os.environ.get('OPENAI_MODEL', 'gpt-5.5')
+OPENAI_MODEL = os.environ.get('OPENAI_MODEL', 'gpt-5.6-luna')
 # Provider calls are synchronous, so both an individual network operation and
 # the complete multi-tool turn need explicit ceilings.  The old implementation
 # documented LLM_TIMEOUT_SECONDS but never bound it from the environment, which

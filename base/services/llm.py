@@ -12,7 +12,7 @@ operator-configured (desktop panel / env):
     GEMINI_API_KEY     — required when AI_PROVIDER=gemini.
     GEMINI_MODEL       — defaults to gemini-2.5-flash.
     OPENAI_API_KEY     — required when AI_PROVIDER=openai.
-    OPENAI_MODEL       — defaults to gpt-5.5 (full; also gpt-5.4, gpt-5.4-mini).
+    OPENAI_MODEL       — defaults to gpt-5.6-luna (cost-optimized GPT-5.6).
 
 `call_ai()` / `call_ai_tools()` accept an optional `history` (a list of
 {'role': 'user'|'assistant', 'content': str} prior turns) so the assistant can
@@ -43,12 +43,12 @@ except ImportError:
 # Current Sonnet — same price as 4.5, 1M context. Override via ANTHROPIC_MODEL.
 DEFAULT_CLAUDE_MODEL = 'claude-sonnet-4-6'
 DEFAULT_GEMINI_MODEL = 'gemini-2.5-flash'
-DEFAULT_OPENAI_MODEL = 'gpt-5.5'
+DEFAULT_OPENAI_MODEL = 'gpt-5.6-luna'
 # GPT-5-class models bill reasoning + answer against one ceiling and use
 # `max_completion_tokens` (not the legacy `max_tokens`); keep a generous floor so
 # a long answer (or any internal reasoning) is never truncated mid-sentence. The
-# FULL gpt-5.5 reasons more than the mini, so give it real headroom (a truncated
-# reasoning pass returns empty content -> 'openai_empty_response').
+# GPT-5 reasoning models need real headroom; a truncated reasoning pass returns
+# empty content -> 'openai_empty_response'.
 OPENAI_MIN_COMPLETION_TOKENS = 8192
 
 # If the configured Gemini model is overloaded (503 'high demand'), fall back to a
