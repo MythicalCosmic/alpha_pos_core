@@ -18,13 +18,25 @@ def test_cache_tools_marks_last_only_without_mutating_input():
     assert llm._cache_tools([]) == []
 
 
-def test_openai_sampling_kwargs_reasoning_vs_classic():
+def test_openai_sampling_kwargs_reasoning_vs_classic(settings):
+    settings.OPENAI_REASONING_EFFORT = 'low'
+    luna = llm._openai_sampling_kwargs('gpt-5.6-luna')
+    assert luna['reasoning_effort'] == 'low'
+    assert 'temperature' not in luna
+
     reasoning = llm._openai_sampling_kwargs('gpt-5.4-mini')
     assert 'temperature' not in reasoning        # reasoning model rejects temperature
+    assert 'reasoning_effort' not in reasoning
     assert reasoning['seed'] and reasoning['prompt_cache_key']
     assert llm._openai_sampling_kwargs('gpt-4o-mini')['temperature'] == 0
     for m in ('o1-mini', 'o3', 'o4-mini', 'gpt-5-nano'):
         assert 'temperature' not in llm._openai_sampling_kwargs(m)
+
+    settings.OPENAI_REASONING_EFFORT = 'not-valid'
+    assert (
+        llm._openai_sampling_kwargs('gpt-5.6-luna')['reasoning_effort']
+        == 'low'
+    )
 
 
 class _FakeCompletions:
