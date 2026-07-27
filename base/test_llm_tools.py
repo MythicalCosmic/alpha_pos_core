@@ -137,7 +137,8 @@ def test_history_messages_filters_to_clean_turns():
 def test_call_openai_builds_messages_and_uses_completion_tokens(settings, monkeypatch):
     settings.AI_PROVIDER = 'openai'
     settings.OPENAI_API_KEY = 'k'
-    settings.OPENAI_MODEL = 'gpt-5.4-mini'
+    settings.OPENAI_MODEL = 'gpt-5.6-luna'
+    settings.OPENAI_REASONING_EFFORT = 'low'
 
     captured = {}
 
@@ -173,7 +174,8 @@ def test_call_openai_builds_messages_and_uses_completion_tokens(settings, monkey
     assert msgs[3] == {'role': 'user', 'content': 'best cashier?'}
     # GPT-5-class models reject the legacy max_tokens.
     assert 'max_completion_tokens' in captured and 'max_tokens' not in captured
-    assert captured['model'] == 'gpt-5.4-mini'
+    assert captured['model'] == 'gpt-5.6-luna'
+    assert captured['reasoning_effort'] == 'low'
 
 
 def test_call_openai_empty_response_is_an_error(settings, monkeypatch):
@@ -209,6 +211,8 @@ def test_can_use_tools_for_openai(settings):
 def test_openai_tool_loop_runs_function_calls(settings, monkeypatch):
     settings.AI_PROVIDER = 'openai'
     settings.OPENAI_API_KEY = 'k'
+    settings.OPENAI_MODEL = 'gpt-5.6-luna'
+    settings.OPENAI_REASONING_EFFORT = 'low'
 
     class _Func:
         def __init__(self, name, args):
@@ -266,6 +270,7 @@ def test_openai_tool_loop_runs_function_calls(settings, monkeypatch):
     assert calls[0]['tools'][0]['type'] == 'function'
     assert calls[0]['tools'][0]['function']['name'] == 'list_orders'
     assert 'max_completion_tokens' in calls[0] and 'max_tokens' not in calls[0]
+    assert all(call['reasoning_effort'] == 'low' for call in calls)
     # Second create() carried the tool result back as a role:'tool' message.
     assert any(m.get('role') == 'tool' and m.get('content') == '{"orders": 3}'
                for m in calls[1]['messages'])

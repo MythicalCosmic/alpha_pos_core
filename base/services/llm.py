@@ -13,6 +13,7 @@ operator-configured (desktop panel / env):
     GEMINI_MODEL       — defaults to gemini-2.5-flash.
     OPENAI_API_KEY     — required when AI_PROVIDER=openai.
     OPENAI_MODEL       — defaults to gpt-5.6-luna (cost-optimized GPT-5.6).
+    OPENAI_REASONING_EFFORT — defaults to low for GPT-5.6 models.
 
 `call_ai()` / `call_ai_tools()` accept an optional `history` (a list of
 {'role': 'user'|'assistant', 'content': str} prior turns) so the assistant can
@@ -647,7 +648,19 @@ def _openai_sampling_kwargs(model):
         'seed': int(getattr(settings, 'OPENAI_SEED', 7)),
         'prompt_cache_key': 'alpha-pos-ai-assistant',
     }
-    if not str(model or '').startswith(('gpt-5', 'o1', 'o3', 'o4')):
+    model_name = str(model or '').strip().lower()
+    if model_name.startswith('gpt-5.6'):
+        effort = str(
+            getattr(settings, 'OPENAI_REASONING_EFFORT', 'low') or 'low'
+        ).strip().lower()
+        if effort not in {'none', 'low', 'medium', 'high', 'xhigh', 'max'}:
+            logger.warning(
+                'Invalid OPENAI_REASONING_EFFORT=%r; using low',
+                effort,
+            )
+            effort = 'low'
+        kw['reasoning_effort'] = effort
+    if not model_name.startswith(('gpt-5', 'o1', 'o3', 'o4')):
         kw['temperature'] = float(getattr(settings, 'AI_TEMPERATURE', 0) or 0)
     return kw
 

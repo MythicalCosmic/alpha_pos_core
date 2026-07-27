@@ -298,6 +298,10 @@ GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash')
 # OpenAI. GPT-5-class models use max_completion_tokens (handled in base.services.llm).
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
 OPENAI_MODEL = os.environ.get('OPENAI_MODEL', 'gpt-5.6-luna')
+# Luna is used for cost-sensitive database Q&A.  Pin a deliberate low effort
+# instead of inheriting GPT-5.6's medium default, which would add reasoning
+# latency/tokens on routine sales and stock lookups.
+OPENAI_REASONING_EFFORT = os.environ.get('OPENAI_REASONING_EFFORT', 'low')
 # Provider calls are synchronous, so both an individual network operation and
 # the complete multi-tool turn need explicit ceilings.  The old implementation
 # documented LLM_TIMEOUT_SECONDS but never bound it from the environment, which
