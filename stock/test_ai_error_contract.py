@@ -14,9 +14,6 @@ from django.test import RequestFactory
 from base.security.rate_limit import rate_limit_by
 from base.services import llm
 from stock.services.ai_assistant_service import (
-    AI_ASSISTANT_ERROR_MESSAGE,
-    AI_PROVIDER_CONFIGURATION_MESSAGE,
-    AI_PROVIDER_ERROR_MESSAGE,
     AI_PROVIDER_RATE_LIMIT_MESSAGE,
     AI_REQUEST_RATE_LIMIT_MESSAGE,
     AIStockAssistant,
@@ -39,28 +36,33 @@ def _provider_result(monkeypatch, error):
     '529: model overloaded',
     '503 UNAVAILABLE: high demand',
 ])
-def test_provider_rate_limit_returns_exact_user_message(monkeypatch, provider_error):
+def test_provider_rate_limit_returns_detailed_safe_message(monkeypatch, provider_error):
     result = _provider_result(monkeypatch, provider_error)
 
-    assert result['error'] == 'quota_exceeded'
+    assert result['error'] == 'provider_rate_limited'
     assert result['error_source'] == 'ai_provider'
     assert result['retryable'] is True
-    assert result['response'] == AI_PROVIDER_RATE_LIMIT_MESSAGE
-    assert result['message'] == AI_PROVIDER_RATE_LIMIT_MESSAGE
+    assert 'What happened' in result['response']
+    assert 'What the backend tried' in result['response']
+    assert 'Data safety' in result['response']
+    assert result['message'] == result['response']
+    assert result['incident_id'].startswith('AI-')
+    assert result['diagnostics']['category'] == 'rate_limit'
     assert provider_error not in json.dumps(result)
 
 
 @pytest.mark.parametrize('provider_error', [
     'upstream connection reset; request_id=secret-provider-id',
 ])
-def test_generic_provider_error_returns_exact_safe_message(monkeypatch, provider_error):
+def test_connection_error_returns_detailed_safe_message(monkeypatch, provider_error):
     result = _provider_result(monkeypatch, provider_error)
 
-    assert result['error'] == 'internal_error'
+    assert result['error'] == 'provider_connection_error'
     assert result['error_source'] == 'ai_provider'
     assert result['retryable'] is True
-    assert result['response'] == AI_PROVIDER_ERROR_MESSAGE
-    assert result['message'] == AI_PROVIDER_ERROR_MESSAGE
+    assert 'network connection' in result['response']
+    assert result['message'] == result['response']
+    assert result['incident_id'].startswith('AI-')
     assert provider_error not in json.dumps(result)
 
 
@@ -75,8 +77,9 @@ def test_provider_configuration_error_is_safe_and_not_retryable(
     assert result['error'] == 'provider_configuration_error'
     assert result['error_source'] == 'configuration'
     assert result['retryable'] is False
-    assert result['response'] == AI_PROVIDER_CONFIGURATION_MESSAGE
-    assert result['message'] == AI_PROVIDER_CONFIGURATION_MESSAGE
+    assert 'key, model, account, billing' in result['response']
+    assert result['message'] == result['response']
+    assert result['incident_id'].startswith('AI-')
     assert provider_error not in json.dumps(result)
 
 
@@ -214,8 +217,10 @@ def test_ai_chat_service_exception_is_returned_as_assistant_message(monkeypatch)
     payload = json.loads(response.content)
     assert response.status_code == 503
     assert payload['error'] == 'internal_error'
-    assert payload['response'] == AI_ASSISTANT_ERROR_MESSAGE
-    assert payload['message'] == AI_ASSISTANT_ERROR_MESSAGE
+    assert 'What happened' in payload['response']
+    assert 'Data safety' in payload['response']
+    assert payload['message'] == payload['response']
+    assert payload['incident_id'].startswith('AI-')
     assert 'secret DB detail' not in json.dumps(payload)
 
 
@@ -225,3 +230,31 @@ def test_provider_rate_limit_classifier_excludes_billing_and_bad_keys():
         '429 insufficient_quota: exceeded your current quota; check billing'
     )
     assert not llm.is_provider_rate_limited('401 invalid_api_key')
+
+
+def test_data_tool_failure_never_falls_back_to_capped_snapshot(monkeypatch):
+    from stock.services.ai_tools_service import AIToolbox
+
+    monkeypatch.setattr(llm, 'can_use_tools', lambda: True)
+    monkeypatch.setattr(
+        llm,
+        'call_ai_tools',
+        lambda *args, **kwargs: (None, 'data_tool_failed'),
+    )
+    fallback_calls = []
+    monkeypatch.setattr(
+        llm,
+        'call_ai',
+        lambda *args, **kwargs: fallback_calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        AIToolbox,
+        'execute',
+        classmethod(lambda cls, *args, **kwargs: '{}'),
+    )
+
+    result = AIStockAssistant.process_query('exact sales total')
+
+    assert result['error'] == 'data_unavailable'
+    assert result['retryable'] is False
+    assert fallback_calls == []

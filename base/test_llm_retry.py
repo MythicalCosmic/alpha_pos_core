@@ -12,11 +12,100 @@ def test_is_transient_classification():
     assert llm._is_transient("503 UNAVAILABLE. high demand")
     assert llm._is_transient("429 RESOURCE_EXHAUSTED")
     assert llm._is_transient("the model is overloaded")
+    assert llm._is_transient("openai.APITimeoutError: Request timed out")
+    assert llm._is_transient("APIConnectionError: connection reset")
     assert not llm._is_transient("401 invalid api key")
     assert not llm._is_transient("400 invalid model name")
     assert not llm._is_transient("")
     # 429 insufficient_quota is a billing issue, not a transient overload — fail fast.
     assert not llm._is_transient("Error code: 429 - insufficient_quota: You exceeded your current quota")
+
+
+def test_timeout_retries_once_then_uses_configured_fallback(settings, monkeypatch):
+    settings.AI_PROVIDER = 'openai'
+    settings.OPENAI_API_KEY = 'openai-test'
+    settings.GEMINI_API_KEY = 'gemini-test'
+    settings.ANTHROPIC_API_KEY = ''
+    settings.AI_FALLBACK_PROVIDERS = 'gemini,claude'
+    monkeypatch.setattr(llm.time, 'sleep', lambda *_: None)
+    attempts = {'openai': 0, 'gemini': 0}
+
+    def slow_openai(*args, **kwargs):
+        attempts['openai'] += 1
+        return None, 'openai.APITimeoutError: Request timed out'
+
+    def healthy_gemini(*args, **kwargs):
+        attempts['gemini'] += 1
+        return 'FALLBACK ANSWER', None
+
+    monkeypatch.setattr(llm, '_call_openai', slow_openai)
+    monkeypatch.setattr(llm, '_call_gemini', healthy_gemini)
+
+    text, err = llm.call_ai('hi', retries=2)
+
+    assert text == 'FALLBACK ANSWER' and err is None
+    # Expensive network timeouts get one retry, not the full fast-overload budget.
+    assert attempts == {'openai': 2, 'gemini': 1}
+
+
+def test_configured_spare_key_does_not_enable_cross_provider_egress(
+        settings,
+        monkeypatch,
+):
+    settings.AI_PROVIDER = 'openai'
+    settings.OPENAI_API_KEY = 'openai-test'
+    settings.GEMINI_API_KEY = 'gemini-test'
+    settings.AI_FALLBACK_PROVIDERS = ''
+    monkeypatch.setattr(llm.time, 'sleep', lambda *_: None)
+    attempted = []
+
+    monkeypatch.setattr(
+        llm,
+        '_call_openai',
+        lambda *args, **kwargs: (None, 'Request timed out'),
+    )
+
+    def unexpected_gemini(*args, **kwargs):
+        attempted.append('gemini')
+        return 'must not be used', None
+
+    monkeypatch.setattr(llm, '_call_gemini', unexpected_gemini)
+
+    text, err = llm.call_ai('sensitive restaurant snapshot', retries=0)
+
+    assert text is None
+    assert isinstance(err, llm.LLMRequestFailure)
+    assert [item['provider'] for item in err.failures] == ['openai']
+    assert attempted == []
+
+
+def test_exhausted_providers_return_safe_structured_failure(settings, monkeypatch):
+    settings.AI_PROVIDER = 'openai'
+    settings.OPENAI_API_KEY = 'openai-test'
+    settings.GEMINI_API_KEY = 'gemini-test'
+    settings.ANTHROPIC_API_KEY = ''
+    settings.AI_FALLBACK_PROVIDERS = 'gemini'
+    monkeypatch.setattr(llm.time, 'sleep', lambda *_: None)
+    monkeypatch.setattr(
+        llm,
+        '_call_openai',
+        lambda *args, **kwargs: (None, 'Request timed out'),
+    )
+    monkeypatch.setattr(
+        llm,
+        '_call_gemini',
+        lambda *args, **kwargs: (None, '503 UNAVAILABLE high demand'),
+    )
+
+    text, err = llm.call_ai('hi', retries=0)
+
+    assert text is None
+    assert isinstance(err, llm.LLMRequestFailure)
+    assert [item['provider'] for item in err.failures] == ['openai', 'gemini']
+    assert [item['category'] for item in err.failures] == [
+        'timeout',
+        'rate_limit',
+    ]
 
 
 @pytest.mark.django_db

@@ -298,6 +298,31 @@ GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash')
 # OpenAI. GPT-5-class models use max_completion_tokens (handled in base.services.llm).
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
 OPENAI_MODEL = os.environ.get('OPENAI_MODEL', 'gpt-5.5')
+# Provider calls are synchronous, so both an individual network operation and
+# the complete multi-tool turn need explicit ceilings.  The old implementation
+# documented LLM_TIMEOUT_SECONDS but never bound it from the environment, which
+# left production permanently stuck at a 30-second read timeout.
+LLM_CONNECT_TIMEOUT_SECONDS = float(
+    os.environ.get('LLM_CONNECT_TIMEOUT_SECONDS', '10')
+)
+LLM_READ_TIMEOUT_SECONDS = float(
+    os.environ.get(
+        'LLM_READ_TIMEOUT_SECONDS',
+        os.environ.get('LLM_TIMEOUT_SECONDS', '45'),
+    )
+)
+AI_REQUEST_DEADLINE_SECONDS = float(
+    os.environ.get('AI_REQUEST_DEADLINE_SECONDS', '110')
+)
+AI_MAX_TOOL_ITERATIONS = int(os.environ.get('AI_MAX_TOOL_ITERATIONS', '5'))
+# Optional ordered backups for deployments whose operator has explicitly
+# approved sending AI prompts to more than one vendor.  Keep this opt-in: the
+# prompts can contain restaurant sales, staff, stock, and customer context, so
+# merely configuring a spare API key must not authorize cross-provider egress.
+AI_FALLBACK_PROVIDERS = os.environ.get(
+    'AI_FALLBACK_PROVIDERS',
+    '',
+)
 # AI determinism knobs. A fixed seed makes the assistant reproducible (same
 # question -> same answer) where the provider supports it; AI_TEMPERATURE feeds
 # the non-reasoning OpenAI/Gemini paths (reasoning models ignore/reject it and

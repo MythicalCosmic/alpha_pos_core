@@ -43,7 +43,14 @@ def test_call_ai_tools_falls_back_when_not_claude(settings, monkeypatch):
     settings.AI_PROVIDER = 'gemini'
     seen = {}
 
-    def fake_call_ai(prompt, system=None, max_tokens=2048, retries=2, history=None):
+    def fake_call_ai(
+        prompt,
+        system=None,
+        max_tokens=2048,
+        retries=2,
+        history=None,
+        **kwargs,
+    ):
         seen['prompt'] = prompt
         return 'PLAIN', None
 
@@ -245,8 +252,8 @@ def test_openai_tool_loop_runs_function_calls(settings, monkeypatch):
     assert any(m.get('role') == 'tool' and m.get('content') == '{"orders": 3}'
                for m in calls[1]['messages'])
 
-    # A failing executor is logged locally, but OpenAI receives fixed safe text
-    # rather than an ORM/SDK exception that it could echo to the operator.
+    # A failing data tool must fail closed. Continuing without the evidence can
+    # produce a plausible but false money/stock answer.
     responses.extend([
         _Resp(_Msg(tool_calls=[_TC('call_2', 'list_orders', '{}')])),
         _Resp(_Msg(content='SAFE FINAL ANSWER')),
@@ -259,13 +266,8 @@ def test_openai_tool_loop_runs_function_calls(settings, monkeypatch):
         'try again', tools=[{'name': 'list_orders'}],
         tool_executor=failing_executor,
     )
-    assert err is None and text == 'SAFE FINAL ANSWER'
-    tool_message = next(
-        message for message in calls[3]['messages']
-        if message.get('role') == 'tool'
-    )
-    assert tool_message['content'] == llm.SAFE_TOOL_ERROR_MESSAGE
-    assert 'secret database table name' not in tool_message['content']
+    assert text is None and err == 'data_tool_failed'
+    assert 'secret database table name' not in str(err)
 
 
 def test_call_ai_tools_surfaces_tool_errors_without_crashing(settings, monkeypatch):
@@ -283,12 +285,116 @@ def test_call_ai_tools_surfaces_tool_errors_without_crashing(settings, monkeypat
 
     text, err = llm.call_ai_tools(
         'q', tools=[{'name': 'boom'}], tool_executor=executor)
-    assert err is None and text == 'handled'
-    # The error is reported back to the model as an is_error tool_result, but
-    # raw exception details must never enter provider-visible context.
-    second = msgs.calls[1]['messages']
-    tr = next(m['content'][0] for m in second
-              if m['role'] == 'user' and isinstance(m['content'], list))
-    assert tr.get('is_error') is True
-    assert tr['content'] == llm.SAFE_TOOL_ERROR_MESSAGE
-    assert 'kaboom' not in tr['content']
+    assert text is None and err == 'data_tool_failed'
+    assert len(msgs.calls) == 1
+    assert 'kaboom' not in str(err)
+
+
+def test_openai_malformed_tool_arguments_fail_closed(settings, monkeypatch):
+    settings.AI_PROVIDER = 'openai'
+    settings.OPENAI_API_KEY = 'k'
+
+    tool_call = types.SimpleNamespace(
+        id='call_bad',
+        function=types.SimpleNamespace(
+            name='list_orders',
+            arguments='{not-json',
+        ),
+    )
+    response = types.SimpleNamespace(choices=[
+        types.SimpleNamespace(message=types.SimpleNamespace(
+            content=None,
+            tool_calls=[tool_call],
+        )),
+    ])
+    client = types.SimpleNamespace(chat=types.SimpleNamespace(
+        completions=types.SimpleNamespace(create=lambda **kwargs: response),
+    ))
+    monkeypatch.setattr(
+        llm,
+        'openai',
+        types.SimpleNamespace(OpenAI=lambda **kwargs: client),
+    )
+    called = []
+
+    text, err = llm.call_ai_tools(
+        'orders?',
+        tools=[{'name': 'list_orders'}],
+        tool_executor=lambda *args: called.append(args),
+    )
+
+    assert text is None and err == 'invalid_tool_arguments'
+    assert called == []
+
+
+def test_tool_iteration_limit_never_forces_ungrounded_answer(
+        settings,
+        monkeypatch,
+):
+    settings.AI_PROVIDER = 'claude'
+    settings.ANTHROPIC_API_KEY = 'k'
+    tool_use = _Block(type='tool_use', id='tu1', name='get_overview', input={})
+    msgs = _Msgs([_Resp([tool_use], 'tool_use')])
+    monkeypatch.setattr(llm, 'anthropic', _fake_anthropic(msgs))
+
+    text, err = llm.call_ai_tools(
+        'q',
+        tools=[{'name': 'get_overview'}],
+        tool_executor=lambda *args: '{"ok": true}',
+        max_iterations=1,
+    )
+
+    assert text is None and err == 'tool_iteration_limit'
+    assert len(msgs.calls) == 1
+
+
+def test_openai_tool_timeout_retries_only_once(settings, monkeypatch):
+    settings.AI_PROVIDER = 'openai'
+    settings.OPENAI_API_KEY = 'k'
+    monkeypatch.setattr(llm.time, 'sleep', lambda *_: None)
+    calls = []
+
+    class _Completions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            raise RuntimeError('openai.APITimeoutError: Request timed out')
+
+    client = types.SimpleNamespace(chat=types.SimpleNamespace(
+        completions=_Completions(),
+    ))
+    monkeypatch.setattr(
+        llm,
+        'openai',
+        types.SimpleNamespace(OpenAI=lambda **kwargs: client),
+    )
+
+    text, err = llm.call_ai_tools(
+        'orders?',
+        tools=[{'name': 'list_orders'}],
+        tool_executor=lambda *args: '{"orders": []}',
+        retries=2,
+    )
+
+    assert text is None
+    assert 'timed out' in str(err)
+    assert len(calls) == 2
+
+
+def test_claude_tool_loop_rejects_blank_final_answer(settings, monkeypatch):
+    settings.AI_PROVIDER = 'claude'
+    settings.ANTHROPIC_API_KEY = 'k'
+    tool_use = _Block(type='tool_use', id='tu1', name='get_overview', input={})
+    msgs = _Msgs([
+        _Resp([tool_use], 'tool_use'),
+        _Resp([_Block(type='text', text='   ')], 'end_turn'),
+    ])
+    monkeypatch.setattr(llm, 'anthropic', _fake_anthropic(msgs))
+
+    text, err = llm.call_ai_tools(
+        'q',
+        tools=[{'name': 'get_overview'}],
+        tool_executor=lambda *args: '{"ok": true}',
+    )
+
+    assert text is None
+    assert err == 'claude_empty_response'

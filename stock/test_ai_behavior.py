@@ -69,7 +69,7 @@ def test_process_query_injects_behavior_into_user_turn(monkeypatch):
     monkeypatch.setattr(A, '_get_sales_data', lambda: {})
     monkeypatch.setattr(A, '_needs_analytics', lambda q: False)
 
-    def fake_call_ai(prompt, system=None, max_tokens=None, history=None):
+    def fake_call_ai(prompt, system=None, max_tokens=None, history=None, **kwargs):
         captured['prompt'] = prompt
         captured['system'] = system
         return 'ok', None
@@ -96,7 +96,7 @@ def test_process_query_no_behavior_when_fresh(monkeypatch):
     monkeypatch.setattr(A, '_get_sales_data', lambda: {})
     monkeypatch.setattr(A, '_needs_analytics', lambda q: False)
 
-    def fake_call_ai(prompt, system=None, max_tokens=None, history=None):
+    def fake_call_ai(prompt, system=None, max_tokens=None, history=None, **kwargs):
         captured['prompt'] = prompt
         return 'ok', None
 

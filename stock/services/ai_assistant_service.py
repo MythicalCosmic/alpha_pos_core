@@ -1,10 +1,13 @@
 from typing import Dict, Any, List
 from datetime import timedelta
 import math
+import logging
+import time
 from django.db.models import Sum, Count, F, Q, Avg, Max
 from django.db.models.functions import Abs, TruncHour, TruncWeek
 from django.utils import timezone
 import json
+import uuid
 
 from stock.models import (
     StockLevel, StockTransaction, StockBatch,
@@ -58,7 +61,18 @@ AI_REQUEST_RATE_LIMIT_MESSAGE = (
 )
 
 
-def build_ai_error(error, message, *, source, retryable, suggestions=None):
+def build_ai_error(
+    error,
+    message,
+    *,
+    source,
+    retryable,
+    suggestions=None,
+    incident_id=None,
+    stage=None,
+    retry_after_seconds=None,
+    diagnostics=None,
+):
     """Build the stable, user-ready failure shape for AI chat responses."""
     payload = {
         "success": False,
@@ -70,7 +84,117 @@ def build_ai_error(error, message, *, source, retryable, suggestions=None):
     }
     if suggestions:
         payload["suggestions"] = suggestions
+    if incident_id:
+        payload["incident_id"] = incident_id
+    if stage:
+        payload["stage"] = stage
+    if retry_after_seconds is not None:
+        payload["retry_after_seconds"] = retry_after_seconds
+    if diagnostics:
+        payload["diagnostics"] = diagnostics
     return payload
+
+
+_FAILURE_EXPLANATIONS = {
+    'timeout': (
+        'A provider did not finish before its bounded read timeout. The backend '
+        'retried the slow call within the request deadline. An operator-approved '
+        'backup provider is also tried when that opt-in is configured.'
+    ),
+    'connection': (
+        'The backend could not maintain a network connection to an AI provider. '
+        'Automatic retry was attempted; operator-approved provider failover is '
+        'also used when that opt-in is configured.'
+    ),
+    'rate_limit': (
+        'An AI provider was temporarily rate-limited or overloaded. The backend '
+        'retried with backoff and used any operator-approved backup before stopping.'
+    ),
+    'configuration': (
+        'A configured provider rejected its key, model, account, billing, or SDK '
+        'configuration. Other configured providers were attempted when available.'
+    ),
+    'data_grounding': (
+        'The assistant could not obtain complete, verified database evidence. It '
+        'refused to guess or return an answer based on incomplete tool results.'
+    ),
+    'empty_response': (
+        'A provider returned no usable answer after processing the request. The '
+        'backend treated the blank result as a failure instead of saving it.'
+    ),
+    'bad_request': (
+        'A provider rejected the generated request or configured model. The '
+        'backend did not expose the provider response because it may contain '
+        'account or request metadata.'
+    ),
+    'temporary_provider_failure': (
+        'The AI provider reported a temporary service or capacity failure. '
+        'Automatic retries and any operator-approved provider backups were attempted.'
+    ),
+    'provider_error': (
+        'The AI provider could not complete the request for a reason that is '
+        'recorded in the protected server logs.'
+    ),
+}
+
+
+def detailed_ai_failure(err, *, stage='provider'):
+    """Return a long, safe operator-facing failure and diagnostic metadata."""
+    from base.services.llm import error_category, get_provider
+
+    incident_id = f'AI-{uuid.uuid4().hex[:12].upper()}'
+    failures = list(getattr(err, 'failures', []) or [])
+    if not failures:
+        failures = [{
+            'provider': get_provider(),
+            'category': error_category(err),
+            'attempts': 1,
+        }]
+
+    attempted = []
+    total_attempts = 0
+    for failure in failures:
+        provider = str(failure.get('provider') or 'configured provider').title()
+        category = str(
+            failure.get('category') or error_category(err)
+        ).replace('_', ' ')
+        attempts = max(0, int(failure.get('attempts') or 0))
+        total_attempts += attempts
+        attempted.append(f'{provider}: {category} ({attempts} attempt(s))')
+
+    primary_category = str(
+        failures[-1].get('category') or error_category(err)
+    )
+    explanation = _FAILURE_EXPLANATIONS.get(
+        primary_category,
+        _FAILURE_EXPLANATIONS['provider_error'],
+    )
+    message = (
+        "The AI request could not be completed safely after automatic recovery.\n\n"
+        f"What happened\n{explanation}\n\n"
+        "What the backend tried\n- " + "\n- ".join(attempted) + "\n\n"
+        "Why no answer is shown\n"
+        "Alpha POS will not invent sales, cash, order, stock, or staff figures "
+        "when the provider response or database evidence is incomplete.\n\n"
+        "Data safety\n"
+        "The AI path is read-only. No order, payment, shift, stock, or cash record "
+        "was changed by this failed request.\n\n"
+        f"Diagnostic reference: {incident_id}"
+    )
+    diagnostics = {
+        'category': primary_category,
+        'providers_attempted': [
+            str(item.get('provider') or '') for item in failures
+        ],
+        'attempt_count': total_attempts,
+    }
+    logging.getLogger(__name__).warning(
+        'AI request failed incident=%s stage=%s diagnostics=%s',
+        incident_id,
+        stage,
+        diagnostics,
+    )
+    return message, incident_id, diagnostics
 
 
 SYSTEM_PROMPT = """You are an expert AI business analyst and assistant for a restaurant/retail POS system in Uzbekistan.
@@ -1656,6 +1780,43 @@ class AIStockAssistant:
                 'tested again?"). Stay professional; never insult, never refuse.\n\n')
 
     @classmethod
+    def _snapshot_prompt(cls, query, preamble, location_id):
+        """Build the verified ORM snapshot used by non-tool providers/failover."""
+        stock_data = (
+            cls._get_all_stock_data(location_id)
+            if location_id is not None
+            else cls._get_all_stock_data()
+        )
+        sales_data = (
+            cls._get_sales_data(location_id)
+            if location_id is not None
+            else cls._get_sales_data()
+        )
+        combined_data = {
+            "date": timezone.localdate().isoformat(),
+            "sales_and_business": sales_data,
+            "stock_and_inventory": stock_data,
+        }
+        if cls._needs_analytics(query):
+            combined_data["business_analytics"] = {
+                "abc_analysis": cls._get_abc_analysis(location_id=location_id),
+                "xyz_analysis": cls._get_xyz_analysis(location_id=location_id),
+                "abc_xyz_matrix": cls._get_abc_xyz_matrix(location_id=location_id),
+                "menu_engineering": cls._get_menu_engineering(location_id=location_id),
+                "profitability": cls._get_profitability_analysis(location_id=location_id),
+                "inventory_health": cls._get_inventory_health(location_id=location_id),
+                "sales_velocity": cls._get_sales_velocity(location_id=location_id),
+            }
+        return f"""{preamble}USER QUERY: {query}
+
+CURRENT DATABASE STATE:
+{json.dumps(combined_data, indent=2, default=str, ensure_ascii=False)}
+
+Respond to the user's query based only on this data. If the exact requested
+fact is not present, state precisely what is unavailable rather than estimating.
+Follow all language and formatting rules from your instructions."""
+
+    @classmethod
     def process_query(cls, query: str, context: Dict = None, user_id: int = None,
                       location_id: int = None, history=None,
                       repeat_count: int = 0) -> Dict[str, Any]:
@@ -1678,7 +1839,42 @@ class AIStockAssistant:
                 source="alpha_pos", retryable=False,
             )
         try:
-            from base.services.llm import call_ai, call_ai_tools, can_use_tools
+            from base.services.llm import (
+                LLMRequestFailure,
+                _request_deadline_seconds,
+                call_ai,
+                call_ai_tools,
+                can_use_tools,
+                error_category,
+                get_provider,
+            )
+            from stock.services.ai_context import resolve_ai_context
+
+            data_context, scope_error = resolve_ai_context(location_id)
+            if scope_error:
+                failure = LLMRequestFailure(
+                    'data_scope_required',
+                    failures=[{
+                        'provider': get_provider(),
+                        'category': 'data_grounding',
+                        'attempts': 0,
+                    }],
+                    stage='scope',
+                )
+                message, incident_id, diagnostics = detailed_ai_failure(
+                    failure,
+                    stage='scope',
+                )
+                return build_ai_error(
+                    'scope_required',
+                    message,
+                    source='alpha_pos',
+                    retryable=False,
+                    suggestions=['Select a valid stock location'],
+                    incident_id=incident_id,
+                    stage='scope',
+                    diagnostics=diagnostics,
+                )
 
             # Page-context preamble (the tab/range/filters the user is looking at),
             # so "this/now/these" resolve to the CURRENT VIEW. Empty when no context.
@@ -1686,6 +1882,9 @@ class AIStockAssistant:
             # BEHAVIOR directive first (repeat/abuse -> playful annoyed opener). It
             # rides the USER turn, so the cached system prefix is untouched.
             preamble = cls._behavior_note(query, history, repeat_count) + preamble
+            request_deadline = (
+                time.monotonic() + _request_deadline_seconds()
+            )
             if can_use_tools():
                 # Claude path: hand the model read-only tools so it can drill into
                 # any order/shift/date/cashier/product itself — true "see everything"
@@ -1707,40 +1906,24 @@ every number on tool results. Follow all language and formatting rules."""
                     tool_executor=lambda n, a: AIToolbox.execute(n, a, location_id),
                     max_tokens=4096,
                     history=history,
+                    deadline=request_deadline,
+                    require_tool=True,
                 )
             else:
                 # Snapshot path (Gemini, or the Claude SDK isn't installed): one big
                 # pre-computed context in a single call, no live drill-down.
-                stock_data = (cls._get_all_stock_data(location_id)
-                              if location_id is not None else cls._get_all_stock_data())
-                sales_data = (cls._get_sales_data(location_id)
-                              if location_id is not None else cls._get_sales_data())
-
-                combined_data = {
-                    "date": timezone.localdate().isoformat(),
-                    "sales_and_business": sales_data,
-                    "stock_and_inventory": stock_data,
-                }
-
-                if cls._needs_analytics(query):
-                    combined_data["business_analytics"] = {
-                        "abc_analysis": cls._get_abc_analysis(location_id=location_id),
-                        "xyz_analysis": cls._get_xyz_analysis(location_id=location_id),
-                        "abc_xyz_matrix": cls._get_abc_xyz_matrix(location_id=location_id),
-                        "menu_engineering": cls._get_menu_engineering(location_id=location_id),
-                        "profitability": cls._get_profitability_analysis(location_id=location_id),
-                        "inventory_health": cls._get_inventory_health(location_id=location_id),
-                        "sales_velocity": cls._get_sales_velocity(location_id=location_id),
-                    }
-
-                prompt = f"""{preamble}USER QUERY: {query}
-
-CURRENT DATABASE STATE:
-{json.dumps(combined_data, indent=2, default=str, ensure_ascii=False)}
-
-Respond to the user's query based on this data. Follow all language and formatting rules from your instructions."""
-
-                text, err = call_ai(prompt, system=SYSTEM_PROMPT, max_tokens=2048, history=history)
+                prompt = cls._snapshot_prompt(
+                    query,
+                    preamble,
+                    data_context.location_id,
+                )
+                text, err = call_ai(
+                    prompt,
+                    system=SYSTEM_PROMPT,
+                    max_tokens=2048,
+                    history=history,
+                    deadline=request_deadline,
+                )
             if err == 'llm_key_missing':
                 return build_ai_error(
                     "no_api_key", AI_NOT_CONFIGURED_MESSAGE,
@@ -1754,29 +1937,47 @@ Respond to the user's query based on this data. Follow all language and formatti
                     suggestions=["Try again"],
                 )
             if err:
-                from base.services.llm import (
-                    is_provider_configuration_error,
-                    is_provider_rate_limited,
+                category = error_category(err)
+                code = {
+                    'timeout': 'provider_timeout',
+                    'connection': 'provider_connection_error',
+                    'rate_limit': 'provider_rate_limited',
+                    'configuration': 'provider_configuration_error',
+                    'data_grounding': 'data_unavailable',
+                    'empty_response': 'provider_empty_response',
+                    'bad_request': 'provider_bad_request',
+                }.get(category, 'provider_error')
+                message, incident_id, diagnostics = detailed_ai_failure(
+                    err,
+                    stage=getattr(err, 'stage', 'provider'),
                 )
-                if is_provider_configuration_error(err):
-                    return build_ai_error(
-                        "provider_configuration_error",
-                        AI_PROVIDER_CONFIGURATION_MESSAGE,
-                        source="configuration", retryable=False,
-                        suggestions=["Contact an administrator"],
-                    )
-                if is_provider_rate_limited(err):
-                    return build_ai_error(
-                        "quota_exceeded", AI_PROVIDER_RATE_LIMIT_MESSAGE,
-                        source="ai_provider", retryable=True,
-                        suggestions=["Try again later"],
-                    )
-                # Don't echo raw exception text — it leaks internals. Full trace
-                # is logged inside call_claude().
+                retryable = category not in {
+                    'configuration',
+                    'bad_request',
+                    'data_grounding',
+                }
                 return build_ai_error(
-                    "internal_error", AI_PROVIDER_ERROR_MESSAGE,
-                    source="ai_provider", retryable=True,
-                    suggestions=["Try again", "Stock overview"],
+                    code,
+                    message,
+                    source=(
+                        'configuration'
+                        if category == 'configuration'
+                        else (
+                            'alpha_pos'
+                            if category == 'data_grounding'
+                            else 'ai_provider'
+                        )
+                    ),
+                    retryable=retryable,
+                    suggestions=(
+                        ['Contact an administrator']
+                        if not retryable
+                        else ['Retry the request']
+                    ),
+                    incident_id=incident_id,
+                    stage=getattr(err, 'stage', 'provider'),
+                    retry_after_seconds=30 if retryable else None,
+                    diagnostics=diagnostics,
                 )
 
             return {
@@ -1785,16 +1986,22 @@ Respond to the user's query based on this data. Follow all language and formatti
                 "suggestions": cls._get_suggestions(query)
             }
 
-        except Exception:
-            import logging
+        except Exception as exc:
             logging.getLogger(__name__).exception('AI assistant query failed')
-            # Don't echo raw exception text — it leaks ORM model names, file
-            # paths, and SDK-internal details to the client. The full trace
-            # is in the server log via the .exception() call above.
+            message, incident_id, diagnostics = detailed_ai_failure(
+                exc,
+                stage='alpha_pos',
+            )
             return build_ai_error(
-                "internal_error", AI_ASSISTANT_ERROR_MESSAGE,
-                source="alpha_pos", retryable=True,
-                suggestions=["Try again", "Stock overview"],
+                "internal_error",
+                message,
+                source="alpha_pos",
+                retryable=True,
+                suggestions=["Retry the request"],
+                incident_id=incident_id,
+                stage='alpha_pos',
+                retry_after_seconds=15,
+                diagnostics=diagnostics,
             )
 
     @classmethod
@@ -1820,4 +2027,5 @@ __all__ = [
     'AI_NOT_CONFIGURED_MESSAGE',
     'AI_REQUEST_RATE_LIMIT_MESSAGE',
     'build_ai_error',
+    'detailed_ai_failure',
 ]

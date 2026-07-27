@@ -41,6 +41,21 @@ def test_unknown_tool_reports_error():
 
 
 @pytest.mark.django_db
+def test_tool_exception_never_exposes_raw_database_detail(monkeypatch):
+    def fail(cls, args):
+        raise RuntimeError('secret_table postgres://private-host')
+
+    monkeypatch.setattr(AIToolbox, '_t_overview', classmethod(fail))
+
+    raw = AIToolbox.execute('get_overview', {})
+    out = json.loads(raw)
+
+    assert out == {'error': 'data_tool_failed'}
+    assert 'secret_table' not in raw
+    assert 'private-host' not in raw
+
+
+@pytest.mark.django_db
 def test_list_orders_empty_is_clean():
     out = json.loads(AIToolbox.execute('list_orders', {'date': '2099-01-01'}))
     assert out['total_matching'] == 0 and out['orders'] == []

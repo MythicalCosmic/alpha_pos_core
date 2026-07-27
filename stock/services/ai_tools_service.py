@@ -86,6 +86,19 @@ def _parse_date(s):
         return None
 
 
+def _invalid_date_error(args, *fields):
+    """Reject an explicit malformed date instead of silently widening scope."""
+    for field in fields:
+        value = args.get(field)
+        if value not in (None, '') and _parse_date(value) is None:
+            return {
+                'error': (
+                    f"invalid {field}: expected an ISO date in YYYY-MM-DD format"
+                )
+            }
+    return None
+
+
 def _context(args):
     """Context injected by :meth:`AIToolbox.execute` after validation."""
     return AIDataContext(
@@ -762,9 +775,11 @@ class AIToolbox:
             return json.dumps({"error": f"unknown tool: {name}"})
         try:
             return json.dumps(handler(args), default=str, ensure_ascii=False)
-        except Exception as e:  # noqa: BLE001 — never crash the loop; report to the model
+        except Exception:  # noqa: BLE001 — never crash the provider loop
             logger.exception("AI tool %s failed", name)
-            return json.dumps({"error": str(e)})
+            # Raw ORM/driver exceptions may contain table names, SQL fragments,
+            # or connection details. Keep them in protected logs only.
+            return json.dumps({"error": "data_tool_failed"})
 
     # ── handlers ──
     @classmethod
@@ -884,10 +899,24 @@ class AIToolbox:
                 return {"error": err}
             try:
                 if group_by:
-                    rows = list(qs.values(*group_by[:6]).annotate(**aggs)
-                                .order_by(*group_by[:6])[:MAX_LIST])
-                    return {"model": name, "group_by": group_by[:6],
-                            "groups": len(rows), "result": _deep_float(rows)}
+                    selected_groups = group_by[:6]
+                    total_groups = (
+                        qs.values(*selected_groups).distinct().count()
+                    )
+                    rows = list(
+                        qs.values(*selected_groups)
+                        .annotate(**aggs)
+                        .order_by(*selected_groups)[:MAX_LIST]
+                    )
+                    return {
+                        "model": name,
+                        "group_by": selected_groups,
+                        "total_groups": total_groups,
+                        "returned": len(rows),
+                        "limit": MAX_LIST,
+                        "truncated": total_groups > len(rows),
+                        "result": _deep_float(rows),
+                    }
                 return {"model": name, "matched": qs.count(),
                         "result": _deep_float(qs.aggregate(**aggs))}
             except Exception as e:  # noqa: BLE001
@@ -917,8 +946,15 @@ class AIToolbox:
             rows = list(qs.values(*fields)[offset:offset + limit])
         except Exception as e:  # noqa: BLE001
             return {"error": "bad fields/order_by (%s)" % e}
-        return {"model": name, "total_matching": total, "returned": len(rows),
-                "rows": _deep_float(rows)}
+        return {
+            "model": name,
+            "total_matching": total,
+            "returned": len(rows),
+            "offset": offset,
+            "limit": limit,
+            "truncated": offset + len(rows) < total,
+            "rows": _deep_float(rows),
+        }
 
     @classmethod
     def _t_datetime(cls, args):
@@ -965,6 +1001,7 @@ class AIToolbox:
         open_shifts = (Shift.objects.filter(is_deleted=False, status=Shift.Status.ACTIVE)
                        .select_related("user").order_by("-start_time"))
         open_shifts = scope_branch(open_shifts, context.branch_id)
+        open_shifts_count = open_shifts.count()
         open_list = []
         for s in open_shifts[:50]:
             count = _shift_orders_qs(s).count()
@@ -1010,7 +1047,9 @@ class AIToolbox:
                 "paid_orders": sales_agg["paid"] or 0,
                 "unpaid_orders": volume_agg["unpaid"] or 0,
             },
-            "open_shifts_count": len(open_list),
+            "open_shifts_count": open_shifts_count,
+            "open_shifts_returned": len(open_list),
+            "open_shifts_truncated": open_shifts_count > len(open_list),
             "open_shifts": open_list,
             "cash_register_balance_uzs": _f(cash.current_balance) if cash else None,
             "cash_register_branch_id": cash.branch_id if cash else context.branch_id,
@@ -1032,6 +1071,14 @@ class AIToolbox:
 
     @classmethod
     def _t_list_orders(cls, args):
+        invalid_date = _invalid_date_error(
+            args,
+            'date',
+            'date_from',
+            'date_to',
+        )
+        if invalid_date:
+            return invalid_date
         qs = (Order.objects.filter(is_deleted=False)
               .select_related("cashier", "customer", "table", "place")
               .prefetch_related("items__product"))
@@ -1089,6 +1136,9 @@ class AIToolbox:
 
     @classmethod
     def _t_get_order(cls, args):
+        invalid_date = _invalid_date_error(args, 'date')
+        if invalid_date:
+            return invalid_date
         base = (Order.objects.filter(is_deleted=False)
                 .select_related("cashier", "customer", "table", "place", "delivery_person")
                 .prefetch_related("items__product__category", "payments"))
@@ -1149,6 +1199,14 @@ class AIToolbox:
 
     @classmethod
     def _t_list_shifts(cls, args):
+        invalid_date = _invalid_date_error(
+            args,
+            'date',
+            'date_from',
+            'date_to',
+        )
+        if invalid_date:
+            return invalid_date
         qs = Shift.objects.filter(is_deleted=False).select_related("user", "shift_template", "reconciliation")
         qs = _scope_orders(qs, args)
         if args.get("status"):
@@ -1295,6 +1353,13 @@ class AIToolbox:
         if args.get("out_only"):
             qs = qs.filter(quantity__lte=0)
         total = qs.count()
+        total_value = sum(
+            _f(quantity) * _f(avg_cost)
+            for quantity, avg_cost in qs.values_list(
+                'quantity',
+                'stock_item__avg_cost_price',
+            )
+        )
         limit = _clamp(args.get("limit"), MAX_LIST, 1, MAX_LIST)
         offset = _clamp(args.get("offset"), 0, 0, _OFFSET_MAX)
         rows = list(qs.order_by("stock_item__name")[offset:offset + limit])
@@ -1304,13 +1369,23 @@ class AIToolbox:
             "returned": len(items),
             "offset": offset,
             "limit": limit,
-            "total_value_uzs": round(sum(i["value_uzs"] for i in items), 2),
+            "truncated": offset + len(items) < total,
+            "total_value_uzs": round(total_value, 2),
+            "page_value_uzs": round(sum(i["value_uzs"] for i in items), 2),
             "items": items,
         }
 
     @classmethod
     def _t_sales_report(cls, args):
         context = _context(args)
+        invalid_date = _invalid_date_error(
+            args,
+            'date',
+            'date_from',
+            'date_to',
+        )
+        if invalid_date:
+            return invalid_date
         d = _parse_date(args.get("date"))
         df, dt = _parse_date(args.get("date_from")), _parse_date(args.get("date_to"))
         if d:
