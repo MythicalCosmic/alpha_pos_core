@@ -1,15 +1,5 @@
-import html
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta
-
-
-def html_escape(value):
-    # Telegram parse_mode=HTML treats &, <, > as markup. User-controlled
-    # values (product names, customer phones, cashier names) must be escaped
-    # to prevent broken rendering or markup injection.
-    if value is None:
-        return ''
-    return html.escape(str(value), quote=False)
 
 
 UZB_TZ = timezone(timedelta(hours=5))

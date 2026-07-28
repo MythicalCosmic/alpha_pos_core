@@ -97,13 +97,3 @@ def build_receipt_payload(order, tenant, receipt_type='SALE'):
         'total': total,
         'items': items,
     }
-
-
-def missing_ikpu_products(order):
-    """Line items whose product has no IKPU code — these will be rejected by a
-    live OFD. Surfaced so the operator can fix the catalog before going live."""
-    missing = []
-    for item in order.items.select_related('product').all():
-        if not (getattr(item.product, 'ikpu_code', '') or ''):
-            missing.append(item.product.name if item.product else f'product {item.product_id}')
-    return missing

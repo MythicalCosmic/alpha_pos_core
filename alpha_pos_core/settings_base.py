@@ -5,10 +5,8 @@ from pathlib import Path
 
 BASE_DIR = Path(os.environ.get('ALPHA_POS_BASE_DIR') or Path.cwd())
 
-# Writable data directory. Normally the project root, but a packaged build (the
-# desktop .exe) sets ALPHA_POS_DATA_DIR to a persistent per-user location so the
-# SQLite DB, logs and media survive restarts — PyInstaller's BASE_DIR is a temp
-# extraction dir that is wiped every launch.
+# Writable state directory for logs, media, collected static files, and the
+# SQLite fallback used by standalone core tooling.
 DATA_DIR = Path(os.environ.get('ALPHA_POS_DATA_DIR') or BASE_DIR)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -189,9 +187,6 @@ else:
     }
 
 
-# Password validation
-# https://docs.djangoproject.com/en/5.2/ref/settings/#auth-password-validators
-
 AUTH_PASSWORD_VALIDATORS = [
     {
         'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator',
@@ -208,9 +203,6 @@ AUTH_PASSWORD_VALIDATORS = [
 ]
 
 
-# Internationalization
-# https://docs.djangoproject.com/en/5.2/topics/i18n/
-
 LANGUAGE_CODE = 'en-us'
 
 # Wall-clock-sensitive features (attendance "today", shift boundaries,
@@ -224,9 +216,6 @@ USE_I18N = True
 
 USE_TZ = True
 
-
-# Static files (CSS, JavaScript, Images)
-# https://docs.djangoproject.com/en/5.2/howto/static-files/
 
 STATIC_URL = 'static/'
 STATIC_ROOT = DATA_DIR / 'staticfiles'
@@ -248,9 +237,6 @@ STORAGES = {
 # file machinery — they're streamed only via auth-gated download views.
 MEDIA_ROOT = os.environ.get('MEDIA_ROOT', str(DATA_DIR / 'private_media'))
 MEDIA_URL = '/private-media/'  # not actually served; placeholder for FileField.url
-
-# Default primary key field type
-# https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
@@ -567,11 +553,7 @@ LOGGING = {
 # ---------------------------------------------------------------------------
 # Soliq fiscalization (Uzbek tax / OFD)
 # ---------------------------------------------------------------------------
-# PER-INSTALL fiscal identity. Each business runs its own deployment and sets
-# its OWN values here (via the desktop control panel, which writes the .env) —
-# receipts are always fiscalized under the selling business's TIN, never the
-# vendor's. See docs/FISCALIZATION.md.
-#
+# Each installation uses the selling business's own fiscal identity.
 # Mode: off | mock | sandbox | live  (runtime-toggleable from the control panel)
 FISCALIZATION_MODE = os.environ.get('FISCALIZATION_MODE', 'off')
 # Provider when not in mock mode: mock | multikassa  (more added as integrated)

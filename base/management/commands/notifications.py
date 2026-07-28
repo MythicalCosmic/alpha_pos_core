@@ -193,7 +193,7 @@ class Command(BaseCommand):
 
         info = ShiftSession.get_info()
         if info:
-            self.stdout.write(f'\n  Active shift:')
+            self.stdout.write('\n  Active shift:')
             self.stdout.write(f'    Cashier: {info["user_name"]}')
             self.stdout.write(f'    User ID: {info["user_id"]}')
             self.stdout.write(f'    Login: {info["login_time"]}')

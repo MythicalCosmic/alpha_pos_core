@@ -26,6 +26,7 @@ local_settings.py
 
 # Tests / tooling
 .pytest_cache/
+.ruff_cache/
 .coverage
 htmlcov/
 

@@ -39,14 +39,6 @@ AI_PROVIDER_RATE_LIMIT_MESSAGE = (
     "The AI provider is temporarily rate-limiting requests. "
     "Please wait a moment and try again."
 )
-AI_PROVIDER_ERROR_MESSAGE = (
-    "The AI provider could not process your request right now. "
-    "Please try again in a moment. If the problem continues, contact an administrator."
-)
-AI_PROVIDER_CONFIGURATION_MESSAGE = (
-    "The AI provider account or credentials require attention. "
-    "Please contact an administrator."
-)
 AI_ASSISTANT_ERROR_MESSAGE = (
     "The AI assistant could not complete your request right now. "
     "Please try again. If the problem continues, contact an administrator."
@@ -2099,8 +2091,6 @@ every number on tool results. Follow all language and formatting rules."""
 __all__ = [
     'AIStockAssistant',
     'AI_PROVIDER_RATE_LIMIT_MESSAGE',
-    'AI_PROVIDER_ERROR_MESSAGE',
-    'AI_PROVIDER_CONFIGURATION_MESSAGE',
     'AI_ASSISTANT_ERROR_MESSAGE',
     'AI_NOT_CONFIGURED_MESSAGE',
     'AI_REQUEST_RATE_LIMIT_MESSAGE',

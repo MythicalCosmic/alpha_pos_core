@@ -11,14 +11,10 @@ The local edition still has these methods on its call paths, but the EDITION
 gate makes them no-ops there (the till no longer sends — no more one-bot-per-till
 duplicates).
 """
-import logging
-
 from django.conf import settings
 
 from notifications.services.sender_service import SenderService
 from notifications.helpers import format_datetime, format_money, format_prep_time
-
-logger = logging.getLogger(__name__)
 
 ORDER_TYPE_LABELS = {
     'HALL': 'Zalda',

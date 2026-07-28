@@ -1,42 +1,38 @@
-# alpha_pos_core
+# Alpha POS Core
 
-The **shared spine** of Alpha POS. Both editions (`alpha_pos_server`,
-`alpha_pos_local`) consume this repo as a **git submodule + editable install**, so
-every synced model, the sync engine, auth, and the shared business apps are defined
-**once** and can never drift between editions.
+Shared backend packages used by both `alpha_pos_server` and `alpha_pos_local`.
+Each edition pins this repository as a Git submodule and installs it as a Python
+package.
 
-## What lives here
+## Packages
 
-| Package | Role |
-|---------|------|
-| `base` | Core models (User, Order, Product, Shift, CashRegister, …), auth, security, **the entire sync engine** `base/services/sync/*` |
-| `stock` | Inventory — sell-side decrement (local) + purchasing/recipes/production (server), same tables |
-| `discounts` | Discount catalog + apply-at-POS |
-| `cashbox` | Cash drawer / reconciliation / settlement |
-| `fiscalization` | Fiscal receipt signing (provider fires local; table read server) |
-| `licensing` | License kill-switch middleware + heartbeat (required on both editions) |
-| `notifications` | Templates / routing / worker / loyalty (the order-taking half routes local-only) |
-| `core/` | **New shared shims introduced by the split** (see below) |
-| `alpha_pos_core/` | `settings_base.py` + shared config (per-edition settings extend it) |
+| Package | Responsibility |
+| --- | --- |
+| `base` | Orders, users, shifts, payments, treasury, authentication, and synchronization |
+| `core.shifts` | Shared shift lifecycle and settlement rules |
+| `core.realtime` | Shared Channels consumers and transaction-safe event publishing |
+| `stock` | Inventory, purchasing, recipes, production, transfers, and stock accounting |
+| `hr` | Employees, attendance, contracts, payroll, expenses, and documents |
+| `discounts` | Discount configuration, validation, and application |
+| `cashbox` | Cash-drawer expenses and shift cashbox operations |
+| `fiscalization` | Fiscal receipt queue and provider interfaces |
+| `licensing` | License state, validation, heartbeat, and enforcement |
+| `notifications` | Telegram notifications, loyalty, carts, and QR ordering |
+| `alpha_pos_core` | Shared Django settings, URLs, WSGI, and ASGI configuration |
 
-## `core/` — new shims (being filled during the migration)
+Both editions install the same shared Django applications. Edition-specific URL
+configuration controls which APIs are exposed; synchronized models must remain
+available in both databases.
 
-- `core/shifts/` — `ShiftService` relocated out of `admins` (used by the local till).
-- `core/attendance/` — `pos_hook.py`: writes the `AUTO_POS` attendance row at login
-  so the local POS no longer imports `hr.services`; no-op if `hr` isn't installed.
-- `core/realtime/` — Channels consumers (`OrderQueue`, `KDS`, `TableMap`, `Drawer`,
-  `License`, `CashierControl`) + `publish.py` (`group_send` helpers producers call).
-- `core/sync_ws/` — websocket transport + consumer that **reuse** the existing
-  durable queue/cursor/idempotent-receiver in `base/services/sync/*` (not a rewrite).
+## Development
 
-## Golden rule
+```bash
+python -m venv .venv
+. .venv/bin/activate
+pip install -r requirements-dev.txt
+pytest
+```
 
-**Trim `urls.py`, never trim `MODEL_MAP`.** Every model in
-`base/services/sync/config.py` ships its table to both editions, even when its UI does
-not. See `../WORKSPACE.md`.
-
-## Status
-
-Apps copied from the monolith. Next: extract `settings_base.py`, add the `core/` shim
-implementations, make this pip-installable into both editions, get `manage.py check`
-green.
+Tests for each application live under that application's `tests` package.
+Financial, synchronization, authorization, and migration tests are regression
+contracts and must pass before either edition updates its submodule pointer.

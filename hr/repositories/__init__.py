@@ -7,10 +7,3 @@ from hr.repositories.cash_transaction import CashTransactionRepository
 from hr.repositories.contract import ContractRepository
 from hr.repositories.contract_document import ContractDocumentRepository
 from hr.repositories.leave_type import LeaveTypeRepository
-from hr.repositories.leave_request import LeaveRequestRepository
-from hr.repositories.leave_balance import LeaveBalanceRepository
-from hr.repositories.attendance import AttendanceRepository
-from hr.repositories.employee_document import EmployeeDocumentRepository
-from hr.repositories.performance_review import PerformanceReviewRepository
-from hr.repositories.performance_goal import PerformanceGoalRepository
-from hr.repositories.employment_event import EmploymentEventRepository

@@ -1,7 +1,7 @@
 from django.conf import settings
 from django.db import transaction
 from django.db.models import Sum, Q, Count, Avg, DecimalField
-from django.db.models.functions import Coalesce, TruncDate, TruncMonth, TruncYear
+from django.db.models.functions import Coalesce, TruncMonth, TruncYear
 from django.core.paginator import Paginator
 from django.utils import timezone
 from datetime import datetime, timedelta
@@ -161,14 +161,6 @@ class OrderRepository(BaseSyncRepository):
             ).prefetch_related('items__product__category', 'payments').get(pk=pk, is_deleted=False)
         except cls.model.DoesNotExist:
             return None
-
-    @classmethod
-    def get_last_display_id(cls):
-        # Retained for back-compat; new code should call next_display_id().
-        last = cls.model.objects.order_by('-id').only('display_id').first()
-        if not last or not last.display_id:
-            return 0
-        return last.display_id
 
     @classmethod
     def next_display_id(cls, scope=None):

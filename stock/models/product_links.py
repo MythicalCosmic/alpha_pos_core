@@ -1,11 +1,4 @@
-"""Product ↔ stock linkage models for the stock app.
-
-Auto-extracted from the original monolithic stock/models.py (smart_pos T5
-refactor). Cross-model FKs are still expressed as direct class references
-where the referenced model lives in this same submodule; FKs that cross
-submodules are expressed as string refs like `'stock.StockUnit'` to avoid
-import-order coupling.
-"""
+"""Product-to-stock linkage models."""
 from django.db import models
 
 from base.models import SyncMixin, SyncManager

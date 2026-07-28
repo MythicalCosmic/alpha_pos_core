@@ -1,9 +1,10 @@
 """Resolve the operational branch visible to an authenticated actor.
 
-Cloud admin identities are global (their ``branch_id`` is commonly ``cloud``),
-while transactional rows belong to a concrete restaurant branch.  Read and
-write endpoints must therefore resolve one explicit operational branch instead
-of accidentally querying every branch or creating cloud-owned business rows.
+Cloud-managed staff identities are global (their ``branch_id`` is commonly
+``cloud``), while transactional rows belong to a concrete restaurant branch.
+Read and write endpoints must therefore resolve one explicit operational branch
+instead of accidentally querying every branch or creating cloud-owned business
+rows.
 """
 
 from django.conf import settings
@@ -12,11 +13,11 @@ from django.conf import settings
 def resolve_actor_branch(actor=None):
     """Return one authorized operational branch id, or ``None``.
 
-    A concrete branch carried by the actor wins.  Global cloud actors use the
-    configured single-branch target.  Local installations use their bound
-    ``BRANCH_ID``.  As a compatibility fallback, a cloud with exactly one live
-    cash register may infer that register's branch; multiple branches fail
-    closed.
+    A concrete branch carried by the actor wins.  On a local installation,
+    blank and ``cloud`` identities operate in the node's bound ``BRANCH_ID``.
+    On a cloud installation, global actors use the configured single-branch
+    target.  As a compatibility fallback, a cloud with exactly one live cash
+    register may infer that register's branch; multiple branches fail closed.
     """
 
     actor_branch = str(getattr(actor, "branch_id", "") or "").strip()
@@ -25,10 +26,12 @@ def resolve_actor_branch(actor=None):
     ).strip().lower()
     node_branch = str(getattr(settings, "BRANCH_ID", "") or "").strip()
 
-    if deployment_mode != "cloud":
-        return actor_branch or node_branch or None
-
     global_markers = {"", "cloud"}
+    if deployment_mode != "cloud":
+        if actor_branch.lower() in global_markers:
+            return node_branch or None
+        return actor_branch
+
     if node_branch:
         global_markers.add(node_branch)
     if actor_branch not in global_markers:
@@ -54,4 +57,3 @@ def resolve_actor_branch(actor=None):
     if len(candidates) == 1:
         return str(candidates[0]).strip() or None
     return None
-

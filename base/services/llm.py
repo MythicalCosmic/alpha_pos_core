@@ -92,11 +92,6 @@ _PROVIDER_CONFIGURATION_MARKERS = _HARD_MARKERS + (
     'permission_denied', 'permission denied', '401', '403',
 )
 
-# A tool exception is logged with its traceback, but only this fixed text is
-# returned to the model. Provider output is ultimately user-visible, so feeding
-# raw ORM/SDK exception strings into the tool loop could disclose internals.
-SAFE_TOOL_ERROR_MESSAGE = 'The requested data tool failed.'
-
 _PROVIDER_FUNCTIONS = {
     'claude': '_call_claude',
     'gemini': '_call_gemini',
@@ -173,12 +168,6 @@ def is_provider_rate_limited(err) -> bool:
     if any(marker in error for marker in _HARD_MARKERS):
         return False
     return any(marker in error for marker in _PROVIDER_RATE_LIMIT_MARKERS)
-
-
-def is_provider_configuration_error(err) -> bool:
-    """Return whether the provider rejected credentials, account or billing."""
-    error = (err or '').lower()
-    return any(marker in error for marker in _PROVIDER_CONFIGURATION_MARKERS)
 
 
 def _timeout_seconds():

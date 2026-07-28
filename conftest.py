@@ -1,28 +1,5 @@
-import os
-
 import django
 import pytest
-
-os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'alpha_pos.settings')
-os.environ.setdefault('DEBUG', 'True')
-os.environ.setdefault('SECRET_KEY', 'pytest-secret-key')
-# The shared core test suite models the current single-branch cloud deployment.
-# Production receives the same explicit value from docker-compose; tests that
-# exercise multi-branch fail-closed behavior override this setting to blank.
-os.environ['CLOUD_DEFAULT_TARGET_BRANCH_ID'] = (
-    os.environ.get('CLOUD_DEFAULT_TARGET_BRANCH_ID') or 'branch1'
-)
-# Django forces settings.DEBUG=False during the test run regardless of the
-# env var, which trips the production fail-closed path in
-# licensing.services.crypto. Pin a stable Fernet key so the at-rest encryption
-# tests work without depending on the dev SECRET_KEY fallback.
-os.environ.setdefault(
-    'LICENSE_FERNET_KEY',
-    # Deterministic test key (urlsafe-base64 32 bytes). Generated once with
-    # Fernet.generate_key(); committed deliberately — tests never touch real
-    # license keys.
-    '6XzGcRmA0kcl-pX8R8wQbHCJqB7pDhVcMpC_Z8ZcKp4=',
-)
 
 django.setup()
 
@@ -54,7 +31,7 @@ def _active_license(db, _clear_caches):
 
     Tests that need to exercise the kill switch explicitly reset the
     License row to the state they want before the request (see
-    licensing/tests.py TestKillSwitch / TestStateTransitions)."""
+    licensing/tests/test_licensing.py TestKillSwitch / TestStateTransitions)."""
     from datetime import timedelta
     from django.utils import timezone
     from licensing.models import License

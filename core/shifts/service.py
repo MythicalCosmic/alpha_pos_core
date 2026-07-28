@@ -11,6 +11,7 @@ from django.utils import timezone
 from base.repositories.shift import ShiftTemplateRepository, ShiftRepository, CashReconciliationRepository
 from base.helpers.response import ServiceResponse
 from base.models import CashReconciliation, Order, Shift, User
+from base.services.branch_scope import resolve_actor_branch
 
 logger = logging.getLogger(__name__)
 
@@ -100,10 +101,7 @@ def _is_global_admin(actor):
 
 
 def _effective_actor_branch(actor):
-    branch = str(getattr(actor, 'branch_id', '') or '').strip()
-    if not branch and getattr(settings, 'DEPLOYMENT_MODE', 'local') != 'cloud':
-        branch = str(getattr(settings, 'BRANCH_ID', '') or '').strip()
-    return branch
+    return resolve_actor_branch(actor) or ''
 
 
 def _actor_can_access_shift(actor, shift):
@@ -1408,10 +1406,8 @@ class ShiftService:
         if actor is None or actor.id != reconciled_by_id:
             return ServiceResponse.forbidden('Invalid reconciliation actor')
         actor_role = str(getattr(actor, 'role', '') or '').upper()
-        actor_branch = str(getattr(actor, 'branch_id', '') or '').strip()
-        is_global_admin = (
-            actor_role == 'ADMIN' and actor_branch.lower() in ('', 'cloud')
-        )
+        actor_branch = _effective_actor_branch(actor)
+        is_global_admin = _is_global_admin(actor)
         if actor_role not in ('ADMIN', 'MANAGER') or (
             not is_global_admin and actor_branch != str(shift.branch_id or '')
         ):

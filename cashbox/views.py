@@ -1,7 +1,7 @@
 from django.db.models import Q
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
-from django.views.decorators.http import require_http_methods, require_GET, require_POST
+from django.views.decorators.http import require_http_methods, require_GET
 
 from base.helpers.request import parse_json_body
 from base.helpers.response import json_response

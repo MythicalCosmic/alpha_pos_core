@@ -12,8 +12,6 @@ the lifetime of the table; an attacker who scans a sticker still can
 only place orders at *that* table (which the staff sees and can
 cancel), not anywhere else.
 """
-import logging
-
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_POST
@@ -23,9 +21,6 @@ from base.models import Category, Product, Table
 from base.security.permissions import admin_required
 from base.security.rate_limit import rate_limit
 from notifications.services import qr_order_service
-
-logger = logging.getLogger(__name__)
-
 
 _ERROR_MESSAGES = {
     'items_empty': 'Provide at least one item',

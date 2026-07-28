@@ -516,12 +516,6 @@ def breakdown_for_orders(order_qs):
     return split, detail
 
 
-def drawer_cash_for_orders(order_qs):
-    """Aggregate only cash that physically entered a POS drawer."""
-    _split, _detail, drawer_cash = breakdown_sources_for_orders(order_qs)
-    return drawer_cash
-
-
 def breakdown_for_refunds(refund_qs):
     """Aggregate frozen tender buckets for an OrderRefund event queryset."""
     split, detail = empty_split(), empty_detail()
@@ -547,17 +541,6 @@ def net_breakdown(sale_order_qs, refund_qs):
         {key: sales[key] - refunds[key] for key in BUCKETS},
         {key: sale_detail[key] - refund_detail[key] for key in CARD_METHODS},
     )
-
-
-def noncash_total_for_orders(order_qs):
-    """Σ(non-cash OrderPayment lines) over an order queryset — the exact quantity the
-    drawer must subtract from revenue to get physical cash (the raw CASH lines are
-    the TENDERED amount and include the change)."""
-    from base.models import OrderPayment
-    from django.db.models import Sum
-    return OrderPayment.objects.filter(
-        is_deleted=False, order__in=order_qs, method__in=list(NONCASH_METHODS),
-    ).aggregate(s=Sum('amount'))['s'] or ZERO
 
 
 def unattributed_orders(order_qs=None):

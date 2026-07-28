@@ -4,10 +4,26 @@ from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_POST, require_http_methods
 from django.conf import settings
-from base.helpers.request import safe_per_page
 
 
 logger = logging.getLogger(__name__)
+DEFAULT_SYNC_PAGE_SIZE = 1000
+MAX_SYNC_PAGE_SIZE = 5000
+
+
+def _sync_page_size(request):
+    """Return the private sync-feed page size.
+
+    The public API pagination ceiling is intentionally small, but a full till
+    replay is a machine-to-machine transfer and needs its own bounded limit.
+    """
+    try:
+        requested = int(
+            request.GET.get('per_page', DEFAULT_SYNC_PAGE_SIZE)
+        )
+    except (TypeError, ValueError):
+        return DEFAULT_SYNC_PAGE_SIZE
+    return min(max(1, requested), MAX_SYNC_PAGE_SIZE)
 
 
 @csrf_exempt
@@ -516,10 +532,7 @@ def changes(request):
             {'error': 'since must be a valid ISO-8601 datetime'},
             status=400,
         )
-    try:
-        per_page = min(max(1, safe_per_page(request, 1000)), 5000)
-    except (TypeError, ValueError):
-        per_page = 1000
+    per_page = _sync_page_size(request)
 
     # Freeze a database-serialized high-water mark *before* reading any model.
     # A raw wall-clock timestamp is not a safe cursor: if NTP/manual correction
