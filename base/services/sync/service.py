@@ -16,17 +16,26 @@ from base.services.sync.context import authoritative_cloud_pull
 logger = logging.getLogger(__name__)
 
 LOCK_TTL = 120
+PULL_APPLY_LEASE_TTL = 15 * 60
 REJECTION_CODE_MAX_LENGTH = 80
 REJECTION_REASON_MAX_LENGTH = 400
 REJECTION_DETAIL_MAX_LENGTH = 480
 
 
-def _lease_ttl():
-    """Cover one complete transport retry envelope plus scheduling margin."""
+def _lease_ttl(name=None):
+    """Cover transport retries and the bounded work performed under the lease."""
     retries = max(1, int(get_sync_max_retries()))
     timeout = max(1, int(get_sync_timeout()))
     backoff = sum(min(2 ** attempt, 30) for attempt in range(retries - 1))
-    return max(LOCK_TTL, retries * timeout + backoff + 60)
+    ttl = max(LOCK_TTL, retries * timeout + backoff + 60)
+    if name == 'pull':
+        # One response can contain a page for every synchronized model. Applying
+        # those rows includes transactional reconciliation and can legitimately
+        # take longer than the HTTP retry envelope on a busy restaurant DB.
+        # Keep the database lease alive for a bounded apply window so the
+        # periodic worker cannot steal a healthy full replay between pages.
+        ttl = max(ttl, PULL_APPLY_LEASE_TTL)
+    return ttl
 
 
 class _QuarantinedRecordDeferred(Exception):
@@ -1398,7 +1407,7 @@ class SyncService:
             lease.value = json.dumps({
                 'token': token,
                 'expires_at': (
-                    now + timedelta(seconds=_lease_ttl())
+                    now + timedelta(seconds=_lease_ttl(name))
                 ).isoformat(),
             })
             lease.save(update_fields=['value', 'updated_at'])
@@ -1427,7 +1436,7 @@ class SyncService:
             lease.value = json.dumps({
                 'token': token,
                 'expires_at': (
-                    timezone.now() + timedelta(seconds=_lease_ttl())
+                    timezone.now() + timedelta(seconds=_lease_ttl(name))
                 ).isoformat(),
             })
             lease.save(update_fields=['value', 'updated_at'])

@@ -816,6 +816,16 @@ def test_lock_ttl_covers_full_transport_retry_envelope(settings):
     assert _lease_ttl() >= (5 * 60) + 15 + 60
 
 
+def test_pull_lock_ttl_covers_large_page_application(settings):
+    from base.services.sync.service import PULL_APPLY_LEASE_TTL, _lease_ttl
+
+    settings.SYNC_MAX_RETRIES = 1
+    settings.SYNC_TIMEOUT = 5
+
+    assert _lease_ttl('pull') >= PULL_APPLY_LEASE_TTL
+    assert _lease_ttl('push') < PULL_APPLY_LEASE_TTL
+
+
 def test_exact_action_identified_payment_replay_is_acknowledged(
     settings, order_factory,
 ):
