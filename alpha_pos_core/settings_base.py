@@ -284,7 +284,7 @@ SYNC_ON_SAVE = False
 
 # AI assistant + demand forecast (base/services/llm.py). The operator picks the
 # provider and pastes the matching key in the desktop panel (AI section) / env.
-AI_PROVIDER = os.environ.get('AI_PROVIDER', 'claude')  # 'claude', 'gemini', or 'openai'
+AI_PROVIDER = os.environ.get('AI_PROVIDER', 'openai')  # 'claude', 'gemini', or 'openai'
 # Claude (Anthropic). Current Sonnet default; also claude-sonnet-4-5 / claude-opus-4-8.
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
 ANTHROPIC_MODEL = os.environ.get('ANTHROPIC_MODEL', 'claude-sonnet-4-6')
@@ -293,7 +293,7 @@ GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
 GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash')
 # OpenAI. GPT-5-class models use max_completion_tokens (handled in base.services.llm).
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
-OPENAI_MODEL = os.environ.get('OPENAI_MODEL', 'gpt-5.5')
+OPENAI_MODEL = os.environ.get('OPENAI_MODEL', 'gpt-5.6-luna')
 # AI determinism knobs. A fixed seed makes the assistant reproducible (same
 # question -> same answer) where the provider supports it; AI_TEMPERATURE feeds
 # the non-reasoning OpenAI/Gemini paths (reasoning models ignore/reject it and
