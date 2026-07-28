@@ -1,6 +1,5 @@
 from django.db.models import Q, Count
 from django.core.cache import cache
-from django.core.paginator import Paginator
 from base.repositories.base import BaseSyncRepository
 from base.models import Product
 
@@ -80,10 +79,6 @@ class ProductRepository(BaseSyncRepository):
             Q(description__icontains=search_term)
         )
 
-    @classmethod
-    def paginate(cls, queryset, page=1, per_page=20):
-        paginator = Paginator(queryset, per_page)
-        return paginator.get_page(page), paginator
 
     @classmethod
     def name_exists(cls, name, category_id, exclude_id=None):

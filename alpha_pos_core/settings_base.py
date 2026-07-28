@@ -92,10 +92,8 @@ MIDDLEWARE = [
     # licensing/apps.py — moving this line will fail `manage.py check`.
     'licensing.middleware.LicenseEnforcementMiddleware',
     'django.middleware.security.SecurityMiddleware',
-    # Serve collected static files (Django admin assets, etc.) directly from
-    # gunicorn. Without this, DEBUG=False + no nginx means every /static/...
-    # request 404s and the admin — the documented vendor recovery surface —
-    # renders unstyled. Must sit immediately after SecurityMiddleware.
+    # Serve collected admin assets without a separate static-file server.
+    # WhiteNoise requires this position after SecurityMiddleware.
     'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -220,10 +218,8 @@ USE_TZ = True
 STATIC_URL = 'static/'
 STATIC_ROOT = DATA_DIR / 'staticfiles'
 
-# WhiteNoise compresses and serves STATIC_ROOT from gunicorn. Use the
-# non-manifest compressed backend: it gzips assets without the strict
-# manifest hashing that 500s the page if a referenced static file wasn't
-# collected. Sufficient for the admin/static surface this backend exposes.
+# WhiteNoise compresses and serves STATIC_ROOT through the application server.
+# The non-manifest backend avoids hard failures on missing asset references.
 STORAGES = {
     'default': {
         'BACKEND': 'django.core.files.storage.FileSystemStorage',
@@ -313,11 +309,8 @@ AI_FALLBACK_PROVIDERS = os.environ.get(
     'AI_FALLBACK_PROVIDERS',
     '',
 )
-# AI determinism knobs. A fixed seed makes the assistant reproducible (same
-# question -> same answer) where the provider supports it; AI_TEMPERATURE feeds
-# the non-reasoning OpenAI/Gemini paths (reasoning models ignore/reject it and
-# fall back gracefully). Prompt caching is automatic on OpenAI (stable system
-# prefix) and via cache_control on Anthropic — no key required.
+# Sampling controls for providers/models that support them. Reasoning models
+# omit temperature because those APIs reject it.
 OPENAI_SEED = int(os.environ.get('OPENAI_SEED', '7'))
 AI_TEMPERATURE = float(os.environ.get('AI_TEMPERATURE', '0'))
 
@@ -335,6 +328,9 @@ CUSTOMER_WEBHOOK_SECRET = os.environ.get('CUSTOMER_WEBHOOK_SECRET', '')
 CUSTOMER_WEBAPP_URL = os.environ.get('CUSTOMER_WEBAPP_URL', 'https://example.com')
 
 REDIS_URL = os.environ.get('REDIS_URL', 'redis://127.0.0.1:6379/0')
+USE_DUMMY_CACHE = os.environ.get(
+    'USE_DUMMY_CACHE', ''
+).lower() in ('true', '1', 'yes')
 
 if os.environ.get('USE_REDIS', '').lower() in ('true', '1', 'yes'):
     CACHES = {
@@ -348,10 +344,12 @@ if os.environ.get('USE_REDIS', '').lower() in ('true', '1', 'yes'):
             'TIMEOUT': 300,
         }
     }
-elif os.environ.get('USE_DUMMY_CACHE', '').lower() in ('true', '1', 'yes'):
-    # Process-shared (no caching at all). Used by the end-to-end
-    # verification script so a License.save() in one process is visible
-    # to the runserver immediately, without standing up Redis.
+elif USE_DUMMY_CACHE:
+    if not DEBUG:
+        from django.core.exceptions import ImproperlyConfigured
+        raise ImproperlyConfigured(
+            'USE_DUMMY_CACHE is test-only and cannot be enabled when DEBUG=False.'
+        )
     CACHES = {
         'default': {
             'BACKEND': 'django.core.cache.backends.dummy.DummyCache',
@@ -366,20 +364,21 @@ else:
         }
 }
 
-# Auth rate limiting stores its counters in the default cache. The per-process
-# LocMemCache is not shared across gunicorn workers, so a limit of N/window
-# becomes N*workers in aggregate — silently weakening login/setup throttling.
-# Warn loudly so production switches to the shared Redis cache.
+# LocMemCache is per process, so authentication limits are multiplied by the
+# number of web workers. Cloud deployments should use Redis.
+_default_web_concurrency = 3 if DEPLOYMENT_MODE == 'cloud' else 1
 try:
-    _gunicorn_workers = int(os.environ.get('GUNICORN_WORKERS', '1'))
+    WEB_CONCURRENCY = int(os.environ.get(
+        'WEB_CONCURRENCY', str(_default_web_concurrency),
+    ))
 except ValueError:
-    _gunicorn_workers = 1
+    WEB_CONCURRENCY = _default_web_concurrency
 if (not DEBUG
-        and _gunicorn_workers > 1
+        and WEB_CONCURRENCY > 1
         and CACHES['default']['BACKEND'].endswith('locmem.LocMemCache')):
     warnings.warn(
         f'Rate limiting uses the per-process LocMemCache with '
-        f'{_gunicorn_workers} gunicorn workers: auth throttles are effectively '
+        f'{WEB_CONCURRENCY} Uvicorn workers: auth throttles are effectively '
         f'multiplied by the worker count. Set USE_REDIS=true for shared, '
         f'correct rate limiting.',
         RuntimeWarning,
@@ -546,23 +545,13 @@ LOGGING = {
     },
 }
 
-# CORS — Electron renderer talks cross-origin to the backend.
-# Origins are env-driven so production gets an explicit allowlist; in DEBUG
-# we permit all origins for local dev kiosks. Browsers reject the combination
-# of CORS_ALLOW_ALL_ORIGINS=True with credentials, so we never ship that.
-# ---------------------------------------------------------------------------
 # Soliq fiscalization (Uzbek tax / OFD)
-# ---------------------------------------------------------------------------
-# Each installation uses the selling business's own fiscal identity.
-# Mode: off | mock | sandbox | live  (runtime-toggleable from the control panel)
+# Mode: off | mock | sandbox | live.
 FISCALIZATION_MODE = os.environ.get('FISCALIZATION_MODE', 'off')
-# Provider when not in mock mode: mock | multikassa  (more added as integrated)
 FISCAL_PROVIDER = os.environ.get('FISCAL_PROVIDER', 'mock')
-# serve-now (False, default): a sale completes even if the OFD is unreachable;
-# the receipt is queued and retried. block-on-failure (True): refuse to close
-# the sale until Soliq confirms.
+# When false, an unavailable provider queues the receipt instead of blocking
+# the sale.
 FISCAL_BLOCK_ON_FAILURE = os.environ.get('FISCAL_BLOCK_ON_FAILURE', 'false').lower() in ('1', 'true', 'yes')
-# The business's own tax identity + provider connection.
 FISCAL_TIN = os.environ.get('FISCAL_TIN', '')
 FISCAL_PROVIDER_URL = os.environ.get('FISCAL_PROVIDER_URL', '')
 FISCAL_MERCHANT_ID = os.environ.get('FISCAL_MERCHANT_ID', '')
@@ -572,16 +561,7 @@ try:
 except ValueError:
     FISCAL_VAT_PERCENT = 0
 
-# ---------------------------------------------------------------------------
 # Licensing / control plane
-# ---------------------------------------------------------------------------
-# The licensing app phones home to a control center the vendor operates and
-# enforces a kill switch when the license is suspended / expired / offline-
-# grace-exceeded.
-
-# Base URL of the pos_control_center deployment (e.g. https://control.example.com).
-# Required for the setup wizard and heartbeat daemon — without it the install
-# stays UNREGISTERED and every endpoint returns 503.
 LICENSE_CONTROL_CENTER_URL = os.environ.get('LICENSE_CONTROL_CENTER_URL', '')
 if (
     LICENSE_CONTROL_CENTER_URL
@@ -601,87 +581,43 @@ if (
 # Pin once per deployment; rotating this value invalidates the stored key.
 LICENSE_FERNET_KEY = os.environ.get('LICENSE_FERNET_KEY', '')
 
-# How often the heartbeat daemon pings the control center, in seconds.
-# Bumped down to 10 in the test suite to keep verification fast.
 LICENSE_HEARTBEAT_INTERVAL = int(os.environ.get('LICENSE_HEARTBEAT_INTERVAL', 300))
 
-# Offline grace window before the kill switch fires when the control center
-# is unreachable. Computed from `last_heartbeat_at`; if the gap exceeds
-# this many days the install is treated as expired even with a previously-
-# active status.
+# Offline grace window before the kill switch fires.
 LICENSE_GRACE_DAYS = int(os.environ.get('LICENSE_GRACE_DAYS', 7))
 
-# HTTP timeout (seconds) for one register/heartbeat call to the control
-# center. Short enough that a hung server doesn't tie up the daemon, long
-# enough for a normal round trip on a slow connection.
 LICENSE_HTTP_TIMEOUT_S = int(os.environ.get('LICENSE_HTTP_TIMEOUT_S', 10))
 
-# TTL (seconds) for the LicenseState snapshot the middleware reads on every
-# request. Lower = faster reaction to admin/heartbeat-driven state flips;
-# higher = fewer DB hits on cache miss. The heartbeat daemon explicitly
-# busts this on every tick, so the TTL only governs cold-cache behavior.
+# Heartbeats invalidate this snapshot after each update.
 LICENSE_STATE_CACHE_TTL = int(os.environ.get('LICENSE_STATE_CACHE_TTL', 60))
 
-# Backoff schedule (seconds, comma-separated) the heartbeat daemon walks
-# through after consecutive failures. Each value is a MINIMUM wait — the
-# daemon picks the larger of (LICENSE_HEARTBEAT_INTERVAL, schedule[step]).
 LICENSE_BACKOFF_SCHEDULE_S = tuple(
     int(x) for x in os.environ.get(
         'LICENSE_BACKOFF_SCHEDULE_S', '300,900,3600',
     ).split(',') if x.strip()
 ) or (300, 900, 3600)
 
-# Development-only kill-switch bypass. When set, the LicenseEnforcementMiddleware
-# lets every request through without a license / heartbeat / payment — so you
-# can run alpha_pos locally with no control center and nothing to pay.
-#
-# HARD-GATED on DEBUG: the env flag is only honored when DEBUG is True. A shipped
-# production build runs DEBUG=False, so the flag is dead there — a customer
-# cannot flip it to dodge the kill switch. (This is why the gate is `DEBUG and
-# ...` and not just the env var: a settings-toggle fail-open that worked in
-# production would be a license-bypass footgun.)
-#
-# DEBUG-gated BY DESIGN: production builds ship DEBUG=False, so this flag is
-# inert there. The fail-loud SECRET_KEY/DEBUG boot guard near the top of this
-# file backstops the gate — a production boot cannot quietly run as DEBUG with
-# the dev key and silently re-enable this bypass.
+# This bypass must remain gated by DEBUG; enabling it in production would
+# disable the licensing kill switch.
 LICENSE_DEV_BYPASS = DEBUG and os.environ.get(
     'LICENSE_DEV_BYPASS', ''
 ).lower() in ('true', '1', 'yes')
 
-# Vendor recovery path for a *production* install bricked by the kill switch:
-# reach the host shell and edit the License row via `python manage.py shell`.
-# There is intentionally no production /admin/-path bypass — only the
-# DEBUG-gated LICENSE_DEV_BYPASS above, which cannot take effect in production.
-
+# Cross-origin POS clients use an explicit production allowlist. Debug mode
+# opens origins only when no allowlist is configured.
 CORS_ALLOWED_ORIGINS = [
     o.strip() for o in os.environ.get('CORS_ALLOWED_ORIGINS', '').split(',') if o.strip()
 ]
-# Only enable credentialed CORS when there's an explicit allowlist — a
-# misconfigured production deploy with an empty list should not advertise
-# credential-bearing cross-origin support, even though browsers also
-# refuse it without specific origins.
 CORS_ALLOW_CREDENTIALS = bool(CORS_ALLOWED_ORIGINS)
 if DEBUG and not CORS_ALLOWED_ORIGINS:
     CORS_ALLOW_ALL_ORIGINS = True
     CORS_ALLOW_CREDENTIALS = False
-# Open CORS to EVERY origin. Two independent triggers:
-#   * OPEN_LAN — the desktop/LAN appliance (also drops CSRF + secure cookies).
-#   * CORS_ALLOW_ALL — a standalone switch for the HTTPS server that opens CORS
-#     ONLY, leaving CSRF enforcement and secure cookies intact.
-# Clients authenticate with bearer tokens (not cookies), so credentialed CORS
-# stays off — the browser-safe allow-all combination.
+# OPEN_LAN also changes CSRF/cookie behavior; CORS_ALLOW_ALL changes only CORS.
 CORS_ALLOW_ALL = os.environ.get('CORS_ALLOW_ALL', 'False').strip().lower() in ('1', 'true', 'yes', 'on')
 if OPEN_LAN or CORS_ALLOW_ALL:
     CORS_ALLOW_ALL_ORIGINS = True
     CORS_ALLOW_CREDENTIALS = False
 
-# Allow the custom request headers our write endpoints read on top of the
-# django-cors-headers defaults. `Idempotency-Key` is consumed by the @idempotent
-# decorator (orders.create / orders.pay / orders.cancel) — a cross-origin
-# browser client (e.g. the waiter app in web mode) sends it, and the CORS
-# preflight rejects any header not on this list (allow-all-origins does NOT
-# imply allow-all-headers). Native apps don't preflight, but listing it keeps
-# every client working.
+# Browser write clients need this header for idempotent payments and orders.
 from corsheaders.defaults import default_headers  # noqa: E402
 CORS_ALLOW_HEADERS = (*default_headers, 'idempotency-key')

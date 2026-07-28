@@ -309,7 +309,13 @@ def business_day_hour_order(start=None):
     return hours
 
 
-def tod_filter(qs, tod_from, tod_to, field='created_at', tz=None):
+def filter_by_repeated_local_time(
+    qs,
+    tod_from,
+    tod_to,
+    field='created_at',
+    tz=None,
+):
     """Legacy repeated local-time filter.
 
     New request handlers should resolve a :class:`ReportingWindow` instead.
@@ -320,10 +326,17 @@ def tod_filter(qs, tod_from, tod_to, field='created_at', tz=None):
     from django.db.models.functions import TruncTime
     tz = tz or timezone.get_current_timezone()
     qs = qs.alias(_tod=TruncTime(field, tzinfo=tz))
-    if tod_from is not None and tod_to is not None and tod_from > tod_to:
+    if (
+        tod_from is not None
+        and tod_to is not None
+        and tod_from > tod_to
+    ):
         return qs.filter(Q(_tod__gte=tod_from) | Q(_tod__lt=tod_to))
     if tod_from is not None:
         qs = qs.filter(_tod__gte=tod_from)
     if tod_to is not None:
         qs = qs.filter(_tod__lt=tod_to)
     return qs
+
+
+tod_filter = filter_by_repeated_local_time

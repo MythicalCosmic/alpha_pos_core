@@ -1,4 +1,3 @@
-from django.core.paginator import Paginator
 from django.utils import timezone
 from datetime import timedelta
 from base.repositories.base import BaseSyncRepository
@@ -95,8 +94,3 @@ class StockBatchRepository(BaseSyncRepository):
             current_quantity__gt=0,
             is_deleted=False,
         ).select_related('stock_item', 'location').order_by('expiry_date')
-
-    @classmethod
-    def paginate(cls, queryset, page=1, per_page=20):
-        paginator = Paginator(queryset, per_page)
-        return paginator.get_page(page), paginator

@@ -1,20 +1,8 @@
-"""Background dispatcher for inbound Telegram updates.
+"""Process-local queue for Telegram updates that would block a web worker.
 
-Telegram POSTs every update to the webhook, and handling one update makes one
-or more *blocking* HTTPS calls back to api.telegram.org (sendMessage,
-editMessageText, answerCallbackQuery), each with a multi-second timeout. Doing
-that inline in the webhook request ties up a gunicorn worker for the duration;
-a burst of updates (or Telegram-side latency) can exhaust the worker pool and
-stall the whole POS API.
-
-This module drains updates on a single background daemon thread so the webhook
-can ack Telegram with 200 immediately and return its worker to the pool. It
-mirrors the outbound worker.py pattern (lazy start, in-memory queue).
-
-Limitation: queued-but-unprocessed updates are lost on a hard shutdown. That's
-acceptable — the webhook has already 200'd, so Telegram will not re-deliver
-them either way, and a dropped inbound command is far less costly than a
-stalled API.
+The webhook acknowledges queued updates immediately. A hard shutdown can lose
+an acknowledged update, so this queue is an availability aid, not durable
+delivery.
 """
 import logging
 import queue

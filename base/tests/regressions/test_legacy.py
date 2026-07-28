@@ -1,4 +1,4 @@
-"""Regression tests for base / sync bugs."""
+"""Cross-domain regressions retained from the original base test suite."""
 from datetime import timedelta
 from decimal import Decimal
 

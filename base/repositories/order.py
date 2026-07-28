@@ -2,7 +2,6 @@ from django.conf import settings
 from django.db import transaction
 from django.db.models import Sum, Q, Count, Avg, DecimalField
 from django.db.models.functions import Coalesce, TruncMonth, TruncYear
-from django.core.paginator import Paginator
 from django.utils import timezone
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -76,8 +75,10 @@ def _window_queryset(qs, field, date_from=None, date_to=None,
         qs = qs.filter(**{f'{field}__gte': date_from})
     if date_to:
         qs = qs.filter(**{f'{field}__lte': date_to})
-    from base.services.business_day import tod_filter
-    return tod_filter(qs, tod_from, tod_to, field=field)
+    from base.services.business_day import filter_by_repeated_local_time
+    return filter_by_repeated_local_time(
+        qs, tod_from, tod_to, field=field,
+    )
 
 
 def _rows_by_key(rows, key):
@@ -227,11 +228,6 @@ class OrderRepository(BaseSyncRepository):
             return row.value
 
     @classmethod
-    def paginate(cls, queryset, page=1, per_page=20):
-        paginator = Paginator(queryset, per_page)
-        return paginator.get_page(page), paginator
-
-    @classmethod
     def build_filtered_queryset(cls, statuses=None, payment_status=None,
                                  category_ids=None, product_ids=None, user_id=None,
                                  cashier_id=None, order_type=None, date_from=None,
@@ -293,8 +289,10 @@ class OrderRepository(BaseSyncRepository):
 
         # Time-of-day filter: keep only rows whose LOCAL wall-clock time is within
         # [tod_from, tod_to], applied per day (working-hours window). No-op if both None.
-        from base.services.business_day import tod_filter
-        qs = tod_filter(qs, tod_from, tod_to, field='created_at')
+        from base.services.business_day import filter_by_repeated_local_time
+        qs = filter_by_repeated_local_time(
+            qs, tod_from, tod_to, field='created_at',
+        )
 
         return qs.order_by(order_by)
 

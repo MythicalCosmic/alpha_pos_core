@@ -15,9 +15,9 @@ def _at(hour, minute=0):
     )
 
 
-def test_tod_filter_supports_overnight_windows():
+def test_repeated_local_time_filter_supports_overnight_windows():
     from base.models import Order, User
-    from base.services.business_day import tod_filter
+    from base.services.business_day import filter_by_repeated_local_time
 
     cashier = User.objects.create(
         email=f'tod-{uuid4().hex}@test.local',
@@ -46,7 +46,7 @@ def test_tod_filter_supports_overnight_windows():
         Order.objects.filter(pk=order.pk).update(created_at=moment)
         rows[label] = order.id
 
-    matched = set(tod_filter(
+    matched = set(filter_by_repeated_local_time(
         Order.objects.filter(pk__in=rows.values()),
         time(22, 0),
         time(2, 0),
@@ -55,3 +55,12 @@ def test_tod_filter_supports_overnight_windows():
     # Reporting windows are uniformly half-open [start, end): the exact end
     # boundary belongs to the next/non-operating window.
     assert matched == {rows['late'], rows['early']}
+
+
+def test_tod_filter_remains_a_compatibility_alias():
+    from base.services.business_day import (
+        filter_by_repeated_local_time,
+        tod_filter,
+    )
+
+    assert tod_filter is filter_by_repeated_local_time

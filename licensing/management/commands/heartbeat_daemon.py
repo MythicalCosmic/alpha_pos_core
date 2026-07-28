@@ -1,15 +1,4 @@
-"""Long-running heartbeat loop.
-
-Launched by entrypoint.sh alongside gunicorn — NOT inside an
-AppConfig.ready() thread (which would spawn one heartbeat per gunicorn
-worker, tripling load and skewing last_heartbeat_at). Running as its
-own process keeps it observable: `docker ps` shows it, `docker logs`
-includes its output, and `docker kill` stops it cleanly via SIGTERM.
-
-Cadence: configurable via LICENSE_HEARTBEAT_INTERVAL (seconds).
-Backoff on failure: LICENSE_BACKOFF_SCHEDULE_S (comma-separated seconds,
-default 300,900,3600) and resets on recovery.
-"""
+"""Run one observable license heartbeat process beside the Uvicorn workers."""
 import logging
 import signal
 import time
@@ -24,10 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 def _backoff_schedule():
-    """Read the backoff schedule from settings each call so test-time
-    overrides via `settings.LICENSE_BACKOFF_SCHEDULE_S = (...)` take effect
-    without restarting the process. Each value is a MINIMUM wait; the daemon
-    still respects LICENSE_HEARTBEAT_INTERVAL as a floor when not in backoff."""
+    """Read settings on each call so test overrides take effect immediately."""
     schedule = getattr(settings, 'LICENSE_BACKOFF_SCHEDULE_S', (300, 900, 3600))
     return tuple(int(x) for x in schedule)
 

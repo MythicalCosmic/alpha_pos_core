@@ -1,19 +1,8 @@
-"""Single-worker notification dispatcher with token-bucket rate limiting.
+"""Process-local Telegram queue with per-chat pacing.
 
-Telegram throttles aggressively (30 messages/sec global, 1/sec/chat). The
-previous design spawned one daemon thread per notification, so a burst of
-orders could spawn dozens of threads each doing a blocking HTTPS POST and
-trip Telegram's rate limit.
-
-This module exposes a process-wide queue drained by a single background
-thread. The thread enforces a per-chat minimum interval before each send.
-
-Limitations:
-- The rate limiter is per-process. With N gunicorn workers you can issue
-  up to N messages/sec/chat. For a single-branch POS with a small worker
-  count this is acceptable; a Redis-backed token bucket would be needed
-  to coordinate across processes.
-- Queued messages in the in-memory queue are lost on hard shutdown.
+Each Uvicorn worker has its own limiter and a hard shutdown loses queued
+messages. A Redis-backed dispatcher is required if cross-worker guarantees
+become necessary.
 """
 import logging
 import queue

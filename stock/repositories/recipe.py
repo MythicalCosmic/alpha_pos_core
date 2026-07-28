@@ -1,5 +1,4 @@
 from django.db.models import Q
-from django.core.paginator import Paginator
 from base.repositories.base import BaseSyncRepository
 from stock.models import (
     Recipe, RecipeIngredient, RecipeIngredientSubstitute,
@@ -74,11 +73,6 @@ class RecipeRepository(BaseSyncRepository):
             Q(code__icontains=query) |
             Q(output_item__name__icontains=query)
         )
-
-    @classmethod
-    def paginate(cls, queryset, page=1, per_page=20):
-        paginator = Paginator(queryset, per_page)
-        return paginator.get_page(page), paginator
 
 
 class RecipeIngredientRepository(BaseSyncRepository):

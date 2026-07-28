@@ -1,5 +1,4 @@
 from django.db.models import Sum
-from django.core.paginator import Paginator
 from base.repositories.base import BaseSyncRepository
 from stock.models import PurchaseOrder, PurchaseOrderItem, PurchaseReceiving, PurchaseReceivingItem
 
@@ -46,11 +45,6 @@ class PurchaseOrderRepository(BaseSyncRepository):
             total_value=Sum('total'),
             count=Sum('id'),
         )
-
-    @classmethod
-    def paginate(cls, queryset, page=1, per_page=20):
-        paginator = Paginator(queryset, per_page)
-        return paginator.get_page(page), paginator
 
 
 class PurchaseOrderItemRepository(BaseSyncRepository):

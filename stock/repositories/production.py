@@ -1,5 +1,4 @@
 from django.db.models import Q
-from django.core.paginator import Paginator
 from base.repositories.base import BaseSyncRepository
 from stock.models import (
     ProductionOrder, ProductionOrderIngredient,
@@ -31,11 +30,6 @@ class ProductionOrderRepository(BaseSyncRepository):
             Q(source_location_id=location_id) | Q(output_location_id=location_id),
             is_deleted=False,
         ).order_by('-created_at')
-
-    @classmethod
-    def paginate(cls, queryset, page=1, per_page=20):
-        paginator = Paginator(queryset, per_page)
-        return paginator.get_page(page), paginator
 
 
 class ProductionOrderIngredientRepository(BaseSyncRepository):

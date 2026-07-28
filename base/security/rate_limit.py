@@ -1,6 +1,8 @@
 from functools import wraps
+
 from django.conf import settings
-from django.core.cache import cache
+from django.core.cache import cache, caches
+from django.core.cache.backends.dummy import DummyCache
 from django.http import JsonResponse
 
 
@@ -17,15 +19,14 @@ def _get_ip(request):
 
 
 def _check_and_incr(key, max_attempts, window):
-    """Returns retry_after seconds if the limit is exceeded, else None.
+    """Return retry-after seconds when the limit is exceeded.
 
-    Uses add()+incr() instead of get()-then-set(): incr is atomic on both
-    LocMem and Redis, so two concurrent requests can't both read count<max and
-    slip through the old check-then-set race. (A shared backend like Redis is
-    still required to enforce the limit ACROSS worker processes — LocMem is
-    per-process.)
+    DummyCache is an explicit test-only backend and cannot enforce limits.
+    LocMem and Redis both support the atomic ``add``/``incr`` sequence.
     """
-    # Seed the window only if absent; a no-op when the key already exists.
+    if isinstance(caches['default'], DummyCache):
+        return None
+
     cache.add(key, 0, window)
     try:
         count = cache.incr(key)
@@ -96,4 +97,3 @@ def rate_limit_by(key_prefix, max_attempts, window, extractor, error_payload=Non
             return view_func(request, *args, **kwargs)
         return wrapper
     return decorator
-

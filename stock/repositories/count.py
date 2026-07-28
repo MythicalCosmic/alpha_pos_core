@@ -1,4 +1,3 @@
-from django.core.paginator import Paginator
 from base.repositories.base import BaseSyncRepository
 from stock.models import StockCount, StockCountItem, VarianceReasonCode
 
@@ -50,11 +49,6 @@ class StockCountRepository(BaseSyncRepository):
         return cls.model.objects.filter(
             location_id=location_id, is_deleted=False
         ).order_by('-created_at')
-
-    @classmethod
-    def paginate(cls, queryset, page=1, per_page=20):
-        paginator = Paginator(queryset, per_page)
-        return paginator.get_page(page), paginator
 
 
 class StockCountItemRepository(BaseSyncRepository):

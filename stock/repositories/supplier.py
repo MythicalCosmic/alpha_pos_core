@@ -1,5 +1,4 @@
 from django.db.models import Q, Count
-from django.core.paginator import Paginator
 from base.repositories.base import BaseSyncRepository
 from stock.models import Supplier, SupplierStockItem
 
@@ -55,11 +54,6 @@ class SupplierRepository(BaseSyncRepository):
             status__in=['DRAFT', 'SENT', 'CONFIRMED', 'PARTIAL'],
             is_deleted=False,
         ).exists()
-
-    @classmethod
-    def paginate(cls, queryset, page=1, per_page=20):
-        paginator = Paginator(queryset, per_page)
-        return paginator.get_page(page), paginator
 
 
 class SupplierStockItemRepository(BaseSyncRepository):

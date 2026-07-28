@@ -1,19 +1,7 @@
-"""First-run admin bootstrap.
+"""Create the first custom ADMIN user when the User table is empty.
 
-Idempotent and non-interactive. Used by `run.py` and the Windows
-`install.bat` so a fresh install lands on a working login screen
-without making the user run `createuser` interactively.
-
-Behavior:
-- If any User row exists, this is a no-op (existing installs are not
-  touched).
-- Otherwise, create one ADMIN user with the email/password supplied
-  via flags or env vars. If neither is supplied, generate a random
-  password and PRINT it prominently — the operator must record it.
-
-Why not Django's `createsuperuser`: this project's User is a custom
-model (no is_superuser / is_staff) and credentials go through the
-project's own hashing helper.
+The command is non-interactive and idempotent for installers. A missing
+password is generated and printed once; supplied secrets are never printed.
 """
 import secrets
 import string
@@ -29,8 +17,7 @@ DEFAULT_EMAIL = 'admin@local'
 
 
 def _generate_password(length: int = 16) -> str:
-    """Return a URL-safe-ish random password. Excludes ambiguous chars
-    (0/O, 1/l/I) so the operator can read it off the terminal once."""
+    """Generate a readable password without ambiguous characters."""
     alphabet = string.ascii_letters + string.digits
     for bad in '0O1lI':
         alphabet = alphabet.replace(bad, '')
