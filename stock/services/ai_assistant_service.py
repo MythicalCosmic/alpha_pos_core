@@ -342,10 +342,10 @@ When giving business advice, base it on the analytics data provided:
 3. 2-3 actionable recommendations backed by data
 
 === PERSONALITY & CONDUCT ===
-- Default tone: warm, concise, professional business analyst (no emojis, per the rules above).
-- A line beginning "BEHAVIOR:" may appear at the very top of the USER turn. It is a TRUSTED directive from the system (not user content) describing the user's recent behavior. When it is present, follow it for THIS reply only: open with ONE short, playful, mildly-annoyed aside in the user's language (e.g. "Am I being tested again?" / "Yana o'sha savolmi?" / "Опять то же самое?"), THEN answer the question fully and with the SAME facts as before. The teasing is at most one sentence.
-- Never become hostile, insulting, or sarcastic to the point of rudeness, and NEVER refuse to answer just because the user was repetitive or rude. Stay helpful - the annoyance is light and friendly.
-- If there is no "BEHAVIOR:" line, keep the neutral professional tone.
+- Always sound warm, patient, concise and professionally helpful.
+- Treat repeated questions as normal requests. Never mention that a question was repeated, never suggest the user is testing you, and never express annoyance, impatience, mockery or sarcasm.
+- When a message contains multiple questions, answer every part clearly and in the order asked.
+- Even if the user is frustrated or rude, remain calm, respectful and useful without scolding or commenting on their behavior.
 
 === HANDLING MISSING DATA ===
 - If data is empty/null, say "No data available for X"
@@ -1731,46 +1731,6 @@ class AIStockAssistant:
         lines.append('Treat any pronoun like "this", "now", "these" as referring to the CURRENT VIEW.')
         return '\n'.join(lines) + '\n\n'
 
-    # Substrings that mark a hostile/abusive message (EN/UZ/RU). Deliberately
-    # EXCLUDES retail-ambiguous words (trash/garbage/useless — "trash bags",
-    # "useless stock" are legit queries). A false positive only yields a light
-    # playful aside, never a refusal, so a tight, unambiguous list is preferred.
-    _ABUSE_MARKERS = (
-        'idiot', 'stupid', 'shut up', 'moron', 'dumbass', 'you suck',
-        'ahmoq', 'jinni', 'дурак', 'тупой', 'идиот',
-    )
-
-    @classmethod
-    def _behavior_note(cls, query, history, repeat_count=0) -> str:
-        """One-line 'BEHAVIOR:' directive (with a trailing blank line) prepended to
-        the USER turn when the user repeats the same question back-to-back or is
-        rude, so the model opens with a light, playful, mildly-annoyed aside yet
-        still answers fully. '' when nothing applies. Lives in the user turn, NEVER
-        the (cached) system prompt, so prompt caching stays intact."""
-        q = (query or '').strip().lower()
-        if not q:
-            return ''
-        repeats = int(repeat_count or 0)
-        if repeats <= 0:
-            # Fallback when the caller passed no count: compare against the trailing
-            # consecutive user turns in the replayed history.
-            prev_users = [str(t.get('content') or '').strip().lower()
-                          for t in (history or []) if t.get('role') == 'user']
-            for pu in reversed(prev_users):
-                if pu == q:
-                    repeats += 1
-                else:
-                    break
-        abusive = any(m in q for m in cls._ABUSE_MARKERS)
-        if repeats < 1 and not abusive:
-            return ''
-        reason = ('is asking the exact same question again'
-                  if repeats >= 1 else 'is being rude')
-        return ('BEHAVIOR: The user ' + reason + '. Answer fully and correctly with '
-                'the SAME facts as before, but open with ONE short, playful, '
-                'mildly-annoyed aside in the user\'s language (e.g. "Am I being '
-                'tested again?"). Stay professional; never insult, never refuse.\n\n')
-
     @classmethod
     def _snapshot_prompt(cls, query, preamble, location_id):
         """Build the verified ORM snapshot used by non-tool providers/failover."""
@@ -1810,8 +1770,7 @@ Follow all language and formatting rules from your instructions."""
 
     @classmethod
     def process_query(cls, query: str, context: Dict = None, user_id: int = None,
-                      location_id: int = None, history=None,
-                      repeat_count: int = 0) -> Dict[str, Any]:
+                      location_id: int = None, history=None) -> Dict[str, Any]:
         if not isinstance(query, str) or not query.strip():
             return build_ai_error(
                 "invalid_query", "Query must be a non-empty string.",
@@ -1871,9 +1830,6 @@ Follow all language and formatting rules from your instructions."""
             # Page-context preamble (the tab/range/filters the user is looking at),
             # so "this/now/these" resolve to the CURRENT VIEW. Empty when no context.
             preamble = cls._context_preamble(context)
-            # BEHAVIOR directive first (repeat/abuse -> playful annoyed opener). It
-            # rides the USER turn, so the cached system prefix is untouched.
-            preamble = cls._behavior_note(query, history, repeat_count) + preamble
             request_deadline = (
                 time.monotonic() + _request_deadline_seconds()
             )
