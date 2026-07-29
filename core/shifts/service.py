@@ -597,6 +597,22 @@ def _shift_tender_integrity_error(shift, evidence_end):
     )
 
 
+def _unpaid_monetary_orders(shift, evidence_end):
+    """Return unpaid orders that still carry money requiring settlement."""
+    return (
+        Order.objects.filter(
+            is_deleted=False,
+            cashier_id=shift.user_id,
+            branch_id=shift.branch_id,
+            created_at__gte=shift.start_time,
+            created_at__lt=evidence_end,
+            is_paid=False,
+            total_amount__gt=0,
+        )
+        .exclude(status=Order.Status.CANCELED)
+    )
+
+
 def _settlement_bundle_error(shift, settlement_rows):
     """Return a fail-closed reason until the full local close bundle arrived."""
     manifest = shift.settlement_manifest or {}
@@ -607,27 +623,12 @@ def _settlement_bundle_error(shift, settlement_rows):
     ):
         return 'Close manifest is missing or invalid'
 
-    # Enforce the payment close guard again on the cloud. A rolling older
-    # terminal only blocked unpaid OPEN carts, so an unpaid PREPARING/READY
-    # order could be omitted from every frozen revenue/tender value while the
-    # close manifest still verified. If that order reached the hub before
-    # manager handover, fail closed instead of posting an incomplete shift.
     evidence_end = shift.end_time or timezone.now()
-    unpaid_count = (
-        Order.objects.filter(
-            is_deleted=False,
-            cashier_id=shift.user_id,
-            branch_id=shift.branch_id,
-            created_at__gte=shift.start_time,
-            created_at__lt=evidence_end,
-            is_paid=False,
-        )
-        .exclude(status=Order.Status.CANCELED)
-        .count()
-    )
+    unpaid_count = _unpaid_monetary_orders(shift, evidence_end).count()
     if unpaid_count:
         return (
-            f'{unpaid_count} non-cancelled order(s) in the shift are unpaid; '
+            f'{unpaid_count} non-cancelled order(s) with a positive balance '
+            'in the shift are unpaid; '
             'take payment or cancel them before reconciliation'
         )
     tender_error = _shift_tender_integrity_error(shift, evidence_end)
@@ -1226,25 +1227,14 @@ class ShiftService:
         if shift.status != 'ACTIVE':
             return ServiceResponse.error("Shift is not active")
 
-        # Every non-cancelled UNPAID sale taken by this cashier must be resolved
-        # before handover, regardless of kitchen state. PREPARING/READY describe
-        # fulfilment, not settlement: allowing an unpaid READY order through makes
-        # it disappear from the frozen revenue/tender totals. Paid kitchen orders
-        # still never block; their money is attributed below by paid_at.
         now = timezone.now()
 
-        blocking = Order.objects.filter(
-            is_deleted=False,
-            cashier_id=shift.user_id,
-            branch_id=shift.branch_id,
-            created_at__gte=shift.start_time,
-            created_at__lt=now,
-            is_paid=False,
-        ).exclude(status=Order.Status.CANCELED).count()
+        blocking = _unpaid_monetary_orders(shift, now).count()
         if blocking:
             return ServiceResponse.error(
-                f"Cannot close shift while {blocking} non-cancelled order(s) are unpaid. "
-                "Take payment or cancel them first."
+                f"Cannot close shift while {blocking} non-cancelled order(s) "
+                "with a positive balance are unpaid. Take payment or cancel "
+                "them first."
             )
 
         # total_orders = orders TAKEN this shift, attributed by created_at.

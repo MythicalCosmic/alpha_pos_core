@@ -1,9 +1,4 @@
-"""end_shift's settlement guard.
-
-Kitchen state and payment state are independent. Paid PREPARING/READY orders do
-not block, while every non-cancelled unpaid order must be paid or cancelled before
-the shift freezes its money totals.
-"""
+"""Shift-close settlement safeguards."""
 from datetime import timedelta
 
 import pytest
@@ -70,6 +65,26 @@ def test_unpaid_open_cart_blocks_close():
     assert st == 400
     s.refresh_from_db()
     assert s.status == 'ACTIVE'    # refused
+
+
+@pytest.mark.django_db
+def test_zero_value_unpaid_order_does_not_block_close_or_reconciliation():
+    from cashbox.models import ShiftPaymentTotal
+    from core.shifts.service import _settlement_bundle_error
+
+    u = _cashier('zero-value@x.com')
+    s = _shift(u)
+    order = _order(u, 'READY', False)
+    order.subtotal = 0
+    order.total_amount = 0
+    order.save(update_fields=['subtotal', 'total_amount'])
+
+    res, st = ShiftService.end_shift(s.id, u.id, '')
+
+    assert st == 200, res
+    s.refresh_from_db()
+    rows = ShiftPaymentTotal.objects.filter(shift=s)
+    assert _settlement_bundle_error(s, rows) is None
 
 
 @pytest.mark.django_db
