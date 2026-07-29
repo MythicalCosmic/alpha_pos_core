@@ -7,11 +7,6 @@ logger = logging.getLogger(__name__)
 
 
 def audit(request, action, *, target_type='', target_id=None, metadata=None):
-    """Write an AuditLog row from a view, swallowing any error.
-
-    Audit logging must never break the business flow it observes. The caller
-    has already completed the underlying action; we only annotate the trail.
-    """
     try:
         return AuditLog.record(
             actor=getattr(request, 'user', None),

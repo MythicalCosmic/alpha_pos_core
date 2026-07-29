@@ -13,14 +13,6 @@ from base.security.auth import (
 
 
 def _session_role_required(allowed_roles, denied_message):
-    """Session-authenticating gate for /api/admins endpoints.
-
-    Validates the session, then checks the user's role against
-    `allowed_roles`. Sets request.user/request.session_key on success.
-    `admin_required`, `manager_required` and `pos_staff_required` are thin
-    wrappers that differ only in which roles they admit — this keeps the
-    session-validation logic in one place.
-    """
     def decorator(view_func):
         @wraps(view_func)
         def wrapper(request, *args, **kwargs):
@@ -33,9 +25,6 @@ def _session_role_required(allowed_roles, denied_message):
                     {"success": False, "message": "Authentication required"},
                     status=401,
                 )
-            # Use the cached lookup with `select_related('user_id')` instead of
-            # the unscoped `first(payload=…)` — saves 2 DB queries per admin
-            # request (the session row and the lazy FK access to user_id below).
             session = SessionRepository.get_by_session_key(session_key)
             if not session or not session.user_id or session.user_id.is_deleted:
                 return JsonResponse(

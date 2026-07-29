@@ -1,28 +1,3 @@
-"""Single entry point for LLM calls — Claude (Anthropic), Gemini (Google) or
-OpenAI.
-
-Both the stock AI assistant and the demand forecaster call `call_ai()`, which
-dispatches to whichever provider the operator selected. Everything is
-operator-configured (desktop panel / env):
-
-    AI_PROVIDER        — 'claude' (default), 'gemini', or 'openai'.
-    ANTHROPIC_API_KEY  — required when AI_PROVIDER=claude.
-    ANTHROPIC_MODEL    — defaults to claude-sonnet-4-6 (also: claude-sonnet-4-5,
-                         claude-opus-4-8).
-    GEMINI_API_KEY     — required when AI_PROVIDER=gemini.
-    GEMINI_MODEL       — defaults to gemini-2.5-flash.
-    OPENAI_API_KEY     — required when AI_PROVIDER=openai.
-    OPENAI_MODEL       — defaults to gpt-5.6-luna (cost-optimized GPT-5.6).
-    OPENAI_REASONING_EFFORT — defaults to low for GPT-5.6 models.
-
-`call_ai()` / `call_ai_tools()` accept an optional `history` (a list of
-{'role': 'user'|'assistant', 'content': str} prior turns) so the assistant can
-hold a multi-message conversation; the providers fold it in natively.
-
-Both backends return (text, error) where error is None on success, or one of
-'llm_sdk_missing' / 'llm_key_missing' / a raw error string. The callers handle
-those codes identically regardless of provider, so switching is a config change.
-"""
 import json
 import logging
 import time
@@ -41,25 +16,14 @@ try:
 except ImportError:
     openai = None
 
-# Current Sonnet — same price as 4.5, 1M context. Override via ANTHROPIC_MODEL.
 DEFAULT_CLAUDE_MODEL = 'claude-sonnet-4-6'
 DEFAULT_GEMINI_MODEL = 'gemini-2.5-flash'
 DEFAULT_OPENAI_MODEL = 'gpt-5.6-luna'
-# GPT-5-class models bill reasoning + answer against one ceiling and use
-# `max_completion_tokens` (not the legacy `max_tokens`); keep a generous floor so
-# a long answer (or any internal reasoning) is never truncated mid-sentence. The
-# GPT-5 reasoning models need real headroom; a truncated reasoning pass returns
-# empty content -> 'openai_empty_response'.
+# GPT-5 reasoning and output share this completion budget.
 OPENAI_MIN_COMPLETION_TOKENS = 8192
 
-# If the configured Gemini model is overloaded (503 'high demand'), fall back to a
-# model on a different capacity pool before giving up — the flash models spike
-# independently. Tried in order after the configured one.
 GEMINI_FALLBACK_MODELS = ('gemini-2.0-flash',)
 
-# Provider-side overloads worth retrying rather than surfacing as a hard failure:
-# Gemini flash 503 UNAVAILABLE 'high demand', 429 quota spikes, Anthropic 529
-# overloaded. Matched (case-insensitively) against the SDK's error string.
 _TRANSIENT_MARKERS = (
     '503', '529', 'unavailable', 'overloaded', 'high demand',
     '429', 'resource_exhausted', 'rate limit', 'try again',
@@ -67,21 +31,12 @@ _TRANSIENT_MARKERS = (
     'connection aborted', 'server disconnected', 'temporarily unavailable',
 )
 
-# Errors that *look* transient (often carry a 429) but won't recover by retrying:
-# an account with no credits/billing, or a bad key. Fail fast instead of burning
-# the backoff budget — the operator must fix billing / the key.
 _HARD_MARKERS = (
     'insufficient_quota', 'exceeded your current quota', 'billing',
     'credit balance', 'purchase credits',
     'invalid api key', 'incorrect api key', 'invalid_api_key',
 )
 
-# Provider errors that should be explained to the operator specifically as a
-# provider-side capacity/rate-limit problem. Keep this narrower than
-# ``_TRANSIENT_MARKERS``: a plain network timeout or generic 503 is retryable but
-# is not necessarily a rate limit. SDKs spell the same condition in several
-# ways (OpenAI/Anthropic use 429/529; Gemini commonly uses RESOURCE_EXHAUSTED or
-# "high demand").
 _PROVIDER_RATE_LIMIT_MARKERS = (
     '429', '529', 'rate_limit', 'rate limit', 'too many requests',
     'resource_exhausted', 'overloaded', 'high demand',
@@ -269,10 +224,6 @@ def get_provider():
 
 
 def key_missing():
-    """True when the *active* provider's API key is not configured. Lets callers
-    fail fast with a clear message instead of gating on one provider's key
-    (the view used to check GEMINI_API_KEY even when the default provider is
-    Claude, so a Claude-configured deployment was wrongly reported unconfigured)."""
     provider = get_provider()
     if provider == 'gemini':
         return not (getattr(settings, 'GEMINI_API_KEY', '') or '')
@@ -385,8 +336,6 @@ def call_ai(
 
 
 def _history_messages(history):
-    """Normalize a history list into clean [{'role','content'}] turns (user/
-    assistant only, non-empty), shared by the Claude and OpenAI message builders."""
     out = []
     for turn in (history or []):
         try:
@@ -420,10 +369,6 @@ def _tool_result_content(value):
 
 
 def can_use_tools() -> bool:
-    """True when the agentic (tool-use) path is available — the provider is Claude
-    or OpenAI and its SDK is importable. Tool use lets the assistant drill into any
-    order / shift / date / cashier / product on demand (and compare arbitrary date
-    ranges) instead of being limited to a fixed pre-computed snapshot."""
     provider = get_provider()
     if provider == 'openai':
         return openai is not None
@@ -445,18 +390,6 @@ def call_ai_tools(
     deadline=None,
     require_tool=True,
 ):
-    """Run the model (Claude or OpenAI) in a tool-use loop so it can read the live
-    database in full detail — drill into any order/shift/date/cashier/product and
-    compare arbitrary date ranges. `tools` is a list of Anthropic-style tool schemas
-    ({name, description, input_schema}); `tool_executor(name, input_dict)` executes
-    one tool call and returns its result as a string (typically JSON). The loop
-    feeds tool results back until the model answers with text or the iteration
-    budget is spent.
-
-    Claude and OpenAI run tools. If the provider is something else, the SDK is
-    missing, or no tools/executor were supplied, this falls back to a single
-    `call_ai()` so the caller never has to branch. Returns (text, error) with the
-    same error codes as `call_ai` ('llm_key_missing' / 'llm_sdk_missing' / raw)."""
     deadline = deadline or (time.monotonic() + _request_deadline_seconds())
     if max_iterations is None:
         try:
@@ -476,7 +409,6 @@ def call_ai_tools(
                                  max_tokens, max_iterations, retries, history,
                                  deadline=deadline, require_tool=require_tool)
 
-    # ── Claude tool-use loop ──
     api_key = getattr(settings, 'ANTHROPIC_API_KEY', '') or ''
     if not api_key:
         return None, 'llm_key_missing'
@@ -496,8 +428,6 @@ def call_ai_tools(
     unresolved_tool_error = False
 
     def _create(include_tools, *, prevent_tool_use=False):
-        # One create() call, retrying transient provider overloads (529 / 'high
-        # demand') with backoff — same policy as call_ai's single-shot path.
         kwargs = {'model': model, 'max_tokens': max_tokens, 'messages': messages}
         if system:
             kwargs['system'] = _cache_system(system)
@@ -560,8 +490,6 @@ def call_ai_tools(
                     return None, 'tool_grounding_missing'
                 return _final_text(resp)
 
-            # Echo the assistant turn (incl. tool_use blocks), then run every
-            # requested tool and return all results in one user turn.
             messages.append({'role': 'assistant', 'content': resp.content})
             results = []
             unresolved_before_round = unresolved_tool_error
@@ -618,21 +546,11 @@ def call_ai_tools(
         return None, str(e)
 
 
-# ── AI determinism + prompt caching helpers ─────────────────────────────────
-# Learned once per process: whether the OpenAI endpoint/model accepts our
-# determinism/cache kwargs. None = not yet probed; False = rejected once, so we
-# stop sending them (avoids a failed+retry round-trip on every request).
 _OPENAI_EXTRAS = ('seed', 'prompt_cache_key', 'temperature')
 _openai_extras_ok = None
 
 
 def _openai_sampling_kwargs(model):
-    """Determinism + cache-routing kwargs for the OpenAI chat API. `seed` gives
-    best-effort reproducibility (same question -> same answer); `prompt_cache_key`
-    improves prefix-cache hit routing (caching itself is automatic once the static
-    system prefix is large, which it is). Reasoning models (gpt-5 / o-series) reject
-    a non-default temperature, so temperature is only sent for classic models.
-    Anything the SDK/model rejects is stripped by _openai_create."""
     kw = {
         'seed': int(getattr(settings, 'OPENAI_SEED', 7)),
         'prompt_cache_key': 'alpha-pos-ai-assistant',
@@ -655,11 +573,6 @@ def _openai_sampling_kwargs(model):
 
 
 def _openai_create(client, kwargs):
-    """client.chat.completions.create(**kwargs), tolerant of an SDK/model that
-    rejects the determinism/cache kwargs: an old SDK raises TypeError, a stricter
-    model returns 400 'unsupported_parameter/value'. On that specific failure we
-    strip the extras, remember it for the rest of the process, and retry once so
-    the call still succeeds. Every other error propagates unchanged."""
     global _openai_extras_ok
     if _openai_extras_ok is False:
         kwargs = {k: v for k, v in kwargs.items() if k not in _OPENAI_EXTRAS}
@@ -686,9 +599,6 @@ def _openai_create(client, kwargs):
 
 
 def _cache_system(system):
-    """Wrap the static system prompt in an Anthropic cache_control block so the
-    large prefix is cached (ephemeral). Plain string in -> list-of-one-block out;
-    falsy stays falsy."""
     if not system:
         return system
     return [{'type': 'text', 'text': system,
@@ -696,8 +606,6 @@ def _cache_system(system):
 
 
 def _cache_tools(tools):
-    """Mark the LAST tool with cache_control so the whole tools array caches with
-    the system prefix. Returns a shallow copy (never mutates the caller's list)."""
     if not tools:
         return tools
     cached = [dict(t) for t in tools]
@@ -724,8 +632,6 @@ def _call_claude(prompt, system, max_tokens, history=None):
         if system:
             kwargs['system'] = _cache_system(system)
         resp = client.messages.create(**kwargs)
-        # content is a list of blocks; concatenate the text blocks. No sampling
-        # params are sent so this stays valid across the Opus 4.x line too.
         text = ''.join(
             b.text for b in resp.content if getattr(b, 'type', None) == 'text'
         )
@@ -745,8 +651,6 @@ def _call_gemini(prompt, system, max_tokens, history=None):
     if not api_key:
         return None, 'llm_key_missing'
     model = getattr(settings, 'GEMINI_MODEL', '') or DEFAULT_GEMINI_MODEL
-    # Gemini has no separate system / role fields in this simple call — fold the
-    # system prompt and any prior conversation turns into one text blob.
     convo = ''
     for turn in _history_messages(history):
         who = 'User' if turn['role'] == 'user' else 'Assistant'
@@ -828,9 +732,6 @@ def _call_openai(prompt, system, max_tokens, history=None):
 def _openai_tool_loop(prompt, system, tools, tool_executor, max_tokens,
                       max_iterations, retries, history, *, deadline,
                       require_tool=True):
-    """OpenAI function-calling loop — the OpenAI twin of the Claude tool loop. The
-    model calls read-only data tools to answer in full detail (compare dates, drill
-    into any order/shift/cashier/product). Returns (text, error)."""
     api_key = getattr(settings, 'OPENAI_API_KEY', '') or ''
     if not api_key:
         return None, 'llm_key_missing'
@@ -843,8 +744,6 @@ def _openai_tool_loop(prompt, system, tools, tool_executor, max_tokens,
         logger.exception('openai client init failed')
         return None, str(e)
 
-    # Anthropic-style tool schema -> OpenAI function schema (input_schema is already
-    # a JSON Schema, which is exactly what OpenAI's `parameters` expects).
     oai_tools = [{
         'type': 'function',
         'function': {
@@ -920,8 +819,6 @@ def _openai_tool_loop(prompt, system, tools, tool_executor, max_tokens,
                 if require_tool and tool_calls_completed == 0:
                     return None, 'tool_grounding_missing'
                 return _final_text(resp)
-            # Echo the assistant tool-call turn, then run every requested tool and
-            # append one tool-result message per call.
             messages.append({
                 'role': 'assistant',
                 'content': msg.content or '',
