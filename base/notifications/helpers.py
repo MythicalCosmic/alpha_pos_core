@@ -1,12 +1,5 @@
-import html
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta
-
-
-def html_escape(value):
-    if value is None:
-        return ''
-    return html.escape(str(value), quote=False)
 
 
 UZB_TZ = timezone(timedelta(hours=5))

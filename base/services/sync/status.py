@@ -11,10 +11,75 @@ class SyncStatus:
     # The pull cursor key in the durable SyncState table.
     CURSOR_KEY = 'last_pull'
     SCOPE_EPOCH_KEY = 'sync_scope_epoch'
+    PULL_CONTRACT_EPOCH_KEY = 'sync_pull_contract_epoch'
+    PULL_REQUEST_GENERATION_KEY = 'sync_pull_request_generation'
+    FULL_PULL_REQUESTED_AT_KEY = 'sync_full_pull_requested_at'
+    FULL_PULL_COMPLETED_AT_KEY = 'sync_full_pull_completed_at'
+    FULL_PULL_COMPLETED_GENERATION_KEY = (
+        'sync_full_pull_completed_generation'
+    )
     # v2 adds OneToOne ownership repair, deterministic adoption of legacy
     # blank-branch roots, and durable recovery markers for quarantined rows.
-    SCOPE_EPOCH = 'branch-target-v2'
+    SCOPE_EPOCH = 'branch-target-v3'
+    # v3 adds the durable logical cloud-feed clock and fail-closed schema
+    # handling on top of cloud-authoritative global records. Rewind each branch
+    # once so rows skipped by an old wall-clock cursor or older schema contract
+    # are delivered again.
+    PULL_CONTRACT_EPOCH = 'cloud-authority-feed-clock-v3'
     QUARANTINE_KEY_PREFIX = 'sync_scope_quarantine:'
+    ACTIVE_SCOPE_BRANCH_KEY = 'sync_scope_active_branch'
+
+    @classmethod
+    def _branch_state_key(cls, prefix, branch_id=None):
+        """Keep mutable sync state isolated when BRANCH_ID changes."""
+        from hashlib import sha256
+        from base.services.sync.config import get_branch_id
+
+        branch = str(
+            get_branch_id() if branch_id is None else branch_id
+        ).strip()
+        digest = sha256(branch.encode('utf-8')).hexdigest()[:20]
+        return f'{prefix}:{digest}'
+
+    @classmethod
+    def cursor_key(cls, branch_id=None):
+        return cls._branch_state_key(cls.CURSOR_KEY, branch_id)
+
+    @classmethod
+    def scope_epoch_key(cls, branch_id=None):
+        return cls._branch_state_key(cls.SCOPE_EPOCH_KEY, branch_id)
+
+    @classmethod
+    def pull_contract_epoch_key(cls, branch_id=None):
+        return cls._branch_state_key(cls.PULL_CONTRACT_EPOCH_KEY, branch_id)
+
+    @classmethod
+    def pull_request_generation_key(cls, branch_id=None):
+        return cls._branch_state_key(
+            cls.PULL_REQUEST_GENERATION_KEY, branch_id,
+        )
+
+    @classmethod
+    def full_pull_requested_at_key(cls, branch_id=None):
+        return cls._branch_state_key(
+            cls.FULL_PULL_REQUESTED_AT_KEY, branch_id,
+        )
+
+    @classmethod
+    def full_pull_completed_at_key(cls, branch_id=None):
+        return cls._branch_state_key(
+            cls.FULL_PULL_COMPLETED_AT_KEY, branch_id,
+        )
+
+    @classmethod
+    def full_pull_completed_generation_key(cls, branch_id=None):
+        return cls._branch_state_key(
+            cls.FULL_PULL_COMPLETED_GENERATION_KEY, branch_id,
+        )
+
+    @classmethod
+    def dead_letter_revival_key(cls, branch_id=None):
+        return cls._branch_state_key('sync_dl_revival_v2', branch_id)
 
     @classmethod
     def scope_quarantine_key(cls, model_class, record_uuid):
@@ -24,6 +89,56 @@ class SyncStatus:
         identity = f'{model_class._meta.label_lower}:{record_uuid}'.encode()
         digest = sha256(identity).hexdigest()[:40]
         return f'{cls.QUARANTINE_KEY_PREFIX}{digest}'
+
+    @classmethod
+    def _rewind_pull_locked(cls, SyncState, branch_id):
+        """Rotate the replay generation and clear its cursor under one lock.
+
+        Every cursor publisher locks this generation first too. That ordering
+        makes a replay request win regardless of whether it races just before
+        or just after an older pull attempts to publish its terminal frontier.
+        """
+        from uuid import uuid4
+
+        generation, _ = (
+            SyncState.objects.select_for_update().get_or_create(
+                key=cls.pull_request_generation_key(branch_id),
+                defaults={'value': ''},
+            )
+        )
+        generation.value = uuid4().hex
+        generation.save(update_fields=['value', 'updated_at'])
+        cursor, _ = SyncState.objects.select_for_update().get_or_create(
+            key=cls.cursor_key(branch_id),
+            defaults={'value': ''},
+        )
+        if cursor.value:
+            cursor.value = ''
+            cursor.save(update_fields=['value', 'updated_at'])
+        requested_at = timezone.now().isoformat()
+        requested, _ = SyncState.objects.select_for_update().get_or_create(
+            key=cls.full_pull_requested_at_key(branch_id),
+            defaults={'value': ''},
+        )
+        requested.value = requested_at
+        requested.save(update_fields=['value', 'updated_at'])
+        completed, _ = SyncState.objects.select_for_update().get_or_create(
+            key=cls.full_pull_completed_at_key(branch_id),
+            defaults={'value': ''},
+        )
+        if completed.value:
+            completed.value = ''
+            completed.save(update_fields=['value', 'updated_at'])
+        completed_generation, _ = (
+            SyncState.objects.select_for_update().get_or_create(
+                key=cls.full_pull_completed_generation_key(branch_id),
+                defaults={'value': ''},
+            )
+        )
+        if completed_generation.value:
+            completed_generation.value = ''
+            completed_generation.save(update_fields=['value', 'updated_at'])
+        return generation.value
 
     @classmethod
     def restore_quarantined_target(cls, model_class, record):
@@ -105,11 +220,21 @@ class SyncStatus:
             with transaction.atomic():
                 from base.models import SyncQueueRecord, SyncState
 
+                active_branch, _ = (
+                    SyncState.objects.select_for_update().get_or_create(
+                        key=cls.ACTIVE_SCOPE_BRANCH_KEY,
+                        defaults={'value': ''},
+                    )
+                )
                 epoch, _ = SyncState.objects.select_for_update().get_or_create(
-                    key=cls.SCOPE_EPOCH_KEY,
+                    key=cls.scope_epoch_key(own_branch),
                     defaults={'value': ''},
                 )
-                if epoch.value == cls.SCOPE_EPOCH:
+                branch_transition = active_branch.value != own_branch
+                if (
+                    epoch.value == cls.SCOPE_EPOCH
+                    and not branch_transition
+                ):
                     return False
 
                 from base.services.sync.config import SYNC_ORDER, get_all_models
@@ -257,17 +382,230 @@ class SyncStatus:
                             record_uuid__in=uuids,
                         ).delete()
 
-                SyncState.objects.update_or_create(
-                    key=cls.CURSOR_KEY, defaults={'value': ''},
-                )
+                cls._rewind_pull_locked(SyncState, own_branch)
                 epoch.value = cls.SCOPE_EPOCH
                 epoch.save(update_fields=['value', 'updated_at'])
+                active_branch.value = own_branch
+                active_branch.save(update_fields=['value', 'updated_at'])
                 return True
         except (OperationalError, ProgrammingError):
             # Called from post_migrate for each app; an early callback can run
             # before a later app's tables exist. A later callback/runtime pull
             # retries once the schema is complete.
             return False
+
+    @classmethod
+    def ensure_pull_contract_epoch(cls):
+        """Durably request one complete cloud replay after a pull-policy change.
+
+        The epoch is written in the same transaction as clearing the cursor. If
+        the app or network fails immediately afterward, the blank cursor
+        survives and every later background attempt starts from the beginning
+        until a fully drained pull publishes a new cloud frontier.
+        """
+        from django.conf import settings
+
+        if getattr(settings, 'DEPLOYMENT_MODE', 'local') != 'local':
+            return False
+        own_branch = str(getattr(settings, 'BRANCH_ID', '') or '').strip()
+        if not own_branch:
+            return False
+
+        from django.db import transaction
+        from django.db.utils import OperationalError, ProgrammingError
+
+        try:
+            with transaction.atomic():
+                from base.models import SyncState
+
+                epoch, _ = SyncState.objects.select_for_update().get_or_create(
+                    key=cls.pull_contract_epoch_key(own_branch),
+                    defaults={'value': ''},
+                )
+                if epoch.value == cls.PULL_CONTRACT_EPOCH:
+                    return False
+                cls._rewind_pull_locked(SyncState, own_branch)
+                epoch.value = cls.PULL_CONTRACT_EPOCH
+                epoch.save(update_fields=['value', 'updated_at'])
+                return True
+        except (OperationalError, ProgrammingError):
+            # Startup/post-migrate callers may run before SyncState exists.
+            # The next ordinary pull retries this transition.
+            return False
+
+    @classmethod
+    def request_full_pull(cls):
+        """Atomically require a complete replay from a new generation."""
+        from django.conf import settings
+
+        if getattr(settings, 'DEPLOYMENT_MODE', 'local') != 'local':
+            return False
+        own_branch = str(getattr(settings, 'BRANCH_ID', '') or '').strip()
+        if not own_branch:
+            return False
+        from django.db import transaction
+        from base.models import SyncState
+
+        with transaction.atomic():
+            cls._rewind_pull_locked(SyncState, own_branch)
+        # This cache write is only a fast-path. Readers overlay the durable
+        # SyncState markers, so a cache flush/restart or a late older completion
+        # can never make a pending replay appear completed.
+        cls.update(**cls.get_full_pull_status())
+        return True
+
+    @classmethod
+    def get_pull_checkpoint(cls):
+        """Return a cursor and the generation allowed to publish its result."""
+        from uuid import uuid4
+        from django.db import transaction
+        from base.models import SyncState
+
+        with transaction.atomic():
+            generation, _ = (
+                SyncState.objects.select_for_update().get_or_create(
+                    key=cls.pull_request_generation_key(),
+                    defaults={'value': uuid4().hex},
+                )
+            )
+            if not generation.value:
+                generation.value = uuid4().hex
+                generation.save(update_fields=['value', 'updated_at'])
+            cursor = SyncState.objects.filter(key=cls.cursor_key()).first()
+            return (
+                cursor.value if (cursor and cursor.value) else None,
+                generation.value,
+            )
+
+    @classmethod
+    def publish_pull_cursor(
+        cls, value, generation, *, completes_full_pull=False,
+    ):
+        """Publish only if no newer replay request superseded this pull.
+
+        The generation row is the serialization point shared with
+        ``request_full_pull``. A compare followed by ``set_cursor`` in separate
+        transactions would still have a check/write race and could erase the
+        newly blank cursor.
+        """
+        from django.db import transaction
+        from base.models import SyncState
+
+        completed_at = None
+        with transaction.atomic():
+            current = (
+                SyncState.objects.select_for_update()
+                .filter(key=cls.pull_request_generation_key())
+                .first()
+            )
+            if (
+                current is None
+                or not generation
+                or current.value != generation
+            ):
+                return False
+            cursor, _ = SyncState.objects.select_for_update().get_or_create(
+                key=cls.cursor_key(),
+                defaults={'value': ''},
+            )
+            cursor.value = value or ''
+            cursor.save(update_fields=['value', 'updated_at'])
+            if completes_full_pull:
+                completed_at = timezone.now().isoformat()
+                completed, _ = (
+                    SyncState.objects.select_for_update().get_or_create(
+                        key=cls.full_pull_completed_at_key(),
+                        defaults={'value': ''},
+                    )
+                )
+                completed.value = completed_at
+                completed.save(update_fields=['value', 'updated_at'])
+                completed_generation, _ = (
+                    SyncState.objects.select_for_update().get_or_create(
+                        key=cls.full_pull_completed_generation_key(),
+                        defaults={'value': ''},
+                    )
+                )
+                completed_generation.value = generation
+                completed_generation.save(
+                    update_fields=['value', 'updated_at'],
+                )
+        if completed_at:
+            # Publish the cache copy only after the cursor and completion
+            # markers committed together.
+            cls.update(**cls.get_full_pull_status())
+        return True
+
+    @classmethod
+    def get_full_pull_status(cls):
+        """Return durable, branch-scoped full-replay progress.
+
+        Cache state is deliberately not consulted. A replay request, its cursor
+        rewind, and its completion marker share the same SyncState transaction,
+        so this remains truthful across process restarts and cache loss.
+        """
+        from django.db.utils import OperationalError, ProgrammingError
+        from base.models import SyncState
+
+        keys = {
+            'generation': cls.pull_request_generation_key(),
+            'cursor': cls.cursor_key(),
+            'requested_at': cls.full_pull_requested_at_key(),
+            'completed_at': cls.full_pull_completed_at_key(),
+            'completed_generation': (
+                cls.full_pull_completed_generation_key()
+            ),
+        }
+        try:
+            rows = {
+                row.key: row
+                for row in SyncState.objects.filter(key__in=keys.values())
+            }
+        except (OperationalError, ProgrammingError):
+            # Status is also read during early startup, before migrations may
+            # have created SyncState. Preserve the cache-only fallback there.
+            return {}
+
+        generation_row = rows.get(keys['generation'])
+        cursor_row = rows.get(keys['cursor'])
+        requested_row = rows.get(keys['requested_at'])
+        completed_row = rows.get(keys['completed_at'])
+        completed_generation_row = rows.get(keys['completed_generation'])
+
+        generation = generation_row.value if generation_row else None
+        requested_at = requested_row.value if requested_row else None
+        cursor = cursor_row.value if cursor_row else None
+        if not requested_at and generation_row is not None and not cursor:
+            # Upgrade recovery: earlier builds persisted the generation and
+            # cursor rewind but kept the display timestamp only in cache.
+            requested_at = generation_row.updated_at.isoformat()
+        completed_at = completed_row.value if completed_row else None
+        completed_generation = (
+            completed_generation_row.value
+            if completed_generation_row else None
+        )
+        completed = bool(
+            requested_at
+            and generation
+            and completed_at
+            and completed_generation == generation
+        )
+        pending = bool(requested_at and generation and not completed)
+        state = (
+            'pending' if pending
+            else 'completed' if completed
+            else 'not_requested'
+        )
+        return {
+            'full_pull_requested_at': requested_at or None,
+            'full_pull_completed_at': completed_at if completed else None,
+            'full_pull_request_generation': generation or None,
+            'full_pull_completed_generation': (
+                completed_generation if completed else None
+            ),
+            'full_pull_pending': pending,
+            'full_pull_state': state,
+        }
 
     @classmethod
     def get_cursor(cls):
@@ -277,14 +615,14 @@ class SyncStatus:
         cache flush can't silently reset it and trigger a full re-pull.
         """
         from base.models import SyncState
-        row = SyncState.objects.filter(key=cls.CURSOR_KEY).first()
+        row = SyncState.objects.filter(key=cls.cursor_key()).first()
         return row.value if (row and row.value) else None
 
     @classmethod
     def set_cursor(cls, value):
         from base.models import SyncState
         SyncState.objects.update_or_create(
-            key=cls.CURSOR_KEY, defaults={'value': value or ''},
+            key=cls.cursor_key(), defaults={'value': value or ''},
         )
 
     @classmethod
@@ -296,7 +634,22 @@ class SyncStatus:
 
     @classmethod
     def get(cls):
-        return safe_get(STATUS_KEY) or {}
+        data = dict(safe_get(STATUS_KEY) or {})
+        durable_full_pull = cls.get_full_pull_status()
+        if durable_full_pull:
+            data.update(durable_full_pull)
+        requested = data.get('full_pull_request_generation')
+        completed = data.get('full_pull_completed_generation')
+        if (
+            requested
+            and completed != requested
+            and data.get('full_pull_completed_at')
+        ):
+            # A stale pull can finish its cache update just after a newer
+            # request commits. Generation tags keep it visibly pending.
+            data = dict(data)
+            data['full_pull_completed_at'] = None
+        return data
 
     @classmethod
     def set_online(cls, online=True):

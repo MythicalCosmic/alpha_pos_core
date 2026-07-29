@@ -133,6 +133,7 @@ def create_qr_order(table, items, customer_note=None):
         place=table.place,
         table=table,
         order_type=Order.OrderType.HALL,
+        order_origin=Order.Origin.QR,
         status=Order.Status.OPEN,
         is_paid=False,
         subtotal=total,

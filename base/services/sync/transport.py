@@ -1,21 +1,70 @@
 import json
 import logging
+import hashlib
+import uuid
 import requests
 from base.services.sync.config import (
     get_cloud_url, get_cloud_token, get_branch_id,
     get_sync_timeout, get_sync_max_retries, get_sync_require_https,
 )
 from base.services.sync.encoder import SyncEncoder
+from base.services.sync.evidence import emit_sync_evidence
 
 logger = logging.getLogger(__name__)
 
 _insecure_url_warned = False
 
 
+def _validated_ack_partition(data, records):
+    """Return a complete v2 ACK partition or a fail-closed error."""
+    if not isinstance(data, dict):
+        return None, 'Server returned a non-object sync response'
+    sent = [str(record.get('uuid') or '') for record in records]
+    if any(not value for value in sent) or len(set(sent)) != len(sent):
+        return None, 'Outbound batch UUIDs must be non-empty and unique'
+    keys = (
+        'acknowledged_uuids', 'retryable_uuids', 'rejected_uuids',
+    )
+    if data.get('ack_protocol_version') != 2 or not all(
+        key in data for key in keys
+    ):
+        return None, (
+            'Server response lacks the explicit acknowledgement partition; '
+            'retaining the entire batch'
+        )
+
+    normalized = {}
+    for key in keys:
+        values = data.get(key)
+        if not isinstance(values, list) or any(
+            not isinstance(value, str) or not value for value in values
+        ):
+            return None, f'Server returned an invalid {key} partition'
+        if len(set(values)) != len(values):
+            return None, f'Server returned duplicate UUIDs in {key}'
+        normalized[key] = values
+
+    sent_set = set(sent)
+    acknowledged = set(normalized['acknowledged_uuids'])
+    retryable = set(normalized['retryable_uuids'])
+    rejected = set(normalized['rejected_uuids'])
+    if acknowledged & retryable or acknowledged & rejected or retryable & rejected:
+        return None, 'Server acknowledgement partitions overlap'
+    if acknowledged | retryable | rejected != sent_set:
+        return None, (
+            'Server acknowledgement partition does not exactly match the '
+            'submitted UUIDs'
+        )
+    return normalized, None
+
+
 def _auth_headers():
     headers = {
         'Authorization': f'Branch {get_cloud_token()}',
         'X-Branch-ID': get_branch_id(),
+        # The server keeps v1 behavior safe during rolling upgrades and returns
+        # canonical identity evidence only to clients which can apply it.
+        'X-Sync-Ack-Protocol': '2',
         'Content-Type': 'application/json',
     }
     # Heartbeat presence: every sync request doubles as this till's "I'm online,
@@ -81,6 +130,8 @@ def send_batch(model_name, records, retry=True):
         'branch_id': get_branch_id(),
         'records': records,
     }, cls=SyncEncoder)
+    batch_id = str(uuid.uuid4())
+    payload_sha256 = hashlib.sha256(payload.encode('utf-8')).hexdigest()
 
     # A bad SYNC_MAX_RETRIES=0 setting must not turn sync into a silent no-op
     # that reports error=None without issuing even one request.
@@ -89,6 +140,17 @@ def send_batch(model_name, records, retry=True):
     last_error = None
 
     for attempt in range(max_retries):
+        attempt_number = attempt + 1
+        emit_sync_evidence(
+            'push_http_attempt',
+            batch_id=batch_id,
+            model_name=model_name,
+            branch_id=get_branch_id(),
+            attempt=attempt_number,
+            max_attempts=max_retries,
+            payload_sha256=payload_sha256,
+            records=records,
+        )
         try:
             resp = requests.post(
                 f'{url}/receive',
@@ -99,21 +161,40 @@ def send_batch(model_name, records, retry=True):
 
             if resp.status_code == 200:
                 data = resp.json()
-                errors = data.get('errors', [])
-                failed_uuids = data.get('failed_uuids', [])
+                errors = data.get('errors', []) if isinstance(data, dict) else []
+                server_success = (
+                    data.get('success') if isinstance(data, dict) else None
+                )
+                emit_sync_evidence(
+                    'push_http_response',
+                    batch_id=batch_id,
+                    model_name=model_name,
+                    attempt=attempt_number,
+                    http_status=resp.status_code,
+                    payload_sha256=payload_sha256,
+                    response=data,
+                )
 
-                # HTTP 200 with per-record failures is a valid partial-batch
-                # acknowledgement. Let the pusher ACK successful/skipped UUIDs
-                # and retain only failed_uuids. Treat only a batch-level receiver
-                # failure (no record identities) as a transport failure.
-                if data.get('success') is False or (errors and not failed_uuids):
+                partition, partition_error = _validated_ack_partition(
+                    data, records,
+                )
+                if server_success is False or partition_error:
                     return {
                         'success': False,
                         'error': (
                             f'Server rejected batch: {errors[0][:200]}'
-                            if errors else 'Server rejected batch'
+                            if server_success is False and errors
+                            else partition_error or 'Server rejected batch'
                         ),
-                        'failed_uuids': failed_uuids,
+                        'acknowledged_uuids': [],
+                        'retryable_uuids': [
+                            str(record.get('uuid')) for record in records
+                        ],
+                        'rejected_uuids': [],
+                        'failed_uuids': [
+                            str(record.get('uuid')) for record in records
+                        ],
+                        'ack_partition_valid': False,
                         'response': data,
                     }
 
@@ -123,23 +204,51 @@ def send_batch(model_name, records, retry=True):
                     'updated': data.get('updated', 0),
                     'skipped': data.get('skipped', 0),
                     'errors': errors,
-                    # Records the receiver could not apply. The pusher keeps these
-                    # queued instead of purging them on this HTTP-200.
-                    'failed_uuids': failed_uuids,
+                    **partition,
+                    'failed_uuids': [
+                        *partition['retryable_uuids'],
+                        *partition['rejected_uuids'],
+                    ],
+                    'ack_partition_valid': True,
+                    'record_results': data.get('record_results', []),
                     'response': data,
                 }
 
             last_error = f'HTTP {resp.status_code}: {resp.text[:200]}'
+            emit_sync_evidence(
+                'push_http_response',
+                batch_id=batch_id,
+                model_name=model_name,
+                attempt=attempt_number,
+                http_status=resp.status_code,
+                payload_sha256=payload_sha256,
+                error=last_error,
+            )
             logger.warning(f'Sync attempt {attempt + 1}/{max_retries} failed: {last_error}')
 
         except requests.exceptions.Timeout:
             last_error = 'Request timeout'
+            emit_sync_evidence(
+                'push_http_error', batch_id=batch_id, model_name=model_name,
+                attempt=attempt_number, payload_sha256=payload_sha256,
+                error=last_error,
+            )
             logger.warning(f'Sync attempt {attempt + 1}/{max_retries}: timeout')
         except requests.exceptions.ConnectionError:
             last_error = 'Connection failed'
+            emit_sync_evidence(
+                'push_http_error', batch_id=batch_id, model_name=model_name,
+                attempt=attempt_number, payload_sha256=payload_sha256,
+                error=last_error,
+            )
             logger.warning(f'Sync attempt {attempt + 1}/{max_retries}: connection failed')
         except Exception as e:
             last_error = str(e)
+            emit_sync_evidence(
+                'push_http_error', batch_id=batch_id, model_name=model_name,
+                attempt=attempt_number, payload_sha256=payload_sha256,
+                error=last_error,
+            )
             logger.error(f'Sync attempt {attempt + 1}/{max_retries}: {e}')
 
         if attempt < max_retries - 1:
@@ -165,8 +274,14 @@ def fetch_changes(since_timestamp=None):
     max_retries = max(1, get_sync_max_retries())
     timeout = get_sync_timeout()
     last_error = None
+    pull_id = str(uuid.uuid4())
 
     for attempt in range(max_retries):
+        attempt_number = attempt + 1
+        emit_sync_evidence(
+            'pull_http_attempt', pull_id=pull_id, attempt=attempt_number,
+            max_attempts=max_retries, branch_id=get_branch_id(), params=params,
+        )
         try:
             resp = requests.get(
                 f'{url}/changes',
@@ -177,6 +292,11 @@ def fetch_changes(since_timestamp=None):
 
             if resp.status_code == 200:
                 data = resp.json()
+                emit_sync_evidence(
+                    'pull_http_response', pull_id=pull_id,
+                    attempt=attempt_number, http_status=resp.status_code,
+                    response=data,
+                )
                 return {
                     'success': True,
                     'data': data.get('data', {}),
@@ -190,16 +310,33 @@ def fetch_changes(since_timestamp=None):
                 }
 
             last_error = f'HTTP {resp.status_code}: {resp.text[:200]}'
+            emit_sync_evidence(
+                'pull_http_response', pull_id=pull_id,
+                attempt=attempt_number, http_status=resp.status_code,
+                error=last_error,
+            )
             logger.warning(f'Pull attempt {attempt + 1}/{max_retries} failed: {last_error}')
 
         except requests.exceptions.Timeout:
             last_error = 'Request timeout'
+            emit_sync_evidence(
+                'pull_http_error', pull_id=pull_id, attempt=attempt_number,
+                error=last_error,
+            )
             logger.warning(f'Pull attempt {attempt + 1}/{max_retries}: timeout')
         except requests.exceptions.ConnectionError:
             last_error = 'Connection failed'
+            emit_sync_evidence(
+                'pull_http_error', pull_id=pull_id, attempt=attempt_number,
+                error=last_error,
+            )
             logger.warning(f'Pull attempt {attempt + 1}/{max_retries}: connection failed')
         except Exception as e:
             last_error = str(e)
+            emit_sync_evidence(
+                'pull_http_error', pull_id=pull_id, attempt=attempt_number,
+                error=last_error,
+            )
             logger.error(f'Pull attempt {attempt + 1}/{max_retries}: {e}')
 
         if attempt < max_retries - 1:

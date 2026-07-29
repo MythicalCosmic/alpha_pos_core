@@ -1,4 +1,3 @@
-from django.core.paginator import Paginator
 from base.repositories.base import BaseSyncRepository
 from stock.models import ProductStockLink, ProductComponentStock
 
@@ -34,12 +33,6 @@ class ProductStockLinkRepository(BaseSyncRepository):
             ).get(pk=link_id, is_deleted=False)
         except cls.model.DoesNotExist:
             return None
-
-
-    @classmethod
-    def paginate(cls, queryset, page=1, per_page=20):
-        paginator = Paginator(queryset, per_page)
-        return paginator.get_page(page), paginator
 
 
 class ProductComponentStockRepository(BaseSyncRepository):

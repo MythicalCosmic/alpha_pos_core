@@ -9,11 +9,11 @@ completes and a retry sweep picks it up later.
 import logging
 from datetime import timedelta
 
-from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
 from base.helpers.response import ServiceResponse
+from base.services.sync.evidence import emit_sync_evidence
 from fiscalization.config import FiscalConfig
 from fiscalization.models import FiscalReceipt
 from fiscalization.providers import get_provider
@@ -51,6 +51,18 @@ class FiscalizationService:
         order = Order.objects.filter(id=order_id).first()
         if not order:
             return ServiceResponse.not_found('Order not found')
+        if (
+            receipt_type == FiscalReceipt.ReceiptType.SALE
+            and (not order.is_paid or order.paid_at is None)
+        ):
+            # The manual admin/management endpoint reaches this service too.
+            # Never let it turn an unpaid kitchen ticket into an official sale
+            # receipt; only the committed payment path may establish the paid
+            # header (and its OrderPayment/CourierPayment evidence) first.
+            return ServiceResponse.validation_error(
+                errors={'order': 'Order payment has not been committed'},
+                message='Cannot fiscalize an unpaid order',
+            )
 
         mode = FiscalConfig.get_mode()
         cfg = FiscalConfig.tenant()
@@ -78,6 +90,20 @@ class FiscalizationService:
             receipt.attempts += 1
             receipt.status = FiscalReceipt.Status.SENT
             receipt.save()
+
+        emit_sync_evidence(
+            'fiscal_attempt_started',
+            order_id=order.id,
+            order_uuid=str(order.uuid),
+            receipt_id=receipt.id,
+            receipt_type=receipt_type,
+            attempt=receipt.attempts,
+            provider=receipt.provider,
+            mode=receipt.mode,
+            amount=str(receipt.amount),
+            request_payload=payload,
+            status=receipt.status,
+        )
 
         # Provider call OUTSIDE the row lock — network I/O must not hold a DB
         # lock on the receipt row.
@@ -107,6 +133,27 @@ class FiscalizationService:
                 receipt.status = FiscalReceipt.Status.FAILED
                 receipt.error = result.error or 'unknown provider error'
             receipt.save()
+
+        emit_sync_evidence(
+            'fiscal_attempt_completed',
+            order_id=order.id,
+            order_uuid=str(order.uuid),
+            receipt_id=receipt.id,
+            receipt_type=receipt_type,
+            attempt=receipt.attempts,
+            provider=receipt.provider,
+            mode=receipt.mode,
+            amount=str(receipt.amount),
+            status=receipt.status,
+            response_payload=receipt.response_payload,
+            error=receipt.error,
+            fiscal_sign=receipt.fiscal_sign,
+            fiscal_number=receipt.fiscal_number,
+            qr_url=receipt.qr_url,
+            fiscalized_at=(
+                receipt.fiscalized_at.isoformat() if receipt.fiscalized_at else None
+            ),
+        )
 
         if result.success:
             return ServiceResponse.success(

@@ -1,4 +1,3 @@
-import logging
 from decimal import Decimal
 from django.core.cache import cache
 from django.db.models import Sum, Count, Avg, Q, F, ExpressionWrapper, DurationField
@@ -8,8 +7,6 @@ from notifications.helpers import (
     format_duration_minutes, format_prep_time, UZB_TZ,
 )
 from notifications.services.sender_service import SenderService
-
-logger = logging.getLogger(__name__)
 
 SESSION_KEY = 'notif:shift:session'
 SESSION_TTL = 86400

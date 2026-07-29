@@ -1,5 +1,4 @@
 from django.db.models import Q, Count
-from django.core.paginator import Paginator
 from base.repositories.base import BaseSyncRepository
 from hr.models import Department
 
@@ -28,8 +27,3 @@ class DepartmentRepository(BaseSyncRepository):
     @classmethod
     def with_employee_count(cls, queryset):
         return queryset.annotate(employee_count=Count('employees'))
-
-    @classmethod
-    def paginate(cls, queryset, page=1, per_page=20):
-        paginator = Paginator(queryset, per_page)
-        return paginator.get_page(page), paginator

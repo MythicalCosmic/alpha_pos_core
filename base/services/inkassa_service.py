@@ -11,8 +11,8 @@ class InkassaService:
         register = CashRegisterRepository.get_or_create_current(
             branch_id, for_update=True,
         )
+        # save() preserves SyncMixin propagation after the locked increment.
         register.current_balance = (register.current_balance or 0) + amount
         register.last_updated = timezone.now()
         register.save(update_fields=['current_balance', 'last_updated',
                                      'synced_at', 'sync_version'])
-

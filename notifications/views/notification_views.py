@@ -306,7 +306,16 @@ def template_preview(request, template_id):
 @admin_required
 def queue_view(request):
     items = QueueService.get_all()
-    return JsonResponse({'success': True, 'data': {'queue': items, 'count': len(items)}})
+    dead_letters = QueueService.get_dead_letters()
+    return JsonResponse({
+        'success': True,
+        'data': {
+            'queue': items,
+            'count': len(items),
+            'dead_letters': dead_letters,
+            'dead_letter_count': len(dead_letters),
+        },
+    })
 
 
 @csrf_exempt

@@ -50,7 +50,7 @@ def webhook(request):
         return JsonResponse({'ok': True})
 
     # Handling an update makes blocking HTTPS calls back to Telegram
-    # (sendMessage, etc., ~10s timeout each). On a multi-worker gunicorn +
+    # (sendMessage, etc., ~10s timeout each). On a multi-worker Uvicorn +
     # Postgres deployment that can tie up workers under load, so the operator
     # can opt into offloading to a background thread via TELEGRAM_ASYNC_INBOUND.
     # It defaults OFF because the single-PC default runs on SQLite, where a

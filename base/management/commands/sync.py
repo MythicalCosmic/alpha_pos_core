@@ -272,7 +272,7 @@ class Command(BaseCommand):
         for model, cnt in summary.items():
             self.stdout.write(f'    {model}: {cnt}')
 
-        self.stdout.write(f'\n  Recent (max 20):')
+        self.stdout.write('\n  Recent (max 20):')
         for r in records[:20]:
             attempts = r.get('attempts', 0)
             err = f' [{r["last_error"][:40]}]' if r.get('last_error') else ''
@@ -282,9 +282,11 @@ class Command(BaseCommand):
     def _clear_queue(self):
         from base.services.sync.queue import SyncQueue
 
-        count = len(SyncQueue.get_all())
-        SyncQueue.clear()
-        self.stdout.write(self.style.SUCCESS(f'  Cleared {count} queued records.'))
+        count = SyncQueue.clear()
+        self.stdout.write(self.style.SUCCESS(
+            f'  Cleared {count} rebuildable queued records; '
+            'hard-delete tombstones preserved.'
+        ))
 
     def _check_health(self):
         from base.services.sync.transport import check_health

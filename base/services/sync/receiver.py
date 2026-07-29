@@ -1,11 +1,529 @@
 import logging
+from hashlib import sha256
 from decimal import Decimal
+from uuid import UUID
 from django.apps import apps
 from django.conf import settings
 from django.db import transaction
+from django.utils import timezone
 from base.services.sync.config import FK_UUID_MAPPINGS
 
 logger = logging.getLogger(__name__)
+
+
+class CriticalSyncConflict(ValueError):
+    """A financial state transition was not authoritatively stored.
+
+    The receive endpoint returns these UUIDs as failed so the branch's durable
+    queue retains them instead of treating an HTTP 200/skipped write as proof
+    that a shift close reached the cloud.
+    """
+
+    def __init__(self, record_result):
+        self.record_result = record_result
+        super().__init__(record_result.get('reason') or 'Critical sync conflict')
+
+
+class RetryableSyncError(ValueError):
+    """A valid record blocked until external state changes.
+
+    ValueError is retained as a base class for direct/internal callers which
+    historically treated an unresolved FK as a validation exception.
+    receive_batch catches this subtype first and classifies it as retryable,
+    never as a permanent invalid-record rejection.
+    """
+
+    def __init__(self, message, *, reason_code='RETRYABLE_APPLY_ERROR'):
+        self.reason_code = reason_code
+        super().__init__(message)
+
+
+class SyncApplyResult:
+    """Backward-compatible two-value result with an explicit disposition.
+
+    Existing direct callers unpack ``instance, action``.  ``receive_batch`` also
+    inspects ``disposition`` so a policy rejection can no longer masquerade as
+    an idempotent ``skipped`` acknowledgement.
+    """
+
+    __slots__ = ('instance', 'action', 'disposition', 'reason_code', 'reason')
+
+    def __init__(
+        self, instance, action, *, disposition='acknowledged',
+        reason_code='', reason='',
+    ):
+        self.instance = instance
+        self.action = action
+        self.disposition = disposition
+        self.reason_code = reason_code
+        self.reason = reason
+
+    def __iter__(self):
+        yield self.instance
+        yield self.action
+
+
+def _rejected(instance, reason_code, reason):
+    return SyncApplyResult(
+        instance, 'skipped', disposition='rejected',
+        reason_code=reason_code, reason=reason,
+    )
+
+
+def _acknowledged(instance, reason_code, reason=''):
+    return SyncApplyResult(
+        instance, 'skipped', disposition='acknowledged',
+        reason_code=reason_code, reason=reason,
+    )
+
+
+def _global_user_alias_key(incoming_branch, source_uuid):
+    """Durable, bounded key for a legacy branch User UUID alias."""
+    identity = f'{incoming_branch}:{source_uuid}'.encode('utf-8')
+    digest = sha256(identity).hexdigest()[:40]
+    return f'sync_user_alias:{digest}'
+
+
+def _store_global_user_alias(incoming_branch, source_uuid, canonical_uuid):
+    """Remember a validated email-identity alias for legacy clients.
+
+    Pre-v2 clients cannot consume ``canonical_uuid`` response evidence.  The
+    server therefore keeps the old UUID resolvable for their later Order/Shift
+    FK payloads while upgraded clients re-key their local graph immediately.
+    """
+    from base.models import SyncState
+
+    source = str(source_uuid)
+    canonical = str(canonical_uuid)
+    if not source or not canonical or source == canonical:
+        return
+    SyncState.objects.update_or_create(
+        key=_global_user_alias_key(incoming_branch, source),
+        defaults={'value': canonical},
+    )
+
+
+def _resolve_global_user_alias(
+    related_model, incoming_branch, source_uuid,
+):
+    """Resolve a previously validated User UUID alias, if still canonical."""
+    if (
+        getattr(settings, 'DEPLOYMENT_MODE', '') != 'cloud'
+        or related_model._meta.label_lower != 'base.user'
+    ):
+        return None
+    from base.models import SyncState
+
+    marker = SyncState.objects.filter(
+        key=_global_user_alias_key(incoming_branch, source_uuid),
+    ).first()
+    if marker is None or not marker.value:
+        return None
+    try:
+        canonical_uuid = UUID(str(marker.value))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return related_model._base_manager.filter(
+        uuid=canonical_uuid,
+        is_deleted=False,
+    ).first()
+
+
+def _append_only_replay_matches(model_class, instance, cleaned, resolved_fks):
+    """Prove that an append-only UUID replay carries identical evidence."""
+    for field_name, incoming_value in _strip_denied(
+        model_class, cleaned, creating=True,
+    ).items():
+        if getattr(instance, field_name) != incoming_value:
+            return False
+    for field_name, related in resolved_fks.items():
+        incoming_pk = related.pk if related is not None else None
+        if getattr(instance, f'{field_name}_id') != incoming_pk:
+            return False
+    return True
+
+
+def _record_replay_matches(
+    model_class, instance, cleaned, resolved_fks, *, is_deleted,
+):
+    """Prove a losing LWW record is already represented on the receiver."""
+    values = _strip_denied(model_class, cleaned, creating=False)
+    values = _strip_branch_rewrites(model_class, instance, values)
+    for field_name, incoming_value in values.items():
+        if getattr(instance, field_name) != incoming_value:
+            return False
+    denied = (
+        model_class._effective_denylist()
+        if hasattr(model_class, '_effective_denylist')
+        else frozenset()
+    )
+    frozen = _branch_frozen_update_fields(model_class, instance)
+    for field_name, related in resolved_fks.items():
+        if field_name in denied or field_name in frozen:
+            continue
+        incoming_pk = related.pk if related is not None else None
+        if getattr(instance, f'{field_name}_id') != incoming_pk:
+            return False
+    delete_denied = 'is_deleted' in denied
+    if (
+        not delete_denied
+        and 'is_deleted' not in frozen
+        and instance.is_deleted != is_deleted
+    ):
+        return False
+    return True
+
+
+_DIRECT_SHIFT_FINANCIAL_MODELS = frozenset({
+    'base.orderrefund',
+    'cashbox.cashboxexpense',
+    'cashbox.shiftpaymenttotal',
+})
+_ORDER_FINANCIAL_CHILD_MODELS = frozenset({
+    'base.externalorderpayment',
+    'base.orderitem',
+    'base.orderpayment',
+})
+
+
+def _order_settlement_state(order):
+    """Return the fields that decide whether an Order belongs to a shift."""
+    if order is None:
+        return None
+    return {
+        'branch_id': str(getattr(order, 'branch_id', '') or ''),
+        'cashier_id': getattr(order, 'cashier_id', None),
+        'is_paid': bool(getattr(order, 'is_paid', False)),
+        'paid_at': getattr(order, 'paid_at', None),
+        'is_deleted': bool(getattr(order, 'is_deleted', False)),
+    }
+
+
+def _incoming_order_settlement_state(
+    existing, cleaned, resolved_fks, incoming_branch, is_deleted,
+):
+    """Project the receiver-visible Order membership after this payload."""
+    current = _order_settlement_state(existing) or {
+        'branch_id': str(incoming_branch or ''),
+        'cashier_id': None,
+        'is_paid': False,
+        'paid_at': None,
+        'is_deleted': False,
+    }
+    projected = dict(current)
+    # Cloud receive never lets a payload steal a non-empty branch owner.
+    if existing is None or not current['branch_id']:
+        projected['branch_id'] = str(incoming_branch or '')
+    if 'cashier' in resolved_fks:
+        cashier = resolved_fks['cashier']
+        projected['cashier_id'] = cashier.pk if cashier is not None else None
+    for field_name in ('is_paid', 'paid_at'):
+        if field_name in cleaned:
+            projected[field_name] = cleaned[field_name]
+    projected['is_deleted'] = bool(is_deleted)
+    return projected
+
+
+def _sale_shift_ids_for_states(states):
+    """Find every shift window whose immutable manifest can contain a sale."""
+    from django.db.models import Q
+    from base.models import Shift
+
+    shift_ids = set()
+    for state in states:
+        if not state or state.get('is_deleted') or not state.get('is_paid'):
+            continue
+        branch_id = str(state.get('branch_id') or '')
+        cashier_id = state.get('cashier_id')
+        paid_at = state.get('paid_at')
+        if not branch_id or not cashier_id or paid_at is None:
+            continue
+        shift_ids.update(
+            Shift._base_manager.filter(
+                branch_id=branch_id,
+                user_id=cashier_id,
+                is_deleted=False,
+                start_time__lte=paid_at,
+            ).filter(
+                Q(end_time__gt=paid_at) | Q(end_time__isnull=True),
+            ).values_list('pk', flat=True)
+        )
+    return shift_ids
+
+
+def _refund_shift_ids_for_orders(order_ids):
+    """OrderItem evidence also belongs to every refund shift for its order."""
+    if not order_ids:
+        return set()
+    from base.models import OrderRefund
+
+    return set(
+        OrderRefund._base_manager.filter(
+            order_id__in=order_ids,
+            shift_id__isnull=False,
+            is_deleted=False,
+        ).values_list('shift_id', flat=True)
+    )
+
+
+def _financial_owner_plan(
+    model_class,
+    uuid_val,
+    cleaned,
+    resolved_fks,
+    incoming_branch,
+    is_deleted,
+):
+    """Plan the Shift→Order→child lock order for settlement evidence writes.
+
+    The plan is deliberately computed before the transaction only to identify
+    candidate rows. `_lock_financial_owners` re-fetches and locks every parent
+    Order inside the transaction and aborts for retry if membership changed.
+    """
+    if getattr(settings, 'DEPLOYMENT_MODE', 'local') != 'cloud':
+        return None
+
+    label = model_class._meta.label_lower
+    if (
+        label not in _DIRECT_SHIFT_FINANCIAL_MODELS
+        and label not in _ORDER_FINANCIAL_CHILD_MODELS
+        and label != 'base.order'
+    ):
+        return None
+
+    from base.models import Order
+
+    direct_shift_ids = set()
+    order_ids = set()
+    projected_states = []
+    include_refund_shifts = label == 'base.orderitem'
+
+    if label in _DIRECT_SHIFT_FINANCIAL_MODELS:
+        incoming_shift = resolved_fks.get('shift')
+        if incoming_shift is not None:
+            direct_shift_ids.add(incoming_shift.pk)
+        existing_shift_id = (
+            model_class._base_manager.filter(uuid=uuid_val)
+            .values_list('shift_id', flat=True)
+            .first()
+        )
+        if existing_shift_id is not None:
+            direct_shift_ids.add(existing_shift_id)
+
+    elif label in _ORDER_FINANCIAL_CHILD_MODELS:
+        incoming_order = resolved_fks.get('order')
+        if incoming_order is not None:
+            order_ids.add(incoming_order.pk)
+        existing_order_id = (
+            model_class._base_manager.filter(uuid=uuid_val)
+            .values_list('order_id', flat=True)
+            .first()
+        )
+        if existing_order_id is not None:
+            order_ids.add(existing_order_id)
+
+    else:  # base.Order itself
+        existing = (
+            Order._base_manager.filter(uuid=uuid_val)
+            .select_related('cashier')
+            .first()
+        )
+        if existing is not None:
+            order_ids.add(existing.pk)
+            projected_states.append(_order_settlement_state(existing))
+        projected_states.append(_incoming_order_settlement_state(
+            existing,
+            cleaned,
+            resolved_fks,
+            incoming_branch,
+            is_deleted,
+        ))
+
+    orders = list(
+        Order._base_manager.filter(pk__in=order_ids).order_by('pk')
+    )
+    states = [_order_settlement_state(order) for order in orders]
+    states.extend(projected_states)
+    shift_ids = set(direct_shift_ids)
+    shift_ids.update(_sale_shift_ids_for_states(states))
+    if include_refund_shifts:
+        shift_ids.update(_refund_shift_ids_for_orders(order_ids))
+
+    return {
+        'label': label,
+        'direct_shift_ids': direct_shift_ids,
+        'order_ids': order_ids,
+        'projected_states': projected_states,
+        'cleaned': dict(cleaned),
+        'incoming_branch': incoming_branch,
+        'is_deleted': is_deleted,
+        'include_refund_shifts': include_refund_shifts,
+        'shift_ids': shift_ids,
+    }
+
+
+def _lock_financial_owners(plan, resolved_fks):
+    """Lock financial owners before the receiver locks or writes the child."""
+    if not plan:
+        return {'settled_shift_ids': set(), 'locked_shift_ids': set()}
+
+    from base.models import CashReconciliation, Order, Shift
+
+    planned_shift_ids = set(plan['shift_ids'])
+    locked_shifts = list(
+        Shift._base_manager.select_for_update()
+        .filter(pk__in=sorted(planned_shift_ids))
+        .order_by('pk')
+    )
+    locked_shift_ids = {shift.pk for shift in locked_shifts}
+
+    locked_orders = list(
+        Order._base_manager.select_for_update()
+        .filter(pk__in=sorted(plan['order_ids']))
+        .order_by('pk')
+    )
+    locked_orders_by_id = {order.pk: order for order in locked_orders}
+
+    # Replace the pre-transaction FK objects with their locked copies. This is
+    # both a freshness guarantee and a clear Shift→Order→child lock order.
+    incoming_order = resolved_fks.get('order')
+    if (
+        incoming_order is not None
+        and incoming_order.pk in locked_orders_by_id
+    ):
+        resolved_fks['order'] = locked_orders_by_id[incoming_order.pk]
+    incoming_shift = resolved_fks.get('shift')
+    locked_shifts_by_id = {shift.pk: shift for shift in locked_shifts}
+    if (
+        incoming_shift is not None
+        and incoming_shift.pk in locked_shifts_by_id
+    ):
+        resolved_fks['shift'] = locked_shifts_by_id[incoming_shift.pk]
+
+    # If a concurrent parent update changed sale/refund membership between the
+    # planning read and these locks, retry from a fresh deterministic plan. Do
+    # not acquire an unplanned lower-PK Shift after locking Orders: that would
+    # invert the global Shift→Order lock order and permit a deadlock.
+    current_states = [
+        _order_settlement_state(order) for order in locked_orders
+    ]
+    if plan['label'] == 'base.order':
+        # The planning snapshot may have waited behind another receiver. Build
+        # the incoming state again from the now-locked current Order; otherwise
+        # a stale projected paid_at/cashier can omit its real settlement shift.
+        current = locked_orders[0] if locked_orders else None
+        current_states.append(_incoming_order_settlement_state(
+            current,
+            plan['cleaned'],
+            resolved_fks,
+            plan['incoming_branch'],
+            plan['is_deleted'],
+        ))
+    else:
+        current_states.extend(plan['projected_states'])
+    current_shift_ids = set(plan['direct_shift_ids'])
+    current_shift_ids.update(_sale_shift_ids_for_states(current_states))
+    if plan['include_refund_shifts']:
+        current_shift_ids.update(
+            _refund_shift_ids_for_orders(locked_orders_by_id)
+        )
+    unplanned = current_shift_ids - locked_shift_ids
+    if unplanned:
+        raise RetryableSyncError(
+            'Financial parent changed while acquiring settlement locks; retry',
+            reason_code='FINANCIAL_OWNER_CHANGED',
+        )
+
+    reconciled_shift_ids = set(
+        CashReconciliation._base_manager.filter(
+            shift_id__in=locked_shift_ids,
+            is_deleted=False,
+        ).values_list('shift_id', flat=True)
+    )
+    completed_shift_ids = {
+        shift.pk for shift in locked_shifts
+        if shift.status == Shift.Status.COMPLETED
+    }
+    return {
+        'settled_shift_ids':
+            reconciled_shift_ids | completed_shift_ids,
+        'locked_shift_ids': locked_shift_ids,
+    }
+
+
+def _verify_locked_financial_target(plan, owner_guard, instance):
+    """Detect a target re-parented while the receiver waited on its row lock."""
+    if not plan or instance is None:
+        return
+    label = plan['label']
+    if label in _DIRECT_SHIFT_FINANCIAL_MODELS:
+        current_shift_id = getattr(instance, 'shift_id', None)
+        valid = (
+            current_shift_id is None
+            or current_shift_id in owner_guard['locked_shift_ids']
+        )
+    elif label in _ORDER_FINANCIAL_CHILD_MODELS:
+        valid = (
+            getattr(instance, 'order_id', None)
+            in plan['order_ids']
+        )
+    else:
+        valid = instance.pk in plan['order_ids']
+    if not valid:
+        raise RetryableSyncError(
+            'Financial target changed while acquiring settlement locks; retry',
+            reason_code='FINANCIAL_OWNER_CHANGED',
+        )
+
+
+def _settled_shift_admission(
+    owner_guard,
+    model_class,
+    instance,
+    cleaned,
+    resolved_fks,
+    *,
+    is_deleted,
+):
+    """Allow exact replays only; reject mutations of a posted settlement."""
+    settled_shift_ids = set(
+        (owner_guard or {}).get('settled_shift_ids') or (),
+    )
+    if not settled_shift_ids:
+        return None
+
+    if instance is not None:
+        if getattr(model_class, '_sync_append_only', False):
+            exact = (
+                not is_deleted
+                and _append_only_replay_matches(
+                    model_class, instance, cleaned, resolved_fks,
+                )
+            )
+        else:
+            exact = _record_replay_matches(
+                model_class,
+                instance,
+                cleaned,
+                resolved_fks,
+                is_deleted=is_deleted,
+            )
+        if exact:
+            return _acknowledged(
+                instance,
+                'IDEMPOTENT_SETTLED_SHIFT_EVIDENCE_REPLAY',
+                'The settled shift already stores identical evidence',
+            )
+
+    shift_list = ','.join(str(pk) for pk in sorted(settled_shift_ids))
+    return _rejected(
+        instance,
+        'SETTLED_SHIFT_EVIDENCE_REWRITE',
+        (
+            'Financial evidence for a completed/reconciled shift is immutable '
+            f'(shift ids: {shift_list})'
+        ),
+    )
 
 
 def _resolve_foreign_keys(model_class, data, incoming_branch):
@@ -51,6 +569,10 @@ def _resolve_foreign_keys(model_class, data, incoming_branch):
         try:
             related_model = apps.get_model(app_label, model_name)
             instance = related_model.objects.filter(uuid=uuid_value).first()
+            if instance is None:
+                instance = _resolve_global_user_alias(
+                    related_model, incoming_branch, uuid_value,
+                )
             if instance:
                 parent_scope = getattr(
                     related_model, 'SYNC_PULL_SCOPE', 'branch',
@@ -128,7 +650,30 @@ def _clean_field_value(field, value):
         return value
 
     if field_type == 'BooleanField':
-        return bool(value)
+        if isinstance(value, bool):
+            return value
+        # JSON booleans are the canonical wire form.  Accept the two legacy
+        # string spellings explicitly; Python's bool("false") is True and was
+        # silently flipping paid/deleted/command state during old-client sync.
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized == 'true':
+                return True
+            if normalized == 'false':
+                return False
+        # A few legacy serializers emitted JSON 0/1.  They are unambiguous,
+        # unlike arbitrary non-empty strings or numbers.
+        if type(value) is int and value in (0, 1):
+            return bool(value)
+        raise ValueError(
+            'boolean values must be true/false (or legacy 0/1)',
+        )
+
+    if field_type == 'UUIDField':
+        # JSON carries UUIDs as strings while Django exposes UUIDField values as
+        # ``uuid.UUID`` objects.  Keeping the raw string made an exact
+        # append-only payment replay look like a money-evidence rewrite.
+        return field.to_python(value)
 
     if field_type in ('IntegerField', 'PositiveIntegerField'):
         return int(value) if value is not None else None
@@ -157,6 +702,14 @@ def _prepare_fields(model_class, data):
             cleaned[key] = _clean_field_value(field, value)
         except Exception as e:
             logger.warning(f'Field {key} clean error: {e}')
+            if field.get_internal_type() in {'BooleanField', 'UUIDField'}:
+                # Invalid financial/control booleans are permanent record
+                # defects, as are malformed business UUIDs. Do not pass either
+                # through to Django's looser save-time coercion and misclassify
+                # them as a transient database failure.
+                raise ValueError(
+                    f'Invalid {field.get_internal_type()} field {key}: {e}'
+                ) from e
             cleaned[key] = value
 
     return cleaned
@@ -182,29 +735,13 @@ def _strip_branch_rewrites(model_class, instance, values):
     values = dict(values)
     if getattr(settings, 'DEPLOYMENT_MODE', 'local') != 'cloud':
         return values
-    create_only = set(getattr(
-        model_class, 'SYNC_CREATE_ONLY_FROM_BRANCH', frozenset(),
-    ))
-    immutable_after_set = set(getattr(
-        model_class, 'SYNC_IMMUTABLE_FROM_BRANCH_AFTER_SET', frozenset(),
-    ))
-    immutable_after_manifest = _branch_frozen_after_manifest_fields(
+    model_guard = getattr(model_class, '_strip_sync_branch_rewrites', None)
+    if model_guard is not None:
+        values = model_guard(instance, values)
+    immutable_from_branch = _branch_frozen_update_fields(
         model_class, instance,
     )
-    for field_name in create_only:
-        values.pop(field_name, None)
-    for field_name in immutable_after_set:
-        if field_name not in values:
-            continue
-        current = getattr(instance, field_name, None)
-        incoming = values[field_name]
-        if current not in (None, '', {}, []) and incoming != current:
-            logger.warning(
-                'sync receive: refused rewrite of immutable %s.%s uuid=%s',
-                model_class.__name__, field_name, getattr(instance, 'uuid', None),
-            )
-            values.pop(field_name, None)
-    for field_name in immutable_after_manifest:
+    for field_name in immutable_from_branch:
         values.pop(field_name, None)
     return values
 
@@ -229,6 +766,17 @@ def _branch_frozen_after_manifest_fields(model_class, instance):
         expanded.add(field.name)
         expanded.add(field.attname)
     return frozenset(expanded)
+
+
+def _branch_frozen_update_fields(model_class, instance):
+    """All fields/attnames a branch may no longer rewrite on the cloud."""
+    frozen = set(_branch_frozen_after_manifest_fields(model_class, instance))
+    settled_guard = getattr(
+        model_class, '_sync_frozen_from_branch_fields', None,
+    )
+    if settled_guard is not None:
+        frozen.update(settled_guard(instance))
+    return frozenset(frozen)
 
 
 def _append_only_trusted_update_fields(model_class):
@@ -270,8 +818,11 @@ def _preserve_automatic_values(model_class, instance, values, *, creating):
 class CloudReceiver:
 
     @classmethod
-    def receive_batch(cls, model_name, branch_id, records):
+    def receive_batch(
+        cls, model_name, branch_id, records, *, client_ack_protocol=2,
+    ):
         result = {
+            'ack_protocol_version': 2,
             'success': True,
             'created': 0,
             'updated': 0,
@@ -282,7 +833,34 @@ class CloudReceiver:
             # re-queues the failures — otherwise a partial-failure batch was
             # purged wholesale on the HTTP-200, silently losing the bad rows.
             'failed_uuids': [],
+            'acknowledged_uuids': [],
+            'retryable_uuids': [],
+            'rejected_uuids': [],
+            # Additive per-record evidence for state transitions where
+            # created/updated/skipped is too weak to be an acknowledgement.
+            'record_results': [],
         }
+
+        if not isinstance(records, list) or not records:
+            result['success'] = False
+            result['errors'].append('records must be a non-empty array')
+            return result
+        submitted_uuids = []
+        for index, record in enumerate(records):
+            if not isinstance(record, dict):
+                result['success'] = False
+                result['errors'].append(f'records[{index}] must be an object')
+                return result
+            record_uuid = str(record.get('uuid') or '')
+            if not record_uuid:
+                result['success'] = False
+                result['errors'].append(f'records[{index}] is missing uuid')
+                return result
+            submitted_uuids.append(record_uuid)
+        if len(set(submitted_uuids)) != len(submitted_uuids):
+            result['success'] = False
+            result['errors'].append('record UUIDs must be unique within a batch')
+            return result
 
         try:
             if '.' in model_name:
@@ -300,7 +878,11 @@ class CloudReceiver:
                 if model_class is None:
                     model_class = apps.get_model('base', model_name)  # legacy fallback
         except Exception as e:
-            return {'success': False, 'created': 0, 'updated': 0, 'skipped': 0, 'errors': [str(e)]}
+            result['success'] = False
+            result['errors'].append(str(e))
+            result['retryable_uuids'] = submitted_uuids
+            result['failed_uuids'] = submitted_uuids
+            return result
 
         # Per-model opt-out for state that must never arrive from a peer (for
         # example the branch-local treasury ledger). One-way collectors such
@@ -312,42 +894,280 @@ class CloudReceiver:
                 model_class.__name__, len(records),
             )
             result['skipped'] = len(records)
+            result['acknowledged_uuids'] = submitted_uuids
+            result['record_results'] = [
+                {
+                    'uuid': record_uuid,
+                    'action': 'skipped',
+                    'disposition': 'acknowledged',
+                    'reason_code': 'INGEST_DISABLED',
+                }
+                for record_uuid in submitted_uuids
+            ]
             return result
 
         model_label = model_class.__name__
         affected_order_ids = set()
-        for record_data in records:
+        affected_record_uuids = set()
+        for record_data, rec_uuid in zip(records, submitted_uuids):
             try:
-                instance, action = cls._create_or_update(model_class, record_data, branch_id)
+                if model_class._meta.label_lower == 'base.user':
+                    apply_result = cls._create_or_update(
+                        model_class,
+                        record_data,
+                        branch_id,
+                        client_ack_protocol=client_ack_protocol,
+                    )
+                else:
+                    apply_result = cls._create_or_update(
+                        model_class, record_data, branch_id,
+                    )
+                if isinstance(apply_result, SyncApplyResult):
+                    instance = apply_result.instance
+                    action = apply_result.action
+                    disposition = apply_result.disposition
+                    reason_code = apply_result.reason_code
+                    reason = apply_result.reason
+                else:
+                    instance, action = apply_result
+                    if action in {'created', 'updated'}:
+                        disposition = 'acknowledged'
+                        reason_code = ''
+                        reason = ''
+                    else:
+                        disposition = 'rejected'
+                        reason_code = 'UNCLASSIFIED_SKIP'
+                        reason = (
+                            'Receiver could not prove that the skipped record '
+                            'is semantically equivalent'
+                        )
                 if action == 'created':
                     result['created'] += 1
                 elif action == 'updated':
                     result['updated'] += 1
                 else:
                     result['skipped'] += 1
+                custom_result = getattr(instance, '_sync_record_result', None)
+                record_result = dict(custom_result or {})
+                record_result.update({
+                    'uuid': rec_uuid,
+                    'action': action,
+                    'disposition': disposition,
+                })
+                if instance is not None:
+                    record_result['server_sync_version'] = getattr(
+                        instance, 'sync_version', None,
+                    )
+                    record_result['server_is_deleted'] = getattr(
+                        instance, 'is_deleted', None,
+                    )
+                if reason_code:
+                    record_result['reason_code'] = reason_code
+                if reason:
+                    record_result['reason'] = reason
+                    # Rolling v1 clients interpret any top-level error without
+                    # failed_uuids as a whole-batch failure. Informational
+                    # idempotent/alias ACK reasons belong only in per-record
+                    # evidence; top-level errors are reserved for retryable or
+                    # rejected records.
+                    if disposition != 'acknowledged':
+                        result['errors'].append(f'{rec_uuid}: {reason}')
+                result['record_results'].append(record_result)
+                result[f'{disposition}_uuids'].append(rec_uuid)
                 # Collect the orders touched by this batch so staff notifications
                 # fire AFTER the order + its items are all applied (items arrive
                 # in a separate batch after the order — see _notify_received_orders).
-                if instance is not None:
+                if instance is not None and disposition == 'acknowledged':
                     if model_label == 'Order':
                         affected_order_ids.add(instance.id)
+                        affected_record_uuids.add(rec_uuid)
                     elif model_label == 'OrderItem' and instance.order_id:
                         affected_order_ids.add(instance.order_id)
-                    elif model_label == 'OrderPayment' and instance.order_id:
+                        affected_record_uuids.add(rec_uuid)
+                    elif model_label in {
+                        'OrderPayment', 'ExternalOrderPayment',
+                    } and instance.order_id:
                         affected_order_ids.add(instance.order_id)
-            except Exception as e:
-                rec_uuid = record_data.get("uuid")
+                        affected_record_uuids.add(rec_uuid)
+            except CriticalSyncConflict as e:
+                record_result = dict(e.record_result)
+                record_result.update({
+                    'uuid': rec_uuid,
+                    'action': 'conflict',
+                    'disposition': 'rejected',
+                })
+                result['record_results'].append(record_result)
+                result['skipped'] += 1
+                error_msg = f'{rec_uuid or "?"}: {e}'
+                result['errors'].append(error_msg)
+                result['rejected_uuids'].append(rec_uuid)
+                logger.warning('Receive critical conflict: %s', error_msg)
+            except RetryableSyncError as e:
                 error_msg = f'{rec_uuid or "?"}: {str(e)}'
                 result['errors'].append(error_msg)
-                if rec_uuid:
-                    result['failed_uuids'].append(rec_uuid)
-                logger.error(f'Receive error: {error_msg}')
+                result['retryable_uuids'].append(rec_uuid)
+                result['record_results'].append({
+                    'uuid': rec_uuid,
+                    'action': 'deferred',
+                    'disposition': 'retryable',
+                    'reason_code': e.reason_code,
+                    'reason': str(e),
+                })
+                logger.info('Receive deferred: %s', error_msg)
+            except ValueError as e:
+                error_msg = f'{rec_uuid or "?"}: {str(e)}'
+                result['errors'].append(error_msg)
+                result['rejected_uuids'].append(rec_uuid)
+                result['record_results'].append({
+                    'uuid': rec_uuid,
+                    'action': 'rejected',
+                    'disposition': 'rejected',
+                    'reason_code': 'INVALID_RECORD',
+                    'reason': str(e),
+                })
+                logger.warning('Receive rejected: %s', error_msg)
+            except Exception as e:
+                error_msg = f'{rec_uuid or "?"}: {str(e)}'
+                result['errors'].append(error_msg)
+                result['retryable_uuids'].append(rec_uuid)
+                result['record_results'].append({
+                    'uuid': rec_uuid,
+                    'action': 'deferred',
+                    'disposition': 'retryable',
+                    'reason_code': 'APPLY_ERROR',
+                    'reason': str(e),
+                })
+                logger.error('Receive error: %s', error_msg, exc_info=True)
 
         if affected_order_ids:
-            cls._reconcile_received_order_money(affected_order_ids)
-            cls._notify_received_orders(affected_order_ids)
+            money_reconciled = True
+            try:
+                cls._reconcile_received_order_money(affected_order_ids)
+            except Exception as exc:
+                money_reconciled = False
+                logger.error(
+                    'post-receive money reconciliation failed', exc_info=True,
+                )
+                for record_uuid in sorted(affected_record_uuids):
+                    if record_uuid not in result['acknowledged_uuids']:
+                        continue
+                    result['acknowledged_uuids'].remove(record_uuid)
+                    result['retryable_uuids'].append(record_uuid)
+                    for evidence in result['record_results']:
+                        if evidence.get('uuid') == record_uuid:
+                            evidence.update({
+                                'action': 'deferred',
+                                'disposition': 'retryable',
+                                'reason_code': (
+                                    'POST_RECEIVE_RECONCILIATION_FAILED'
+                                ),
+                                'reason': str(exc),
+                            })
+                    result['errors'].append(
+                        f'{record_uuid}: post-receive reconciliation failed: '
+                        f'{exc}'
+                    )
+            if money_reconciled:
+                cls._notify_received_orders(affected_order_ids)
 
+        try:
+            cls._run_periodic_money_reconciliation()
+        except Exception:
+            # The touched-record path above is part of that record's ACK. This
+            # bounded legacy sweep is independent and retries on the next batch.
+            logger.warning(
+                'periodic money reconciliation failed', exc_info=True,
+            )
+
+        for key in (
+            'acknowledged_uuids', 'retryable_uuids', 'rejected_uuids',
+        ):
+            result[key] = list(dict.fromkeys(result[key]))
+        result['failed_uuids'] = list(dict.fromkeys([
+            *result['retryable_uuids'],
+            *result['rejected_uuids'],
+        ]))
         return result
+
+    @staticmethod
+    def _shift_close_result(
+        *, uuid_val, state, instance=None, manifest=None,
+        reason_code=None, reason=None,
+    ):
+        from core.shifts.service import settlement_manifest_digest
+
+        manifest = manifest or {}
+        return {
+            'uuid': str(uuid_val),
+            'kind': 'SHIFT_CLOSE',
+            'state': state,
+            'server_status': getattr(instance, 'status', None),
+            'server_sync_version': getattr(instance, 'sync_version', None),
+            'manifest_version': manifest.get('version'),
+            'manifest_digest': settlement_manifest_digest(manifest),
+            'reason_code': reason_code,
+            'reason': reason,
+        }
+
+    @classmethod
+    def _validate_shift_close_intent(
+        cls, *, model_class, uuid_val, cleaned, incoming_branch,
+    ):
+        """Validate the immutable minimum needed to store a close header."""
+        if (
+            getattr(settings, 'DEPLOYMENT_MODE', 'local') != 'cloud'
+            or model_class._meta.label_lower != 'base.shift'
+            or str(cleaned.get('status') or '').upper() != 'ENDED'
+        ):
+            return None
+
+        manifest = cleaned.get('settlement_manifest')
+        result_kwargs = {
+            'uuid_val': uuid_val,
+            'state': 'CONFLICT',
+            'manifest': manifest if isinstance(manifest, dict) else None,
+        }
+        if not isinstance(manifest, dict) or not manifest:
+            raise CriticalSyncConflict(cls._shift_close_result(
+                **result_kwargs,
+                reason_code='MANIFEST_REQUIRED',
+                reason='A shift close must include its immutable settlement manifest',
+            ))
+        if (
+            manifest.get('version') not in {2, 3}
+            or manifest.get('branch_id') != incoming_branch
+            or not isinstance(manifest.get('tenders'), list)
+        ):
+            raise CriticalSyncConflict(cls._shift_close_result(
+                **result_kwargs,
+                reason_code='INVALID_CLOSE_MANIFEST',
+                reason='The shift close manifest is malformed or belongs to another branch',
+            ))
+        end_time = cleaned.get('end_time')
+        if end_time is None:
+            raise CriticalSyncConflict(cls._shift_close_result(
+                **result_kwargs,
+                reason_code='INVALID_CLOSE_WINDOW',
+                reason='A shift close must include end_time',
+            ))
+        if (
+            not isinstance(cleaned.get('total_orders'), int)
+            or cleaned['total_orders'] < 0
+        ):
+            raise CriticalSyncConflict(cls._shift_close_result(
+                **result_kwargs,
+                reason_code='INVALID_CLOSE_TOTALS',
+                reason='A shift close must include frozen order and money totals',
+            ))
+        for field_name in ('total_revenue', 'cash_collected'):
+            value = cleaned.get(field_name)
+            if not isinstance(value, Decimal) or not value.is_finite():
+                raise CriticalSyncConflict(cls._shift_close_result(
+                    **result_kwargs,
+                    reason_code='INVALID_CLOSE_TOTALS',
+                    reason=f'A shift close has invalid {field_name}',
+                ))
+        return manifest
 
     @staticmethod
     def _reconcile_received_order_money(order_ids):
@@ -355,21 +1175,92 @@ class CloudReceiver:
         from django.conf import settings
         if getattr(settings, 'DEPLOYMENT_MODE', '') != 'cloud':
             return
-        try:
-            from base.services.order_payment_reconciliation import (
-                reconcile_stale_paid_headers,
+        from base.services.order_payment_reconciliation import (
+            reconcile_stale_paid_headers,
+        )
+        repaired = reconcile_stale_paid_headers(order_ids)
+        if repaired:
+            logger.warning(
+                'sync receive repaired %d stale paid order header(s): %s',
+                len(repaired), ','.join(sorted(repaired)),
             )
-            repaired = reconcile_stale_paid_headers(order_ids)
-            if repaired:
-                logger.warning(
-                    'sync receive repaired %d stale paid order header(s): %s',
-                    len(repaired), ','.join(sorted(repaired)),
+
+    @staticmethod
+    def _run_periodic_money_reconciliation():
+        """Bounded cloud sweep for rows lost by pre-v2 acknowledgement races."""
+        if getattr(settings, 'DEPLOYMENT_MODE', '') != 'cloud':
+            return []
+        import json
+        from datetime import timedelta
+        from django.utils.dateparse import parse_datetime
+        from base.models import (
+            ExternalOrderPayment, OrderPayment, SyncState,
+        )
+        from base.services.order_payment_reconciliation import (
+            reconcile_stale_paid_headers,
+        )
+
+        interval = max(30, int(getattr(
+            settings, 'SYNC_MONEY_RECONCILE_INTERVAL_SECONDS', 300,
+        )))
+        limit = max(1, min(2000, int(getattr(
+            settings, 'SYNC_MONEY_RECONCILE_BATCH_SIZE', 500,
+        ))))
+        now = timezone.now()
+        with transaction.atomic():
+            marker, _ = SyncState.objects.select_for_update().get_or_create(
+                key='sync_money_reconcile_v2',
+                defaults={'value': ''},
+            )
+            try:
+                state = json.loads(marker.value or '{}')
+                last_finished = parse_datetime(
+                    state.get('last_finished_at', ''),
                 )
-        except Exception:
-            # Never reject an otherwise valid sync batch because the defensive
-            # invariant check failed. The durable payment/header evidence stays
-            # available for the next delivery or management-command repair.
-            logger.warning('post-receive money reconciliation failed', exc_info=True)
+                if last_finished is None:
+                    raise ValueError('missing reconciliation timestamp')
+                if timezone.is_naive(last_finished):
+                    last_finished = timezone.make_aware(last_finished)
+            except (TypeError, ValueError):
+                last_finished = None
+            if (
+                last_finished is not None
+                and last_finished > now - timedelta(seconds=interval)
+            ):
+                return []
+            order_ids = list(
+                OrderPayment.objects.filter(
+                    is_deleted=False,
+                    order__is_paid=False,
+                    order__is_deleted=False,
+                ).values_list('order_id', flat=True).distinct()[:limit]
+            )
+            remaining = limit - len(order_ids)
+            if remaining:
+                order_ids.extend(
+                    ExternalOrderPayment.objects.filter(
+                        is_deleted=False,
+                        order__is_paid=False,
+                        order__is_deleted=False,
+                    ).exclude(
+                        order_id__in=order_ids,
+                    ).values_list(
+                        'order_id', flat=True,
+                    ).distinct()[:remaining]
+                )
+            repaired = reconcile_stale_paid_headers(order_ids)
+            marker.value = json.dumps({
+                'last_finished_at': now.isoformat(),
+                'candidate_count': len(order_ids),
+                'repaired_count': len(repaired),
+            })
+            marker.save(update_fields=['value', 'updated_at'])
+        if repaired:
+            logger.warning(
+                'periodic sync repair restored %d paid header(s)',
+                len(repaired),
+            )
+        return repaired
 
     @staticmethod
     def _notify_received_orders(order_ids):
@@ -390,7 +1281,107 @@ class CloudReceiver:
             logger.warning('post-receive order notify failed', exc_info=True)
 
     @classmethod
-    def _create_or_update(cls, model_class, data, branch_id):
+    def _receive_global_user_identity(
+        cls, model_class, data, uuid_val, incoming_branch,
+        *, client_ack_protocol=2,
+    ):
+        """Resolve the branch's staff UUID without accepting privilege rewrites.
+
+        Orders depend on User UUIDs.  Treating every global User push as a
+        generic catalog write stranded the whole order cluster whenever a till
+        had been bootstrapped before the cloud user arrived.  Existing users
+        remain completely cloud-owned.  A matching email returns the canonical
+        UUID so the branch can re-key its local identity.  If neither identity
+        exists, create a tightly bounded, non-admin bootstrap identity once.
+        """
+        from django.contrib.auth.hashers import make_password
+        from django.core.validators import validate_email
+
+        existing = model_class._base_manager.filter(uuid=uuid_val).first()
+        if existing is not None:
+            incoming_email = str(data.get('email') or '').strip().lower()
+            if (
+                existing.is_deleted
+                or not incoming_email
+                or incoming_email != str(existing.email or '').strip().lower()
+            ):
+                return _rejected(
+                    existing,
+                    'GLOBAL_USER_IDENTITY_MISMATCH',
+                    'The UUID does not match the canonical cloud user email',
+                )
+            existing._sync_record_result = {
+                'canonical_uuid': str(existing.uuid),
+                'reason_code': 'GLOBAL_USER_UUID_AVAILABLE',
+            }
+            return _acknowledged(
+                existing,
+                'GLOBAL_USER_UUID_AVAILABLE',
+                'The canonical cloud identity already exists',
+            )
+
+        email = str(data.get('email') or '').strip().lower()
+        try:
+            validate_email(email)
+        except Exception as exc:
+            return _rejected(
+                None,
+                'INVALID_USER_IDENTITY',
+                f'A valid email is required to resolve the user identity: {exc}',
+            )
+
+        with transaction.atomic():
+            canonical = (
+                model_class._base_manager.select_for_update()
+                .filter(email__iexact=email, is_deleted=False)
+                .first()
+            )
+            if canonical is not None:
+                _store_global_user_alias(
+                    incoming_branch, uuid_val, canonical.uuid,
+                )
+                evidence = {
+                    'reason_code': 'GLOBAL_USER_CANONICAL_ALIAS',
+                }
+                if int(client_ack_protocol or 1) >= 2:
+                    evidence['canonical_uuid'] = str(canonical.uuid)
+                canonical._sync_record_result = evidence
+                return _acknowledged(
+                    canonical,
+                    'GLOBAL_USER_CANONICAL_ALIAS',
+                    'The email is already owned by a canonical cloud identity',
+                )
+
+            canonical = model_class(
+                uuid=uuid_val,
+                first_name=str(data.get('first_name') or 'Branch')[:25],
+                last_name=str(data.get('last_name') or 'Operator')[:25],
+                email=email,
+                # This row is an FK-only bridge. Cloud management must
+                # explicitly activate/provision credentials before login.
+                password=make_password(None),
+                role=model_class.RoleChoices.USER,
+                status=model_class.UserStatus.SUSPENDED,
+                permissions=[],
+                branch_id='cloud',
+                sync_version=max(1, int(data.get('sync_version') or 1)),
+                is_deleted=False,
+                synced_at=None,
+            )
+            canonical.save(_syncing=True)
+            canonical._publish_synced_at_after_commit(
+                using=canonical._state.db,
+            )
+            canonical._sync_record_result = {
+                'canonical_uuid': str(canonical.uuid),
+                'reason_code': 'GLOBAL_USER_SAFE_PROVISIONED',
+            }
+            return SyncApplyResult(canonical, 'created')
+
+    @classmethod
+    def _create_or_update(
+        cls, model_class, data, branch_id, *, client_ack_protocol=2,
+    ):
         data = data.copy()
 
         uuid_val = data.pop('uuid', None)
@@ -406,12 +1397,24 @@ class CloudReceiver:
         # resolving any relationships. The push is acknowledged as skipped so a
         # compromised/outdated till cannot poison its queue forever.
         if getattr(model_class, 'SYNC_PULL_SCOPE', 'branch') == 'global':
+            if model_class._meta.label_lower == 'base.user':
+                return cls._receive_global_user_identity(
+                    model_class,
+                    data,
+                    uuid_val,
+                    branch_id,
+                    client_ack_protocol=client_ack_protocol,
+                )
             existing = model_class._base_manager.filter(uuid=uuid_val).first()
             logger.warning(
                 'sync receive: refused branch=%s write to cloud-owned %s uuid=%s',
                 branch_id, model_class.__name__, uuid_val,
             )
-            return existing, 'skipped'
+            return _rejected(
+                existing,
+                'GLOBAL_MODEL_WRITE_REFUSED',
+                'Branch writes to cloud-owned global models are not allowed',
+            )
 
         sync_version = data.pop('sync_version', 1)
         is_deleted = data.pop('is_deleted', False)
@@ -452,11 +1455,19 @@ class CloudReceiver:
                     incoming_branch, model_class.__name__, uuid_val,
                     existing.branch_id,
                 )
-                return existing, 'skipped'
+                return _rejected(
+                    existing,
+                    'CROSS_BRANCH_OWNER',
+                    'The UUID is owned by a different branch',
+                )
 
         # Append-only evidence may be created once, never deleted by a peer.
         if is_deleted and getattr(model_class, '_sync_append_only', False):
-            return None, 'skipped'
+            return _rejected(
+                None,
+                'APPEND_ONLY_DELETE',
+                'Append-only sync evidence cannot be deleted by a peer',
+            )
 
         resolved_fks, missing_fks, forbidden_fks = _resolve_foreign_keys(
             model_class, data, incoming_branch,
@@ -469,7 +1480,11 @@ class CloudReceiver:
                 model_class.__name__, uuid_val, incoming_branch,
                 forbidden_fks,
             )
-            return None, 'skipped'
+            return _rejected(
+                None,
+                'CROSS_BRANCH_PARENT',
+                'The record references a parent owned by another branch',
+            )
 
         # Any non-empty parent UUID that has not arrived yet must defer, even
         # when the FK column is nullable. Persisting NULL would advance the
@@ -499,18 +1514,37 @@ class CloudReceiver:
                     'sync receive: skipping unseen tombstone for %s; FK '
                     '%s=%s absent', model_class.__name__, fk_field_name, uuid_value,
                 )
-                return None, 'skipped'
+                return _acknowledged(
+                    None,
+                    'UNSEEN_TOMBSTONE',
+                    'The deleted record has never existed on this receiver',
+                )
             relation_kind = 'nullable' if fk_field.null else 'required'
-            raise ValueError(
+            raise RetryableSyncError(
                 f'Unresolved {relation_kind} FK on {model_class.__name__}: '
                 f'{fk_field_name}={uuid_value}. Parent record has not '
-                'synced yet — retry after the parent batch lands.'
+                'synced yet — retry after the parent batch lands.',
+                reason_code='MISSING_DEPENDENCY',
             )
 
         for uuid_field in FK_UUID_MAPPINGS:
             data.pop(uuid_field, None)
 
         cleaned = _prepare_fields(model_class, data)
+        close_manifest = cls._validate_shift_close_intent(
+            model_class=model_class,
+            uuid_val=uuid_val,
+            cleaned=cleaned,
+            incoming_branch=incoming_branch,
+        )
+        financial_owner_plan = _financial_owner_plan(
+            model_class,
+            uuid_val,
+            cleaned,
+            resolved_fks,
+            incoming_branch,
+            is_deleted,
+        )
 
         # Per-record atomic + row lock. Without this the get → _should_replace →
         # save sequence is a read-modify-write with no isolation: two concurrent
@@ -520,8 +1554,19 @@ class CloudReceiver:
         # exceptions, so each record owns its own transaction; a rollback here
         # leaves the row untouched and the UUID is re-queued via failed_uuids.
         with transaction.atomic():
+            financial_owner_guard = _lock_financial_owners(
+                financial_owner_plan,
+                resolved_fks,
+            )
             try:
                 instance = model_class.objects.select_for_update().get(uuid=uuid_val)
+                force_shift_close = False
+                prior_sync_version = instance.sync_version
+                _verify_locked_financial_target(
+                    financial_owner_plan,
+                    financial_owner_guard,
+                    instance,
+                )
 
                 if (
                     getattr(model_class, 'SYNC_PULL_SCOPE', 'branch') == 'branch'
@@ -533,7 +1578,108 @@ class CloudReceiver:
                         incoming_branch, model_class.__name__, uuid_val,
                         instance.branch_id,
                     )
-                    return instance, 'skipped'
+                    return _rejected(
+                        instance,
+                        'CROSS_BRANCH_OWNER',
+                        'The UUID is owned by a different branch',
+                    )
+
+                settled_admission = _settled_shift_admission(
+                    financial_owner_guard,
+                    model_class,
+                    instance,
+                    cleaned,
+                    resolved_fks,
+                    is_deleted=is_deleted,
+                )
+                if settled_admission is not None:
+                    return settled_admission
+
+                if close_manifest:
+                    def close_conflict(code, reason):
+                        raise CriticalSyncConflict(cls._shift_close_result(
+                            uuid_val=uuid_val,
+                            state='CONFLICT',
+                            instance=instance,
+                            manifest=close_manifest,
+                            reason_code=code,
+                            reason=reason,
+                        ))
+
+                    incoming_user = resolved_fks.get('user')
+                    if (
+                        incoming_user is not None
+                        and incoming_user.pk != instance.user_id
+                    ):
+                        close_conflict(
+                            'CLOSE_OWNER_MISMATCH',
+                            'The close owner differs from the cloud shift owner',
+                        )
+                    incoming_start = cleaned.get('start_time')
+                    if (
+                        incoming_start is not None
+                        and incoming_start != instance.start_time
+                    ):
+                        close_conflict(
+                            'CLOSE_WINDOW_MISMATCH',
+                            'The close start_time differs from the cloud shift window',
+                        )
+                    if cleaned['end_time'] <= instance.start_time:
+                        close_conflict(
+                            'INVALID_CLOSE_WINDOW',
+                            'The close end_time must be later than start_time',
+                        )
+
+                    stored_closed = instance.status in {
+                        'ENDED', 'COMPLETED',
+                    }
+                    same_header = (
+                        instance.end_time == cleaned['end_time']
+                        and instance.total_orders == cleaned['total_orders']
+                        and instance.total_revenue == cleaned['total_revenue']
+                        and instance.cash_collected == cleaned['cash_collected']
+                    )
+                    stored_manifest = instance.settlement_manifest or {}
+                    if stored_closed:
+                        if not same_header:
+                            close_conflict(
+                                'CLOSE_TOTALS_MISMATCH',
+                                'The replayed close differs from frozen cloud totals',
+                            )
+                        if stored_manifest == close_manifest:
+                            instance._sync_record_result = cls._shift_close_result(
+                                uuid_val=uuid_val,
+                                state='STORED',
+                                instance=instance,
+                                manifest=stored_manifest,
+                            )
+                            return _acknowledged(
+                                instance,
+                                'IDEMPOTENT_SHIFT_CLOSE_REPLAY',
+                                'The immutable close manifest matches exactly',
+                            )
+                        if stored_manifest or instance.status == 'COMPLETED':
+                            close_conflict(
+                                'CLOSE_MANIFEST_MISMATCH',
+                                'The replayed close differs from the immutable cloud manifest',
+                            )
+                        # Repair a previously stored ENDED legacy header by
+                        # attaching the first immutable manifest. Header values
+                        # were proven identical above.
+                        force_shift_close = True
+                    elif (
+                        instance.status == 'ACTIVE'
+                        and instance.end_time is None
+                    ):
+                        # A close is irreversible branch-owned evidence. Apply a
+                        # valid manifest even when an unrelated cloud-side save
+                        # advanced sync_version and ordinary LWW would skip it.
+                        force_shift_close = True
+                    else:
+                        close_conflict(
+                            'INVALID_CLOUD_SHIFT_STATE',
+                            f'The cloud shift cannot close from {instance.status}',
+                        )
 
                 trusted_append_fields = frozenset()
                 if getattr(model_class, '_sync_append_only', False):
@@ -542,8 +1688,21 @@ class CloudReceiver:
                     )
                     if not trusted_append_fields:
                         # UUID is the immutable event identity. A replay is an
-                        # idempotent no-op; a higher version cannot rewrite history.
-                        return instance, 'skipped'
+                        # idempotent no-op only when every evidence field still
+                        # matches; a higher version cannot rewrite history.
+                        if _append_only_replay_matches(
+                            model_class, instance, cleaned, resolved_fks,
+                        ):
+                            return _acknowledged(
+                                instance,
+                                'IDEMPOTENT_APPEND_ONLY_REPLAY',
+                                'Append-only evidence matches exactly',
+                            )
+                        return _rejected(
+                            instance,
+                            'APPEND_ONLY_REWRITE',
+                            'The UUID already stores different append-only evidence',
+                        )
                     # A branch pulling a cloud manager result may update only
                     # the explicitly declared acknowledgement field(s). The
                     # locally frozen financial evidence remains append-only.
@@ -558,18 +1717,54 @@ class CloudReceiver:
                 # sync_version. Without this, two branches that landed at the
                 # same version silently let whichever batch arrived second win.
                 if hasattr(model_class, '_should_replace'):
-                    if not model_class._should_replace(
+                    if not force_shift_close and not model_class._should_replace(
                         instance, sync_version, cleaned, incoming_branch,
                     ):
-                        return instance, 'skipped'
-                elif sync_version < instance.sync_version:
-                    return instance, 'skipped'
+                        if _record_replay_matches(
+                            model_class,
+                            instance,
+                            cleaned,
+                            resolved_fks,
+                            is_deleted=is_deleted,
+                        ):
+                            return _acknowledged(
+                                instance,
+                                'IDEMPOTENT_RECORD_REPLAY',
+                                'The receiver already stores the same values',
+                            )
+                        return _rejected(
+                            instance,
+                            'STALE_VERSION',
+                            'The incoming record lost version conflict resolution',
+                        )
+                elif not force_shift_close and sync_version < instance.sync_version:
+                    if _record_replay_matches(
+                        model_class,
+                        instance,
+                        cleaned,
+                        resolved_fks,
+                        is_deleted=is_deleted,
+                    ):
+                        return _acknowledged(
+                            instance,
+                            'IDEMPOTENT_RECORD_REPLAY',
+                            'The receiver already stores the same values',
+                        )
+                    return _rejected(
+                        instance,
+                        'STALE_VERSION',
+                        'The incoming record has an older sync version',
+                    )
 
                 # A locally-tombstoned row is terminal: never let a stale
                 # incoming record that won the version/tiebreaker resurrect it
                 # by clearing is_deleted (FS7). Deletes only propagate forward.
                 if instance.is_deleted and not is_deleted:
-                    return instance, 'skipped'
+                    return _rejected(
+                        instance,
+                        'TOMBSTONE_RESURRECTION',
+                        'A tombstoned record cannot be resurrected by sync',
+                    )
 
                 # Capture every automatic source timestamp before save() stamps
                 # the receiver clock; restore them with QuerySet.update below.
@@ -586,15 +1781,22 @@ class CloudReceiver:
 
                 denied = model_class._effective_denylist() \
                     if hasattr(model_class, '_effective_denylist') else frozenset()
-                branch_frozen = _branch_frozen_after_manifest_fields(
+                branch_frozen = _branch_frozen_update_fields(
                     model_class, instance,
                 )
                 for fk_field, fk_instance in resolved_fks.items():
                     if fk_field not in denied and fk_field not in branch_frozen:
                         setattr(instance, fk_field, fk_instance)
 
-                instance.sync_version = sync_version
-                if not _del_denied:           # SYNC_DENY_FROM_BRANCH guard (e.g. User.is_deleted)
+                instance.sync_version = (
+                    max(prior_sync_version, sync_version) + 1
+                    if force_shift_close and sync_version <= prior_sync_version
+                    else sync_version
+                )
+                if (
+                    not _del_denied
+                    and 'is_deleted' not in branch_frozen
+                ):  # class denylist + settled-row guard
                     instance.is_deleted = is_deleted
                 # Keep this version outside the timestamp feed until its
                 # per-record transaction commits.  A NULL row is still served
@@ -613,9 +1815,27 @@ class CloudReceiver:
                     model_class, instance, automatic_values, creating=False,
                 )
                 instance._publish_synced_at_after_commit(using=instance._state.db)
+                if close_manifest:
+                    instance._sync_record_result = cls._shift_close_result(
+                        uuid_val=uuid_val,
+                        state='STORED',
+                        instance=instance,
+                        manifest=instance.settlement_manifest,
+                    )
                 return instance, 'updated'
 
             except model_class.DoesNotExist:
+                settled_admission = _settled_shift_admission(
+                    financial_owner_guard,
+                    model_class,
+                    None,
+                    cleaned,
+                    resolved_fks,
+                    is_deleted=is_deleted,
+                )
+                if settled_admission is not None:
+                    return settled_admission
+
                 automatic_values = _pop_automatic_values(model_class, cleaned)
 
                 # Reconcile onto an existing row that already owns this model's
@@ -634,9 +1854,14 @@ class CloudReceiver:
                     instance = model_class.objects.select_for_update().get(pk=natural.pk)
                     if getattr(model_class, '_sync_append_only', False):
                         # The natural key identifies the same immutable event
-                        # under a different UUID. Treat it as an idempotent
-                        # replay; never adopt the UUID or overwrite evidence.
-                        return instance, 'skipped'
+                        # under a different UUID. ACKing it would strand future
+                        # child references to the sender's UUID, so surface the
+                        # identity conflict and keep the outbound evidence.
+                        return _rejected(
+                            instance,
+                            'APPEND_ONLY_IDENTITY_CONFLICT',
+                            'The natural key exists under a different UUID',
+                        )
                     instance.uuid = uuid_val
                     # Reconcile = UPDATE of an existing row: protect denied fields.
                     update_values = _strip_denied(
@@ -649,14 +1874,17 @@ class CloudReceiver:
                         setattr(instance, key, value)
                     denied = model_class._effective_denylist() \
                         if hasattr(model_class, '_effective_denylist') else frozenset()
-                    branch_frozen = _branch_frozen_after_manifest_fields(
+                    branch_frozen = _branch_frozen_update_fields(
                         model_class, instance,
                     )
                     for fk_field, fk_instance in resolved_fks.items():
                         if fk_field not in denied and fk_field not in branch_frozen:
                             setattr(instance, fk_field, fk_instance)
                     instance.sync_version = sync_version
-                    if not _del_denied:       # SYNC_DENY_FROM_BRANCH guard (e.g. User.is_deleted)
+                    if (
+                        not _del_denied
+                        and 'is_deleted' not in branch_frozen
+                    ):  # class denylist + settled-row guard
                         instance.is_deleted = is_deleted
                     instance.synced_at = None
                     # Reconcile = update of an existing row: preserve its owner
@@ -686,7 +1914,11 @@ class CloudReceiver:
                         'sync receive: refused uncommitted %s create uuid=%s',
                         model_class.__name__, uuid_val,
                     )
-                    return None, 'skipped'
+                    return _rejected(
+                        None,
+                        'CREATE_POLICY_REFUSED',
+                        'The record is not eligible for branch-side creation',
+                    )
 
                 instance = model_class(
                     uuid=uuid_val,
@@ -710,4 +1942,11 @@ class CloudReceiver:
                     model_class, instance, automatic_values, creating=True,
                 )
                 instance._publish_synced_at_after_commit(using=instance._state.db)
+                if close_manifest:
+                    instance._sync_record_result = cls._shift_close_result(
+                        uuid_val=uuid_val,
+                        state='STORED',
+                        instance=instance,
+                        manifest=instance.settlement_manifest,
+                    )
                 return instance, 'created'

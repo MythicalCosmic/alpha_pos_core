@@ -1,4 +1,3 @@
-from django.core.paginator import Paginator
 from base.repositories.base import BaseSyncRepository
 from base.models import ShiftTemplate, Shift, CashReconciliation
 
@@ -9,11 +8,6 @@ class ShiftTemplateRepository(BaseSyncRepository):
     @classmethod
     def get_active(cls):
         return cls.model.objects.filter(is_deleted=False, is_active=True)
-
-    @classmethod
-    def paginate(cls, queryset, page=1, per_page=20):
-        paginator = Paginator(queryset, per_page)
-        return paginator.get_page(page), paginator
 
 
 class ShiftRepository(BaseSyncRepository):
@@ -53,11 +47,6 @@ class ShiftRepository(BaseSyncRepository):
         if end:
             qs = qs.filter(start_time__lte=end)
         return qs
-
-    @classmethod
-    def paginate(cls, queryset, page=1, per_page=20):
-        paginator = Paginator(queryset, per_page)
-        return paginator.get_page(page), paginator
 
 
 class CashReconciliationRepository(BaseSyncRepository):

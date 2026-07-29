@@ -8,36 +8,34 @@ version = "0.1.0"
 description = "Shared spine for Alpha POS: core models, auth, the sync engine, and the business apps used by BOTH the server and local (desktop) editions."
 requires-python = ">=3.11"
 
-# Runtime deps the shared apps need. Editions add their own on top:
-#   server: gunicorn, channels-redis, uvicorn[standard]
-#   local:  uvicorn, embedded-Postgres tooling, PyInstaller (build-time)
 dependencies = [
     "Django==6.0.3",
     "asgiref==3.11.1",
     "sqlparse==0.5.5",
     "tzdata==2025.2",
-    "channels>=4.1",            # NEW: websockets (replaces polling)
+    "channels>=4.1",
     "redis==7.3.0",
     "django-redis==6.0.0",
     "requests==2.32.5",
-    "cryptography>=48,<50",     # licensing crypto + heartbeat HMAC (loosened for daphne/twisted)
-    "psycopg[binary]>=3.2",     # Postgres driver v3 (Django 6 preferred; has 3.13/3.14 wheels)
+    "cryptography>=48,<50",
+    "psycopg[binary]>=3.2",
     "django-cors-headers==4.9.0",
     "whitenoise==6.8.2",
-    "anthropic==0.74.0",        # base/services/llm.py (stock assistant / forecaster)
+    "anthropic==0.74.0",
     "google-genai==2.7.0",
-    "openai==2.43.0",           # base/services/llm.py — OpenAI provider (gpt-5.4-mini)
+    "openai==2.43.0",
 ]
 
 [tool.setuptools.packages.find]
-# Each Django app is a top-level package so `from base.models import …` keeps working
-# unchanged in both editions once core is installed (editable) / on sys.path.
 include = [
     "base*", "stock*", "hr*", "discounts*", "cashbox*", "fiscalization*",
     "licensing*", "notifications*", "core*", "alpha_pos_core*",
 ]
 
 [tool.setuptools.package-data]
-# Ship templates / static / fixtures with the packages (recursive — covers nested
-# dirs like stock/templates/admin/stock/*.html and base/management/commands/*.json).
 "*" = ["**/*.html", "**/*.json", "**/*.txt", "**/*.css", "**/*.js", "**/*.png", "**/*.ico", "**/*.svg"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+"alpha_pos_core/asgi.py" = ["E402"]
+"stock/views/__init__.py" = ["F403"]

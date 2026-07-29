@@ -1,4 +1,3 @@
-
 PERMISSIONS = [
     ('order.create',     'Create orders',          'Orders'),
     ('order.update',     'Edit orders',            'Orders'),
@@ -21,7 +20,7 @@ PERMISSIONS = [
     ('hr.manage',        'Manage HR',              'HR'),
 
     ('reports.view',     'View reports',           'Reports'),
-    ('inkassa.manage',   'Manage cash register',   'Reports'),
+    ('inkassa.manage',   'Manage branch cash collection',   'Reports'),
 
     ('users.manage',     'Manage users',           'Administration'),
     ('settings.manage',  'Manage settings',        'Administration'),
@@ -29,8 +28,6 @@ PERMISSIONS = [
 
 VALID_KEYS = {p[0] for p in PERMISSIONS}
 
-# Default permission set per role. ADMIN uses the '*' wildcard (bypasses every
-# check). Roles are the User.RoleChoices values.
 DEFAULT_ROLE_PERMISSIONS = {
     'ADMIN': ['*'],
     'MANAGER': [

@@ -19,16 +19,24 @@ except ImportError:
 DEFAULT_CLAUDE_MODEL = 'claude-sonnet-4-6'
 DEFAULT_GEMINI_MODEL = 'gemini-2.5-flash'
 DEFAULT_OPENAI_MODEL = 'gpt-5.6-luna'
+# GPT-5 reasoning and output share this completion budget.
 OPENAI_MIN_COMPLETION_TOKENS = 8192
+
 GEMINI_FALLBACK_MODELS = ('gemini-2.0-flash',)
+
 _TRANSIENT_MARKERS = (
     '503', '529', 'unavailable', 'overloaded', 'high demand',
     '429', 'resource_exhausted', 'rate limit', 'try again',
+    'timeout', 'timed out', 'connection error', 'connection reset',
+    'connection aborted', 'server disconnected', 'temporarily unavailable',
 )
+
 _HARD_MARKERS = (
     'insufficient_quota', 'exceeded your current quota', 'billing',
+    'credit balance', 'purchase credits',
     'invalid api key', 'incorrect api key', 'invalid_api_key',
 )
+
 _PROVIDER_RATE_LIMIT_MARKERS = (
     '429', '529', 'rate_limit', 'rate limit', 'too many requests',
     'resource_exhausted', 'overloaded', 'high demand',
@@ -39,7 +47,26 @@ _PROVIDER_CONFIGURATION_MARKERS = _HARD_MARKERS + (
     'permission_denied', 'permission denied', '401', '403',
 )
 
-SAFE_TOOL_ERROR_MESSAGE = 'The requested data tool failed. Continue without this result.'
+_PROVIDER_FUNCTIONS = {
+    'claude': '_call_claude',
+    'gemini': '_call_gemini',
+    'openai': '_call_openai',
+}
+
+
+class LLMRequestFailure(str):
+    """String-compatible provider failure with safe structured diagnostics.
+
+    Existing callers and tests compare errors as strings, so this deliberately
+    subclasses ``str``.  The additional ``failures`` metadata contains only
+    provider/model/category/attempt counts; raw SDK messages remain in logs.
+    """
+
+    def __new__(cls, message, failures=None, stage='provider'):
+        obj = super().__new__(cls, str(message or 'llm_request_failed'))
+        obj.failures = list(failures or [])
+        obj.stage = stage
+        return obj
 
 
 def _is_transient(err) -> bool:
@@ -49,23 +76,147 @@ def _is_transient(err) -> bool:
     return any(m in e for m in _TRANSIENT_MARKERS)
 
 
+def error_category(err) -> str:
+    """Classify a provider/tool failure without exposing its raw message."""
+    value = str(err or '').lower()
+    if value in {'llm_key_missing', 'llm_sdk_missing'}:
+        return 'configuration'
+    if value == 'llm_provider_invalid':
+        return 'configuration'
+    if value.startswith('tool_') or value in {
+        'invalid_tool_arguments',
+        'data_tool_failed',
+        'data_scope_required',
+    }:
+        return 'data_grounding'
+    if value == 'openai_empty_response' or 'empty_response' in value:
+        return 'empty_response'
+    if any(marker in value for marker in _PROVIDER_CONFIGURATION_MARKERS):
+        return 'configuration'
+    if 'timeout' in value or 'timed out' in value:
+        return 'timeout'
+    if any(marker in value for marker in (
+        'connection error', 'connection reset', 'connection aborted',
+        'server disconnected', 'api connection',
+    )):
+        return 'connection'
+    if is_provider_rate_limited(value):
+        return 'rate_limit'
+    if _is_transient(value):
+        return 'temporary_provider_failure'
+    if any(marker in value for marker in (
+        'bad request', 'invalid request', 'model_not_found',
+        'model not found', 'unsupported model',
+    )):
+        return 'bad_request'
+    return 'provider_error'
+
+
 def is_provider_rate_limited(err) -> bool:
+    """Return whether *err* is a provider-side rate/capacity limit.
+
+    Billing, quota-credit and invalid-key failures sometimes include HTTP 429,
+    but are configuration problems rather than a temporary rate limit, so hard
+    markers take precedence. Raw provider errors stay server-side.
+    """
     error = (err or '').lower()
     if any(marker in error for marker in _HARD_MARKERS):
         return False
     return any(marker in error for marker in _PROVIDER_RATE_LIMIT_MARKERS)
 
 
-def is_provider_configuration_error(err) -> bool:
-    error = (err or '').lower()
-    return any(marker in error for marker in _PROVIDER_CONFIGURATION_MARKERS)
-
-
 def _timeout_seconds():
+    """Backward-compatible read timeout value used by provider SDKs."""
     try:
-        return float(getattr(settings, 'LLM_TIMEOUT_SECONDS', 30) or 30)
+        return max(
+            1.0,
+            float(getattr(settings, 'LLM_READ_TIMEOUT_SECONDS', 45) or 45),
+        )
     except (TypeError, ValueError):
-        return 30.0
+        return 45.0
+
+
+def _connect_timeout_seconds():
+    try:
+        return max(
+            1.0,
+            float(getattr(settings, 'LLM_CONNECT_TIMEOUT_SECONDS', 10) or 10),
+        )
+    except (TypeError, ValueError):
+        return 10.0
+
+
+def _sdk_timeout():
+    """Use distinct connect/read ceilings when httpx is available."""
+    try:
+        import httpx
+        return httpx.Timeout(
+            connect=_connect_timeout_seconds(),
+            read=_timeout_seconds(),
+            write=_timeout_seconds(),
+            pool=_connect_timeout_seconds(),
+        )
+    except (ImportError, TypeError, ValueError):
+        return _timeout_seconds()
+
+
+def _remaining_sdk_timeout(deadline):
+    """Cap one provider operation to the request's remaining wall-clock budget."""
+    if deadline is None:
+        return _sdk_timeout()
+    remaining = max(1.0, deadline - time.monotonic())
+    try:
+        import httpx
+        return httpx.Timeout(
+            connect=min(_connect_timeout_seconds(), remaining),
+            read=min(_timeout_seconds(), remaining),
+            write=min(_timeout_seconds(), remaining),
+            pool=min(_connect_timeout_seconds(), remaining),
+        )
+    except (ImportError, TypeError, ValueError):
+        return min(_timeout_seconds(), remaining)
+
+
+def _request_deadline_seconds():
+    try:
+        return max(
+            _timeout_seconds(),
+            float(getattr(settings, 'AI_REQUEST_DEADLINE_SECONDS', 110) or 110),
+        )
+    except (TypeError, ValueError):
+        return 110.0
+
+
+def _provider_model(provider):
+    setting_name = {
+        'claude': 'ANTHROPIC_MODEL',
+        'gemini': 'GEMINI_MODEL',
+        'openai': 'OPENAI_MODEL',
+    }.get(provider)
+    return str(getattr(settings, setting_name, '') or '') if setting_name else ''
+
+
+def _provider_has_key(provider):
+    setting_name = {
+        'claude': 'ANTHROPIC_API_KEY',
+        'gemini': 'GEMINI_API_KEY',
+        'openai': 'OPENAI_API_KEY',
+    }.get(provider)
+    return bool(setting_name and (getattr(settings, setting_name, '') or ''))
+
+
+def _provider_order(providers=None):
+    if providers is not None:
+        values = providers
+    else:
+        raw = getattr(settings, 'AI_FALLBACK_PROVIDERS', '') or ''
+        values = [get_provider(), *str(raw).split(',')]
+    order = []
+    for value in values:
+        provider = str(value or '').strip().lower()
+        if provider in _PROVIDER_FUNCTIONS and provider not in order:
+            order.append(provider)
+    return order
 
 
 def get_provider():
@@ -81,19 +232,107 @@ def key_missing():
     return not (getattr(settings, 'ANTHROPIC_API_KEY', '') or '')
 
 
-def call_ai(prompt, system=None, max_tokens=2048, retries=2, history=None):
-    fn = {'gemini': _call_gemini, 'openai': _call_openai}.get(get_provider(), _call_claude)
-    delay = 1.0
-    text, err = fn(prompt, system, max_tokens, history)
-    for attempt in range(retries):
-        if err is None or not _is_transient(err):
-            break
-        logger.warning('LLM transient overload (retry %d/%d): %s',
-                       attempt + 1, retries, str(err)[:120])
-        time.sleep(delay)
-        delay = min(delay * 2, 8)
-        text, err = fn(prompt, system, max_tokens, history)
-    return text, err
+def call_ai(
+    prompt,
+    system=None,
+    max_tokens=2048,
+    retries=2,
+    history=None,
+    *,
+    providers=None,
+    deadline=None,
+):
+    """Call the active provider with bounded retry and configured failover.
+
+    Timeouts and connection failures used to fail immediately because their SDK
+    strings were not considered transient.  They now receive one retry, while
+    fast capacity responses (429/503/529) retain the normal retry budget.  If the
+    active provider still cannot answer, another configured provider is tried
+    before the request is declared failed.
+    """
+    deadline = deadline or (time.monotonic() + _request_deadline_seconds())
+    failures = []
+    last_error = 'llm_request_failed'
+    attempted_provider = False
+
+    primary = get_provider()
+    provider_order = _provider_order(providers)
+    if not provider_order:
+        failure = {
+            'provider': primary,
+            'model': '',
+            'category': 'configuration',
+            'attempts': 0,
+        }
+        return None, LLMRequestFailure(
+            'llm_provider_invalid',
+            failures=[failure],
+        )
+
+    for provider in provider_order:
+        # Always invoke the selected provider so its established missing-key/SDK
+        # contract and test doubles remain intact. Backups with no key are skipped.
+        if provider != primary and not _provider_has_key(provider):
+            continue
+        attempted_provider = True
+        fn = globals()[_PROVIDER_FUNCTIONS[provider]]
+        delay = 1.0
+        provider_attempts = 0
+        provider_error = None
+
+        for attempt in range(max(0, int(retries)) + 1):
+            if time.monotonic() >= deadline:
+                provider_error = 'provider_timeout: request deadline exceeded'
+                break
+            provider_attempts += 1
+            text, provider_error = fn(prompt, system, max_tokens, history)
+            if provider_error is None and (text or '').strip():
+                if provider != primary:
+                    logger.warning(
+                        'LLM recovered through fallback provider=%s primary=%s',
+                        provider,
+                        primary,
+                    )
+                return text, None
+            if provider_error is None:
+                provider_error = f'{provider}_empty_response'
+
+            category = error_category(provider_error)
+            retryable = _is_transient(provider_error)
+            # Network timeouts are expensive; one retry is enough before moving
+            # to a healthy backup. Fast 429/503/529 responses may use all retries.
+            timeout_budget_spent = (
+                category in {'timeout', 'connection'} and attempt >= 1
+            )
+            if (
+                attempt >= max(0, int(retries))
+                or not retryable
+                or timeout_budget_spent
+            ):
+                break
+            if time.monotonic() + delay >= deadline:
+                break
+            logger.warning(
+                'LLM retry provider=%s attempt=%d/%d category=%s',
+                provider,
+                attempt + 1,
+                retries,
+                category,
+            )
+            time.sleep(delay)
+            delay = min(delay * 2, 8)
+
+        last_error = provider_error or last_error
+        failures.append({
+            'provider': provider,
+            'model': _provider_model(provider),
+            'category': error_category(last_error),
+            'attempts': provider_attempts,
+        })
+
+    if not attempted_provider:
+        return None, last_error
+    return None, LLMRequestFailure(last_error, failures=failures)
 
 
 def _history_messages(history):
@@ -109,6 +348,26 @@ def _history_messages(history):
     return out
 
 
+def _tool_result_failed(value):
+    """True when a tool returned a structured error instead of usable evidence."""
+    if isinstance(value, dict):
+        return bool(value.get('error'))
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(parsed, dict) and bool(parsed.get('error'))
+
+
+def _tool_result_content(value):
+    """Serialize non-string tool results as valid JSON for provider correction."""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, default=str, ensure_ascii=False)
+
+
 def can_use_tools() -> bool:
     provider = get_provider()
     if provider == 'openai':
@@ -118,15 +377,37 @@ def can_use_tools() -> bool:
     return False
 
 
-def call_ai_tools(prompt, system=None, tools=None, tool_executor=None,
-                  max_tokens=4096, max_iterations=10, retries=2, history=None):
+def call_ai_tools(
+    prompt,
+    system=None,
+    tools=None,
+    tool_executor=None,
+    max_tokens=4096,
+    max_iterations=None,
+    retries=2,
+    history=None,
+    *,
+    deadline=None,
+    require_tool=True,
+):
+    deadline = deadline or (time.monotonic() + _request_deadline_seconds())
+    if max_iterations is None:
+        try:
+            max_iterations = int(
+                getattr(settings, 'AI_MAX_TOOL_ITERATIONS', 8) or 8
+            )
+        except (TypeError, ValueError):
+            max_iterations = 8
+    max_iterations = max(1, min(int(max_iterations), 10))
+
     if (not can_use_tools() or not tools or tool_executor is None):
         return call_ai(prompt, system=system, max_tokens=max_tokens,
-                       retries=retries, history=history)
+                       retries=retries, history=history, deadline=deadline)
 
     if get_provider() == 'openai':
         return _openai_tool_loop(prompt, system, tools, tool_executor,
-                                 max_tokens, max_iterations, retries, history)
+                                 max_tokens, max_iterations, retries, history,
+                                 deadline=deadline, require_tool=require_tool)
 
     api_key = getattr(settings, 'ANTHROPIC_API_KEY', '') or ''
     if not api_key:
@@ -135,7 +416,7 @@ def call_ai_tools(prompt, system=None, tools=None, tool_executor=None,
 
     try:
         client = anthropic.Anthropic(
-            api_key=api_key, timeout=_timeout_seconds(), max_retries=0,
+            api_key=api_key, timeout=_sdk_timeout(), max_retries=0,
         )
     except Exception as e:  # noqa: BLE001
         logger.exception('claude client init failed')
@@ -143,20 +424,44 @@ def call_ai_tools(prompt, system=None, tools=None, tool_executor=None,
 
     messages = _history_messages(history) + [{'role': 'user', 'content': prompt}]
 
-    def _create(include_tools):
+    tool_calls_completed = 0
+    unresolved_tool_error = False
+
+    def _create(include_tools, *, prevent_tool_use=False):
         kwargs = {'model': model, 'max_tokens': max_tokens, 'messages': messages}
         if system:
             kwargs['system'] = _cache_system(system)
         if include_tools:
             kwargs['tools'] = _cache_tools(tools)
+            if prevent_tool_use:
+                kwargs['tool_choice'] = {'type': 'none'}
+            elif (
+                unresolved_tool_error
+                or (require_tool and tool_calls_completed == 0)
+            ):
+                kwargs['tool_choice'] = {'type': 'any'}
         delay = 1.0
         last_err = None
         for attempt in range(retries + 1):
+            if time.monotonic() >= deadline:
+                return None, 'provider_timeout: request deadline exceeded'
             try:
-                return client.messages.create(**kwargs), None
-            except Exception as e:
+                return client.messages.create(
+                    **kwargs,
+                    timeout=_remaining_sdk_timeout(deadline),
+                ), None
+            except Exception as e:  # noqa: BLE001
                 last_err = str(e)
-                if attempt < retries and _is_transient(last_err):
+                category = error_category(last_err)
+                timeout_budget_spent = (
+                    category in {'timeout', 'connection'} and attempt >= 1
+                )
+                if (
+                    attempt < retries
+                    and _is_transient(last_err)
+                    and not timeout_budget_spent
+                    and time.monotonic() + delay < deadline
+                ):
                     logger.warning('claude transient overload (retry %d/%d): %s',
                                    attempt + 1, retries, last_err[:120])
                     time.sleep(delay)
@@ -165,10 +470,13 @@ def call_ai_tools(prompt, system=None, tools=None, tool_executor=None,
                 return None, last_err
         return None, last_err
 
-    def _text(resp):
-        return ''.join(
+    def _final_text(resp):
+        text = ''.join(
             b.text for b in resp.content if getattr(b, 'type', None) == 'text'
         )
+        if not text.strip():
+            return None, 'claude_empty_response'
+        return text, None
 
     try:
         for _ in range(max_iterations):
@@ -176,46 +484,92 @@ def call_ai_tools(prompt, system=None, tools=None, tool_executor=None,
             if err:
                 return None, err
             if getattr(resp, 'stop_reason', None) != 'tool_use':
-                return _text(resp), None
+                if unresolved_tool_error:
+                    return None, 'data_tool_failed'
+                if require_tool and tool_calls_completed == 0:
+                    return None, 'tool_grounding_missing'
+                return _final_text(resp)
 
             messages.append({'role': 'assistant', 'content': resp.content})
             results = []
+            unresolved_before_round = unresolved_tool_error
+            round_had_error = False
+            round_had_success = False
             for block in resp.content:
                 if getattr(block, 'type', None) != 'tool_use':
                     continue
                 try:
                     out = tool_executor(block.name, dict(block.input or {}))
-                    results.append({
-                        'type': 'tool_result', 'tool_use_id': block.id,
-                        'content': out if isinstance(out, str) else str(out),
-                    })
+                    result = {
+                        'type': 'tool_result',
+                        'tool_use_id': block.id,
+                        'content': _tool_result_content(out),
+                    }
+                    if _tool_result_failed(out):
+                        logger.warning(
+                            'AI data tool returned an error tool=%s',
+                            getattr(block, 'name', '?'),
+                        )
+                        result['is_error'] = True
+                        round_had_error = True
+                    else:
+                        tool_calls_completed += 1
+                        round_had_success = True
+                    results.append(result)
                 except Exception:  # noqa: BLE001
                     logger.exception('AI tool %s failed', getattr(block, 'name', '?'))
-                    results.append({
-                        'type': 'tool_result', 'tool_use_id': block.id,
-                        'content': SAFE_TOOL_ERROR_MESSAGE, 'is_error': True,
-                    })
+                    return None, 'data_tool_failed'
             messages.append({'role': 'user', 'content': results})
+            # A success from the same assistant turn cannot correct an error the
+            # provider has not seen yet. Only a clean later tool round resolves it.
+            if round_had_error:
+                unresolved_tool_error = True
+            elif unresolved_before_round and round_had_success:
+                unresolved_tool_error = False
 
-        resp, err = _create(include_tools=False)
+        # The tool budget limits data-gathering rounds, not the final prose turn.
+        # Synthesize once with tools omitted only when the accumulated evidence
+        # is verified and every structured tool error has been resolved.
+        if unresolved_tool_error:
+            return None, 'data_tool_failed'
+        if tool_calls_completed == 0:
+            return None, 'tool_iteration_limit'
+        # Anthropic requires a tool-result continuation to retain the same tool
+        # definitions. Explicit ``none`` keeps that continuation valid while
+        # guaranteeing this last request can only synthesize prose.
+        resp, err = _create(include_tools=True, prevent_tool_use=True)
         if err:
             return None, err
-        return _text(resp), None
+        return _final_text(resp)
     except Exception as e:  # noqa: BLE001
         logger.exception('claude tool loop failed')
         return None, str(e)
+
 
 _OPENAI_EXTRAS = ('seed', 'prompt_cache_key', 'temperature')
 _openai_extras_ok = None
 
 
-def _openai_sampling_kwargs(model):
-
+def _openai_sampling_kwargs(model, *, for_tools=False):
     kw = {
         'seed': int(getattr(settings, 'OPENAI_SEED', 7)),
         'prompt_cache_key': 'alpha-pos-ai-assistant',
     }
-    if not str(model or '').startswith(('gpt-5', 'o1', 'o3', 'o4')):
+    model_name = str(model or '').strip().lower()
+    if model_name.startswith('gpt-5.6'):
+        effort = str(
+            getattr(settings, 'OPENAI_REASONING_EFFORT', 'low') or 'low'
+        ).strip().lower()
+        if effort not in {'none', 'low', 'medium', 'high', 'xhigh', 'max'}:
+            logger.warning(
+                'Invalid OPENAI_REASONING_EFFORT=%r; using low',
+                effort,
+            )
+            effort = 'low'
+        if for_tools and model_name == 'gpt-5.6-luna':
+            effort = 'none'
+        kw['reasoning_effort'] = effort
+    if not model_name.startswith(('gpt-5', 'o1', 'o3', 'o4')):
         kw['temperature'] = float(getattr(settings, 'AI_TEMPERATURE', 0) or 0)
     return kw
 
@@ -230,7 +584,7 @@ def _openai_create(client, kwargs):
         if _openai_extras_ok is None and any(k in kwargs for k in _OPENAI_EXTRAS):
             _openai_extras_ok = True
         return resp
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         msg = str(e).lower()
         looks_like_param = (
             isinstance(e, TypeError)
@@ -270,7 +624,7 @@ def _call_claude(prompt, system, max_tokens, history=None):
     model = getattr(settings, 'ANTHROPIC_MODEL', '') or DEFAULT_CLAUDE_MODEL
     try:
         client = anthropic.Anthropic(
-            api_key=api_key, timeout=_timeout_seconds(), max_retries=0,
+            api_key=api_key, timeout=_sdk_timeout(), max_retries=0,
         )
         kwargs = {
             'model': model,
@@ -280,8 +634,6 @@ def _call_claude(prompt, system, max_tokens, history=None):
         if system:
             kwargs['system'] = _cache_system(system)
         resp = client.messages.create(**kwargs)
-        # content is a list of blocks; concatenate the text blocks. No sampling
-        # params are sent so this stays valid across the Opus 4.x line too.
         text = ''.join(
             b.text for b in resp.content if getattr(b, 'type', None) == 'text'
         )
@@ -301,8 +653,6 @@ def _call_gemini(prompt, system, max_tokens, history=None):
     if not api_key:
         return None, 'llm_key_missing'
     model = getattr(settings, 'GEMINI_MODEL', '') or DEFAULT_GEMINI_MODEL
-    # Gemini has no separate system / role fields in this simple call — fold the
-    # system prompt and any prior conversation turns into one text blob.
     convo = ''
     for turn in _history_messages(history):
         who = 'User' if turn['role'] == 'user' else 'Assistant'
@@ -353,7 +703,7 @@ def _call_openai(prompt, system, max_tokens, history=None):
     model = getattr(settings, 'OPENAI_MODEL', '') or DEFAULT_OPENAI_MODEL
     try:
         client = openai.OpenAI(
-            api_key=api_key, timeout=_timeout_seconds(), max_retries=0,
+            api_key=api_key, timeout=_sdk_timeout(), max_retries=0,
         )
         messages = []
         if system:
@@ -382,24 +732,20 @@ def _call_openai(prompt, system, max_tokens, history=None):
 
 
 def _openai_tool_loop(prompt, system, tools, tool_executor, max_tokens,
-                      max_iterations, retries, history):
-    """OpenAI function-calling loop — the OpenAI twin of the Claude tool loop. The
-    model calls read-only data tools to answer in full detail (compare dates, drill
-    into any order/shift/cashier/product). Returns (text, error)."""
+                      max_iterations, retries, history, *, deadline,
+                      require_tool=True):
     api_key = getattr(settings, 'OPENAI_API_KEY', '') or ''
     if not api_key:
         return None, 'llm_key_missing'
     model = getattr(settings, 'OPENAI_MODEL', '') or DEFAULT_OPENAI_MODEL
     try:
         client = openai.OpenAI(
-            api_key=api_key, timeout=_timeout_seconds(), max_retries=0,
+            api_key=api_key, timeout=_sdk_timeout(), max_retries=0,
         )
     except Exception as e:  # noqa: BLE001
         logger.exception('openai client init failed')
         return None, str(e)
 
-    # Anthropic-style tool schema -> OpenAI function schema (input_schema is already
-    # a JSON Schema, which is exactly what OpenAI's `parameters` expects).
     oai_tools = [{
         'type': 'function',
         'function': {
@@ -415,19 +761,42 @@ def _openai_tool_loop(prompt, system, tools, tool_executor, max_tokens,
     messages.extend(_history_messages(history))
     messages.append({'role': 'user', 'content': prompt})
     ceiling = max(int(max_tokens or 2048), OPENAI_MIN_COMPLETION_TOKENS)
+    tool_calls_completed = 0
+    unresolved_tool_error = False
 
     def _create(include_tools):
-        kwargs = {'model': model, 'messages': messages, 'max_completion_tokens': ceiling,
-                  **_openai_sampling_kwargs(model)}
+        kwargs = {
+            'model': model,
+            'messages': messages,
+            'max_completion_tokens': ceiling,
+            **_openai_sampling_kwargs(model, for_tools=True),
+        }
         if include_tools:
             kwargs['tools'] = oai_tools
+            if (
+                unresolved_tool_error
+                or (require_tool and tool_calls_completed == 0)
+            ):
+                kwargs['tool_choice'] = 'required'
         delay, last_err = 1.0, None
         for attempt in range(retries + 1):
+            if time.monotonic() >= deadline:
+                return None, 'provider_timeout: request deadline exceeded'
             try:
+                kwargs['timeout'] = _remaining_sdk_timeout(deadline)
                 return _openai_create(client, kwargs), None
             except Exception as e:  # noqa: BLE001
                 last_err = str(e)
-                if attempt < retries and _is_transient(last_err):
+                category = error_category(last_err)
+                timeout_budget_spent = (
+                    category in {'timeout', 'connection'} and attempt >= 1
+                )
+                if (
+                    attempt < retries
+                    and _is_transient(last_err)
+                    and not timeout_budget_spent
+                    and time.monotonic() + delay < deadline
+                ):
                     logger.warning('openai transient overload (retry %d/%d): %s',
                                    attempt + 1, retries, last_err[:120])
                     time.sleep(delay)
@@ -451,9 +820,11 @@ def _openai_tool_loop(prompt, system, tools, tool_executor, max_tokens,
             msg = resp.choices[0].message if resp.choices else None
             tool_calls = getattr(msg, 'tool_calls', None) if msg else None
             if not tool_calls:
+                if unresolved_tool_error:
+                    return None, 'data_tool_failed'
+                if require_tool and tool_calls_completed == 0:
+                    return None, 'tool_grounding_missing'
                 return _final_text(resp)
-            # Echo the assistant tool-call turn, then run every requested tool and
-            # append one tool-result message per call.
             messages.append({
                 'role': 'assistant',
                 'content': msg.content or '',
@@ -463,24 +834,52 @@ def _openai_tool_loop(prompt, system, tools, tool_executor, max_tokens,
                                  'arguments': tc.function.arguments or '{}'},
                 } for tc in tool_calls],
             })
+            unresolved_before_round = unresolved_tool_error
+            round_had_error = False
+            round_had_success = False
             for tc in tool_calls:
                 try:
                     args = json.loads(tc.function.arguments or '{}')
                 except (ValueError, TypeError):
-                    args = {}
+                    logger.warning(
+                        'OpenAI returned malformed tool arguments tool=%s',
+                        tc.function.name,
+                    )
+                    return None, 'invalid_tool_arguments'
                 if not isinstance(args, dict):
-                    args = {}
+                    return None, 'invalid_tool_arguments'
                 try:
                     out = tool_executor(tc.function.name, args)
+                    if _tool_result_failed(out):
+                        logger.warning(
+                            'AI data tool returned an error tool=%s',
+                            tc.function.name,
+                        )
+                        round_had_error = True
+                    else:
+                        tool_calls_completed += 1
+                        round_had_success = True
                 except Exception:  # noqa: BLE001
                     logger.exception('AI tool %s failed', tc.function.name)
-                    out = SAFE_TOOL_ERROR_MESSAGE
+                    return None, 'data_tool_failed'
                 messages.append({
                     'role': 'tool', 'tool_call_id': tc.id,
-                    'content': out if isinstance(out, str) else str(out),
+                    'content': _tool_result_content(out),
                 })
+            # A success from the same assistant turn cannot correct an error the
+            # provider has not seen yet. Only a clean later tool round resolves it.
+            if round_had_error:
+                unresolved_tool_error = True
+            elif unresolved_before_round and round_had_success:
+                unresolved_tool_error = False
 
-        # Iteration budget spent: ask once more without tools so the model answers.
+        # The tool budget limits data-gathering rounds, not the final prose turn.
+        # Synthesize once with tools omitted only when the accumulated evidence
+        # is verified and every structured tool error has been resolved.
+        if unresolved_tool_error:
+            return None, 'data_tool_failed'
+        if tool_calls_completed == 0:
+            return None, 'tool_iteration_limit'
         resp, err = _create(include_tools=False)
         if err:
             return None, err

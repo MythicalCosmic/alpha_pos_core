@@ -172,6 +172,7 @@ def checkout(customer, phone_required=True):
         user=user,
         phone_number=customer.phone_number or None,
         order_type=Order.OrderType.PICKUP,
+        order_origin=Order.Origin.TELEGRAM,
         status=Order.Status.OPEN,
         is_paid=False,
         subtotal=total,

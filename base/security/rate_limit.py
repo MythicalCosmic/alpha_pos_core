@@ -1,10 +1,16 @@
 from functools import wraps
+
 from django.conf import settings
-from django.core.cache import cache
+from django.core.cache import cache, caches
+from django.core.cache.backends.dummy import DummyCache
 from django.http import JsonResponse
 
 
 def _get_ip(request):
+    # X-Forwarded-For is attacker-controlled when no reverse proxy strips it.
+    # Trust it only when the operator has explicitly opted in via
+    # TRUST_FORWARDED_FOR — otherwise an attacker can rotate the header to
+    # bypass the per-IP rate limit (or stuff a victim's IP to lock them out).
     if getattr(settings, 'TRUST_FORWARDED_FOR', False):
         xff = request.META.get('HTTP_X_FORWARDED_FOR')
         if xff:
@@ -13,11 +19,19 @@ def _get_ip(request):
 
 
 def _check_and_incr(key, max_attempts, window):
+    """Return retry-after seconds when the limit is exceeded.
+
+    DummyCache is an explicit test-only backend and cannot enforce limits.
+    LocMem and Redis both support the atomic ``add``/``incr`` sequence.
+    """
+    if isinstance(caches['default'], DummyCache):
+        return None
 
     cache.add(key, 0, window)
     try:
         count = cache.incr(key)
     except ValueError:
+        # Key expired between add and incr — re-seed and count this request.
         cache.add(key, 0, window)
         count = cache.incr(key)
     if count > max_attempts:
@@ -26,6 +40,11 @@ def _check_and_incr(key, max_attempts, window):
 
 
 def rate_limit(key_prefix, max_attempts, window, error_payload=None):
+    """Rate-limit a view by source IP.
+
+    ``error_payload`` lets an endpoint provide its own user-ready error contract
+    while preserving the historical response everywhere else.
+    """
     def decorator(view_func):
         @wraps(view_func)
         def wrapper(request, *args, **kwargs):
@@ -48,6 +67,13 @@ def rate_limit(key_prefix, max_attempts, window, error_payload=None):
 
 
 def rate_limit_by(key_prefix, max_attempts, window, extractor, error_payload=None):
+    """Rate-limit by a request-derived key (e.g. username, phone, target id)
+    in addition to IP. Use on auth endpoints to defeat distributed
+    credential-stuffing where the attacker rotates source IPs.
+
+    `extractor(request)` returns the key string, or None to skip the check.
+    Combine with IP-based @rate_limit on the same view for layered defense.
+    """
     def decorator(view_func):
         @wraps(view_func)
         def wrapper(request, *args, **kwargs):
@@ -71,4 +97,3 @@ def rate_limit_by(key_prefix, max_attempts, window, extractor, error_payload=Non
             return view_func(request, *args, **kwargs)
         return wrapper
     return decorator
-

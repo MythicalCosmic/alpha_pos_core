@@ -20,6 +20,7 @@ class BaseConfig(AppConfig):
         def ensure_sync_scope_epoch(**_kwargs):
             from base.services.sync.status import SyncStatus
             SyncStatus.ensure_scope_epoch()
+            SyncStatus.ensure_pull_contract_epoch()
 
         post_migrate.connect(
             ensure_sync_scope_epoch,

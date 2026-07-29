@@ -1,4 +1,3 @@
-from django.core.paginator import Paginator
 from base.repositories.base import BaseSyncRepository
 from base.models import Table
 
@@ -39,8 +38,3 @@ class TableRepository(BaseSyncRepository):
         table.status = status
         table.save(update_fields=['status'])
         return table
-
-    @classmethod
-    def paginate(cls, queryset, page=1, per_page=20):
-        paginator = Paginator(queryset, per_page)
-        return paginator.get_page(page), paginator

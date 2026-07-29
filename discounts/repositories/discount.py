@@ -1,5 +1,4 @@
 from django.db.models import Q, F
-from django.core.paginator import Paginator
 from django.utils import timezone
 from base.repositories.base import BaseSyncRepository
 from discounts.models import Discount
@@ -75,8 +74,3 @@ class DiscountRepository(BaseSyncRepository):
         return queryset.filter(
             Q(name__icontains=query) | Q(code__icontains=query)
         )
-
-    @classmethod
-    def paginate(cls, queryset, page=1, per_page=20):
-        paginator = Paginator(queryset, per_page)
-        return paginator.get_page(page), paginator

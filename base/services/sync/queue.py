@@ -16,6 +16,7 @@ from collections import defaultdict
 from django.db import IntegrityError, transaction
 
 from base.services.sync.encoder import serialize_payload
+from base.services.sync.evidence import emit_sync_evidence
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,7 @@ class SyncQueue:
         # Reset retry state only for genuinely new content.  Re-adding the same
         # poison payload (the reconcile sweep runs every cycle) must not revive
         # it forever; editing/correcting it should revive it immediately.
+        operation = 'unchanged'
         for create_attempt in range(2):
             try:
                 with transaction.atomic():
@@ -66,6 +68,7 @@ class SyncQueue:
                             record_uuid=record_uuid,
                             payload=payload,
                         )
+                        operation = 'created'
                     elif (_payload_version(payload) is not None
                           and _payload_version(record.payload) is not None
                           and _payload_version(payload)
@@ -84,6 +87,7 @@ class SyncQueue:
                             'payload', 'generation', 'attempts', 'last_error',
                             'updated_at',
                         ])
+                        operation = 'replaced'
                 break
             except IntegrityError:
                 # Two first-time enqueue attempts can both observe an empty slot.
@@ -92,6 +96,9 @@ class SyncQueue:
                 if create_attempt:
                     raise
         logger.debug(f'Sync queued: {model_name} {uuid_val}')
+        emit_sync_evidence(
+            'queue_upsert', operation=operation, record=cls._to_dict(record),
+        )
         return str(record.generation)
 
     @classmethod
@@ -107,7 +114,11 @@ class SyncQueue:
         from base.models import SyncQueueRecord
         from base.services.sync.config import get_sync_max_queue_attempts
         max_attempts = get_sync_max_queue_attempts()
-        qs = SyncQueueRecord.objects.all()
+        qs = SyncQueueRecord.objects.exclude(
+            last_error__startswith='[REJECTED]',
+        ).exclude(
+            last_error__startswith='[BRANCH_SCOPE]',
+        )
         if max_attempts:
             qs = qs.filter(attempts__lt=max_attempts)
         grouped = defaultdict(list)
@@ -116,13 +127,51 @@ class SyncQueue:
         return dict(grouped)
 
     @classmethod
+    def get_snapshots(cls, model_name, uuids, *, lock=False):
+        """Return immutable-generation snapshots for selected queue slots.
+
+        Callers which perform cleanup after other database work must not delete
+        by UUID alone: a concurrent save may replace that slot with a newer
+        generation while the work is in flight.  Feeding these snapshots to
+        :meth:`acknowledge` removes only the generations observed here.
+        """
+        from base.models import SyncQueueRecord
+
+        coerced = []
+        for value in uuids:
+            try:
+                coerced.append(_coerce_uuid(value))
+            except (ValueError, TypeError):
+                continue
+        if not coerced:
+            return []
+        queryset = SyncQueueRecord.objects.filter(
+            model_name=model_name,
+            record_uuid__in=coerced,
+        )
+        if lock:
+            # Callers use this only inside the same transaction which applies
+            # the corresponding model row. A concurrent queue upsert then
+            # cannot rotate the observed generation before exact ACK cleanup.
+            queryset = queryset.select_for_update()
+        return [
+            cls._to_dict(row)
+            for row in queryset.iterator()
+        ]
+
+    @classmethod
     def dead_letter_count(cls):
         from base.models import SyncQueueRecord
         from base.services.sync.config import get_sync_max_queue_attempts
         max_attempts = get_sync_max_queue_attempts()
-        if not max_attempts:
-            return 0
-        return SyncQueueRecord.objects.filter(attempts__gte=max_attempts).count()
+        from django.db.models import Q
+        dead = (
+            Q(last_error__startswith='[REJECTED]')
+            | Q(last_error__startswith='[BRANCH_SCOPE]')
+        )
+        if max_attempts:
+            dead |= Q(attempts__gte=max_attempts)
+        return SyncQueueRecord.objects.filter(dead).count()
 
     @classmethod
     def queued_uuids_for_model(cls, model_name):
@@ -136,8 +185,17 @@ class SyncQueue:
     @classmethod
     def count(cls):
         from base.models import SyncQueueRecord
+        from django.db.models import Q
+
         total = SyncQueueRecord.objects.count()
-        failed = SyncQueueRecord.objects.filter(attempts__gt=0).count()
+        # A retryable batch/record deferral deliberately does not consume the
+        # poison-message attempt budget, but it is still a failed/blocked queue
+        # row that operators must see.  Counting only attempts>0 made the
+        # dashboard report a clean queue while missing-dependency rows sat
+        # indefinitely with a useful last_error.
+        failed = SyncQueueRecord.objects.filter(
+            Q(attempts__gt=0) | ~Q(last_error=''),
+        ).count()
         return total, failed
 
     @classmethod
@@ -158,7 +216,10 @@ class SyncQueue:
         qs = SyncQueueRecord.objects.filter(record_uuid__in=coerced)
         if model_name is not None:
             qs = qs.filter(model_name=model_name)
+        removed = [cls._to_dict(row) for row in qs.iterator()]
         qs.delete()
+        if removed:
+            emit_sync_evidence('queue_removed', reason='explicit_remove', records=removed)
 
     @classmethod
     def acknowledge(cls, records, model_name):
@@ -175,6 +236,7 @@ class SyncQueue:
         if not expected:
             return set()
 
+        snapshots = []
         with transaction.atomic():
             rows = list(
                 SyncQueueRecord.objects.select_for_update().filter(
@@ -187,9 +249,14 @@ class SyncQueue:
                 if expected.get(row.record_uuid) == row.generation
             ]
             if matched:
+                snapshots = [cls._to_dict(row) for row in matched]
                 SyncQueueRecord.objects.filter(
                     pk__in=[row.pk for row in matched],
                 ).delete()
+        if snapshots:
+            emit_sync_evidence(
+                'queue_acknowledged', model_name=model_name, records=snapshots,
+            )
         return {str(row.record_uuid) for row in matched}
 
     @classmethod
@@ -211,9 +278,169 @@ class SyncQueue:
             attempts=models_F_plus_one(),
             last_error=str(error)[:500],
         )
+        rows = [cls._to_dict(row) for row in qs.iterator()]
+        if rows:
+            emit_sync_evidence('queue_failed', error=str(error)[:500], records=rows)
 
     @classmethod
     def mark_batch_failed(cls, uuids, error, model_name=None, generations=None):
+        """Consume one poison-record attempt for exact rejected generations.
+
+        This is reserved for receiver responses which identify the individual
+        UUIDs that could not be applied.  Transport/authentication/server-wide
+        failures are not evidence that any record is poison and must use
+        :meth:`mark_batch_deferred` instead; otherwise a short outage can
+        dead-letter valid orders and payments permanently.
+        """
+        return cls._record_batch_error(
+            uuids,
+            error,
+            model_name=model_name,
+            generations=generations,
+            consume_attempt=True,
+        )
+
+    @classmethod
+    def mark_batch_deferred(cls, uuids, error, model_name=None, generations=None):
+        """Retain a systemically blocked batch without poisoning its records.
+
+        A 401 after token rotation, a 5xx deployment fault, timeout, or a legacy
+        batch-level rejection applies to the delivery attempt as a whole.  It
+        should remain observable in ``last_error`` but must not advance the
+        per-record dead-letter counter: the exact same payload may be valid as
+        soon as the shared dependency recovers.
+        """
+        return cls._record_batch_error(
+            uuids,
+            error,
+            model_name=model_name,
+            generations=generations,
+            consume_attempt=False,
+        )
+
+    @classmethod
+    def mark_batch_rejected(
+        cls, uuids, error, model_name=None, generations=None,
+    ):
+        """Dead-letter exact generations explicitly rejected by the receiver."""
+        from base.services.sync.config import get_sync_max_queue_attempts
+
+        return cls._record_batch_error(
+            uuids,
+            f'[REJECTED] {error}',
+            model_name=model_name,
+            generations=generations,
+            consume_attempt=False,
+            force_attempts=max(1, get_sync_max_queue_attempts()),
+        )
+
+    @classmethod
+    def revive_legacy_dead_letters(cls):
+        """One-time revival after retryable dependency failures stopped poisoning.
+
+        Old builds consumed attempts for missing parents and systemic outages.
+        Replaying those rows once under ACK protocol v2 is safe; an actually
+        invalid row is now explicitly rejected and immediately dead-lettered.
+        """
+        from base.models import SyncQueueRecord, SyncState
+        from base.services.sync.config import get_sync_max_queue_attempts
+        from base.services.sync.status import SyncStatus
+
+        max_attempts = get_sync_max_queue_attempts()
+        if not max_attempts:
+            return 0
+        marker_key = SyncStatus.dead_letter_revival_key()
+        revived = []
+        with transaction.atomic():
+            marker, _ = SyncState.objects.select_for_update().get_or_create(
+                key=marker_key, defaults={'value': ''},
+            )
+            if marker.value == 'complete':
+                return 0
+            rows = list(
+                SyncQueueRecord.objects.select_for_update()
+                .filter(attempts__gte=max_attempts)
+                .exclude(last_error__startswith='[REJECTED]')
+                .exclude(last_error__startswith='[BRANCH_SCOPE]')
+            )
+            if rows:
+                SyncQueueRecord.objects.filter(
+                    pk__in=[row.pk for row in rows],
+                ).update(attempts=0, last_error='')
+                revived = [cls._to_dict(row) for row in rows]
+            marker.value = 'complete'
+            marker.save(update_fields=['value', 'updated_at'])
+        if revived:
+            emit_sync_evidence(
+                'queue_dead_letters_revived',
+                reason='ack_protocol_v2_retry_classification',
+                records=revived,
+            )
+        return len(revived)
+
+    @classmethod
+    def quarantine_foreign_branch_records(cls, branch_id):
+        """Prevent stale branch-A payloads from authenticating as branch B."""
+        from base.models import SyncQueueRecord
+        from base.services.sync.config import get_sync_max_queue_attempts
+
+        branch_id = str(branch_id or '').strip()
+        if not branch_id:
+            return 0
+        cap = max(1, get_sync_max_queue_attempts())
+        quarantined = []
+        restored = []
+        with transaction.atomic():
+            rows = list(
+                SyncQueueRecord.objects.select_for_update().all()
+            )
+            for row in rows:
+                payload = row.payload if isinstance(row.payload, dict) else {}
+                payload_branch = str(payload.get('branch_id') or '').strip()
+                if payload_branch and payload_branch != branch_id:
+                    error = (
+                        f'[BRANCH_SCOPE] payload belongs to {payload_branch}; '
+                        f'current branch is {branch_id}'
+                    )
+                    if row.last_error != error or row.attempts != cap:
+                        row.last_error = error[:500]
+                        row.attempts = cap
+                        row.save(update_fields=[
+                            'last_error', 'attempts', 'updated_at',
+                        ])
+                    quarantined.append(cls._to_dict(row))
+                elif row.last_error.startswith('[BRANCH_SCOPE]'):
+                    row.last_error = ''
+                    row.attempts = 0
+                    row.save(update_fields=[
+                        'last_error', 'attempts', 'updated_at',
+                    ])
+                    restored.append(cls._to_dict(row))
+        if quarantined:
+            emit_sync_evidence(
+                'queue_branch_scope_quarantined',
+                branch_id=branch_id,
+                records=quarantined,
+            )
+        if restored:
+            emit_sync_evidence(
+                'queue_branch_scope_restored',
+                branch_id=branch_id,
+                records=restored,
+            )
+        return len(quarantined)
+
+    @classmethod
+    def _record_batch_error(
+        cls,
+        uuids,
+        error,
+        *,
+        model_name=None,
+        generations=None,
+        consume_attempt,
+        force_attempts=None,
+    ):
         # Scope by model_name (the unique key's other half) when known so a
         # failure on one model doesn't bump attempts on a different model's row
         # sharing the same record_uuid.
@@ -244,23 +471,93 @@ class SyncQueue:
                 ]
                 if not matched_pks:
                     return set()
-                SyncQueueRecord.objects.filter(pk__in=matched_pks).update(
-                    attempts=models_F_plus_one(),
-                    last_error=str(error)[:500],
+                updates = {'last_error': str(error)[:500]}
+                if force_attempts is not None:
+                    updates['attempts'] = force_attempts
+                elif consume_attempt:
+                    updates['attempts'] = models_F_plus_one()
+                if force_attempts is None and not consume_attempt:
+                    # A manual dead-letter recovery deliberately retains the
+                    # receiver's original diagnosis behind a [RETRYING]
+                    # marker. Repeated auth/transport/background failures are
+                    # delivery symptoms, not a new diagnosis, so replacing the
+                    # marker here would make the actionable rejection vanish.
+                    # The row locks also ensure a fresh explicit rejection
+                    # cannot be overwritten by this older batch result.
+                    for row in rows:
+                        if row.pk in matched_pks:
+                            row.last_error = _deferred_error(
+                                row.last_error, error,
+                            )
+                    SyncQueueRecord.objects.bulk_update(
+                        [row for row in rows if row.pk in matched_pks],
+                        ['last_error'],
+                    )
+                else:
+                    SyncQueueRecord.objects.filter(
+                        pk__in=matched_pks,
+                    ).update(**updates)
+                failed_rows = list(
+                    SyncQueueRecord.objects.filter(pk__in=matched_pks).iterator()
+                )
+                emit_sync_evidence(
+                    'queue_failed', error=str(error)[:500],
+                    failure_scope=('record' if consume_attempt else 'batch'),
+                    attempts_consumed=consume_attempt,
+                    force_attempts=force_attempts,
+                    records=[cls._to_dict(row) for row in failed_rows],
                 )
             return {
                 str(row.record_uuid) for row in rows if row.pk in matched_pks
             }
-        qs.update(
-            attempts=models_F_plus_one(),
-            last_error=str(error)[:500],
-        )
+        updates = {'last_error': str(error)[:500]}
+        if force_attempts is not None:
+            updates['attempts'] = force_attempts
+        elif consume_attempt:
+            updates['attempts'] = models_F_plus_one()
+        if force_attempts is None and not consume_attempt:
+            with transaction.atomic():
+                rows = list(qs.select_for_update())
+                for row in rows:
+                    row.last_error = _deferred_error(row.last_error, error)
+                if rows:
+                    SyncQueueRecord.objects.bulk_update(rows, ['last_error'])
+        else:
+            qs.update(**updates)
+        rows = [cls._to_dict(row) for row in qs.iterator()]
+        if rows:
+            emit_sync_evidence(
+                'queue_failed', error=str(error)[:500],
+                failure_scope=('record' if consume_attempt else 'batch'),
+                attempts_consumed=consume_attempt, records=rows,
+            )
         return {str(u) for u in coerced}
 
     @classmethod
-    def clear(cls):
+    def clear(cls, *, include_tombstones=False):
+        """Clear rebuildable queue slots without erasing deletion evidence.
+
+        A live row removed from this cache is rediscovered by the unsynced-row
+        reconciliation sweep.  A hard-delete tombstone has no source row left;
+        its queue slot is the *only* durable record that tells the peer to
+        remove the object.  The old blanket clear silently resurrected deleted
+        order items on the cloud.  Preserve tombstones by default, while keeping
+        an explicit internal escape hatch for full database reset workflows.
+        Returns the number of rows removed.
+        """
         from base.models import SyncQueueRecord
-        SyncQueueRecord.objects.all().delete()
+        qs = SyncQueueRecord.objects.all()
+        if not include_tombstones:
+            qs = qs.exclude(payload__is_deleted=True)
+        rows = [cls._to_dict(row) for row in qs.iterator()]
+        qs.delete()
+        if rows:
+            emit_sync_evidence(
+                'queue_removed',
+                reason=('clear_all' if include_tombstones else 'clear_rebuildable'),
+                records=rows,
+            )
+        return len(rows)
 
     @classmethod
     def get_summary(cls):
@@ -298,6 +595,20 @@ def models_F_plus_one():
     # Local helper to keep the import small at module top.
     from django.db.models import F
     return F('attempts') + 1
+
+
+def _deferred_error(current_error, latest_error):
+    """Preserve a recovery diagnosis while refreshing its delivery symptom."""
+    current = str(current_error or '').strip()
+    latest = str(latest_error or '').strip()
+    if current.startswith(('[REJECTED]', '[BRANCH_SCOPE]')):
+        return current[:500]
+    if current.startswith('[RETRYING]'):
+        original = current.split(' | latest push:', 1)[0].rstrip()
+        if latest:
+            return f'{original} | latest push: {latest}'[:500].rstrip()
+        return original[:500]
+    return latest[:500]
 
 
 def _payload_version(payload):

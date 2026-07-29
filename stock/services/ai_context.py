@@ -43,8 +43,35 @@ def resolve_ai_context(location_id=None):
             return None, f"stock location {location_pk} not found"
 
     branch_id = (location.branch_id or '').strip() if location else ''
-    if not branch_id and getattr(settings, 'DEPLOYMENT_MODE', 'local') == 'local':
+    deployment_mode = getattr(settings, 'DEPLOYMENT_MODE', 'local')
+    if not branch_id and deployment_mode == 'local':
         branch_id = str(getattr(settings, 'BRANCH_ID', '') or '').strip()
+    if not branch_id and deployment_mode == 'cloud':
+        # The production target is currently a single branch and already exposes
+        # its authoritative id in settings.  Use it instead of leaving scope=None
+        # (which makes scope_branch() return every branch).  A future multi-branch
+        # cloud must supply a concrete location unless it configures an explicit
+        # default target.
+        branch_id = str(
+            getattr(settings, 'CLOUD_DEFAULT_TARGET_BRANCH_ID', '') or ''
+        ).strip()
+        if not branch_id:
+            candidates = list(
+                StockLocation.objects.filter(is_deleted=False)
+                .exclude(branch_id='')
+                .values_list('branch_id', flat=True)
+                .distinct()
+                .order_by('branch_id')[:2]
+            )
+            if len(candidates) == 1:
+                branch_id = str(candidates[0]).strip()
+            elif len(candidates) > 1:
+                return None, (
+                    'location_id is required because this cloud contains '
+                    'multiple branches'
+                )
+        if not branch_id:
+            return None, 'no cloud branch scope is configured'
     if location is not None and not branch_id:
         return None, f"stock location {location.id} has no branch_id"
 

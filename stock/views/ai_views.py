@@ -6,10 +6,10 @@ from base.helpers.response import json_response
 from base.security.rate_limit import rate_limit_by
 from base.security.permissions import admin_required
 from stock.services.ai_assistant_service import (
-    AI_ASSISTANT_ERROR_MESSAGE,
     AI_NOT_CONFIGURED_MESSAGE,
     AI_REQUEST_RATE_LIMIT_MESSAGE,
     build_ai_error,
+    detailed_ai_failure,
 )
 from stock.services.ai_chat_service import AIChatService
 
@@ -79,13 +79,21 @@ def ai_query(request):
             # against the open tab.
             context=data.get('context'),
         )
-    except Exception:  # DB/history/persistence failures need the chat contract
+    except Exception as exc:  # DB/history/persistence failures need the chat contract
         import logging
         logging.getLogger(__name__).exception('AI chat request failed')
+        message, incident_id, diagnostics = detailed_ai_failure(
+            exc,
+            stage='chat_persistence',
+        )
         result = build_ai_error(
-            'internal_error', AI_ASSISTANT_ERROR_MESSAGE,
+            'internal_error', message,
             source='alpha_pos', retryable=True,
-            suggestions=['Try again'],
+            suggestions=['Retry the request'],
+            incident_id=incident_id,
+            stage='chat_persistence',
+            retry_after_seconds=15,
+            diagnostics=diagnostics,
         )
     if isinstance(result, dict) and result.get('chat_id') is not None:
         result.setdefault('conversation_id', result['chat_id'])
@@ -110,6 +118,14 @@ def ai_query(request):
         'invalid_request': 400,
         'no_api_key': 503,
         'provider_configuration_error': 503,
+        'provider_timeout': 504,
+        'provider_connection_error': 502,
+        'provider_rate_limited': 429,
+        'provider_bad_request': 502,
+        'provider_empty_response': 502,
+        'provider_error': 502,
+        'data_unavailable': 503,
+        'scope_required': 422,
         # Provider unavailable / SDK missing / unexpected error — a server-side
         # failure, so return 5xx (not a client 400) and the desktop panel + infra
         # alerting can tell an outage apart from a bad request.

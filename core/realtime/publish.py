@@ -28,8 +28,3 @@ def publish_order_event(event, order):
     payload = {'channel': 'orders', 'event': event, 'order': order}
     _send(consumers.ORDERS_GROUP, payload)
     _send(consumers.KDS_GROUP, payload)
-
-
-def publish_cashier_control(action, **data):
-    """Server -> till: lock_cashier / force_logout / deactivate."""
-    _send(consumers.CASHIERS_GROUP, {'channel': 'cashiers', 'action': action, **data})

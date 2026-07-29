@@ -5,6 +5,13 @@ from .models import (
     ShiftTemplate, Shift, CashReconciliation,
 )
 
+# Django's built-in ``delete_selected`` action calls QuerySet.delete(), which
+# bypasses SyncMixin.delete(). On the cloud that physically removed synced rows
+# without publishing a tombstone, so terminals could retain them forever.
+# Individual admin deletion remains available and calls the model's ordinary
+# soft-delete path; only the unsafe bulk shortcut is disabled globally.
+admin.site.disable_action('delete_selected')
+
 
 @admin.register(User)
 class UserAdmin(admin.ModelAdmin):
@@ -69,6 +76,13 @@ class OrderAdmin(admin.ModelAdmin):
     list_filter = ('status', 'is_paid', 'order_type', 'created_at')
     search_fields = ('display_id', 'phone_number', 'description')
     autocomplete_fields = ('user', 'cashier', 'delivery_person', 'place', 'table')
+    # These fields are a derived settlement header, not an admin checkbox.
+    # Editing them directly bypasses OrderPayment, the active-shift guard,
+    # drawer accounting, fiscalization and refund invariants. Corrections must
+    # use the explicit pay/refund/repair services that write auditable evidence.
+    readonly_fields = (
+        'is_paid', 'payment_method', 'paid_at', 'accounting_recorded_at',
+    )
     inlines = [OrderItemInline]
     date_hierarchy = 'created_at'
 
@@ -103,7 +117,14 @@ class DeliveryPersonAdmin(admin.ModelAdmin):
 
 @admin.register(CashRegister)
 class CashRegisterAdmin(admin.ModelAdmin):
-    list_display = ('id', 'current_balance', 'last_updated')
+    list_display = (
+        'id', 'branch_id', 'uncollected_cash_cursor', 'last_updated',
+    )
+
+    @admin.display(description='Uncollected branch cash cursor')
+    def uncollected_cash_cursor(self, register):
+        """Administrative accounting cursor, never a per-shift drawer."""
+        return register.current_balance
 
 
 @admin.register(Inkassa)

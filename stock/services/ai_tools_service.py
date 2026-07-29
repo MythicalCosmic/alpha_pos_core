@@ -28,9 +28,9 @@ from base.models import (
 )
 from stock.models import StockLevel, StockBatch, StockLocation
 from base.services.business_day import business_day_date_expr
-from base.services.revenue import net_line_revenue
+from base.services.revenue import gross_line_revenue, net_line_revenue
 from base.services.refund_lines import (
-    REFUND_EVENT_ALIAS, refund_item_events, refund_item_events_in_window,
+    REFUND_EVENT_ALIAS, refund_item_events_in_window,
     refund_line_quantity, refund_line_revenue,
 )
 from stock.services.ai_context import (
@@ -84,6 +84,19 @@ def _parse_date(s):
         return date.fromisoformat(str(s)[:10])
     except (ValueError, TypeError):
         return None
+
+
+def _invalid_date_error(args, *fields):
+    """Reject an explicit malformed date instead of silently widening scope."""
+    for field in fields:
+        value = args.get(field)
+        if value not in (None, '') and _parse_date(value) is None:
+            return {
+                'error': (
+                    f"invalid {field}: expected an ISO date in YYYY-MM-DD format"
+                )
+            }
+    return None
 
 
 def _context(args):
@@ -314,6 +327,26 @@ def _order_full(o):
         "amount_uzs": _f(p.amount),
         "at": _iso(p.created_at),
     } for p in payments]
+    # OrderPayment is immutable tender evidence, not an additive revenue
+    # ledger. CASH can include change and replay recovery can temporarily leave
+    # more than one raw row. Expose the same capped breakdown used by shifts and
+    # dashboards so the assistant never derives revenue by summing raw evidence.
+    from base.services.tender import order_tender_sources
+    tender, card_detail, drawer_cash = order_tender_sources(o)
+    data["canonical_tender"] = {
+        "cash_uzs": _f(tender["cash"]),
+        "card_uzs": _f(tender["card"]),
+        "payme_uzs": _f(tender["payme"]),
+        "unknown_uzs": _f(tender["unknown"]),
+        "drawer_cash_uzs": _f(drawer_cash),
+        "card_detail_uzs": {
+            method: _f(amount) for method, amount in card_detail.items()
+        },
+    }
+    data["payment_evidence_note"] = (
+        "payments are raw tender evidence and must not be summed for revenue; "
+        "use canonical_tender or total_amount_uzs"
+    )
     data["delivery_person"] = _name(o.delivery_person) if o.delivery_person_id else None
     data["phone_number"] = o.phone_number or None
     data["description"] = o.description or None
@@ -690,7 +723,11 @@ class AIToolbox:
                 'aggregate {"revenue":"sum:total_amount","orders":"count"} '
                 'group_by ["cashier"]. Row example: fields ["id","total_amount","status",'
                 '"cashier__first_name"]. Prefer a specific tool when it already computes the exact '
-                "metric (those are pre-validated); use query_db for anything they can't. Read-only; "
+                "metric (those are pre-validated); use query_db for anything they can't. "
+                "For orderitem, line_total_uzs is a computed gross-line field equal "
+                "to price * quantity before any order-level discount; it can be "
+                "returned or aggregated with sum:line_total_uzs. There is no "
+                "total_price field. Use sales_report for net sales/refunds. Read-only; "
                 "soft-deleted rows and sensitive fields (passwords/tokens/keys) are always excluded."
             ),
             "input_schema": {
@@ -742,9 +779,11 @@ class AIToolbox:
             return json.dumps({"error": f"unknown tool: {name}"})
         try:
             return json.dumps(handler(args), default=str, ensure_ascii=False)
-        except Exception as e:  # noqa: BLE001 — never crash the loop; report to the model
+        except Exception:  # noqa: BLE001 — never crash the provider loop
             logger.exception("AI tool %s failed", name)
-            return json.dumps({"error": str(e)})
+            # Raw ORM/driver exceptions may contain table names, SQL fragments,
+            # or connection details. Keep them in protected logs only.
+            return json.dumps({"error": "data_tool_failed"})
 
     # ── handlers ──
     @classmethod
@@ -758,7 +797,43 @@ class AIToolbox:
             return {"error": "unknown model '%s'. queryable: %s"
                     % (name, ', '.join(sorted(set(_QUERYABLE_MODELS))))}
 
+        if model is OrderItem:
+            path_values = []
+            for key in ('filters', 'exclude'):
+                value = args.get(key) or {}
+                if isinstance(value, dict):
+                    path_values.extend(value)
+            for key in ('fields', 'group_by', 'order_by'):
+                value = args.get(key) or []
+                path_values.extend([value] if isinstance(value, str) else value)
+            aggregate = args.get('aggregate') or {}
+            if isinstance(aggregate, dict):
+                for spec in aggregate.values():
+                    _fn, _separator, field = str(spec).partition(':')
+                    if field:
+                        path_values.append(field)
+            if any(
+                str(path).lstrip('-').split('__', 1)[0] == 'total_price'
+                for path in path_values
+            ):
+                return {
+                    "error": (
+                        "OrderItem has no total_price field. Use "
+                        "line_total_uzs for price * quantity before any "
+                        "order-level discount, or use sales_report for net "
+                        "sales/refund accounting."
+                    )
+                }
+
         qs = model.objects.all()
+        if model is OrderItem:
+            # A line total is derived rather than stored on OrderItem. Models
+            # can request this explicit gross-line expression in rows, filters,
+            # ordering, or aggregates without pretending it includes order-level
+            # discounts/refunds.
+            qs = qs.annotate(
+                line_total_uzs=gross_line_revenue(),
+            )
         # Exclude soft-deleted rows unless explicitly asked.
         if any(f.name == 'is_deleted' for f in model._meta.concrete_fields) \
                 and args.get('include_deleted') is not True:
@@ -828,17 +903,61 @@ class AIToolbox:
                                 "join fan-out: aggregating an order-level field '%s' while "
                                 "filtering/grouping across a to-many relation (%s) counts each "
                                 "row once per line item and inflates the total. Aggregate on "
-                                "the item side (query model 'orderitem', sum 'quantity*price') "
+                                "the item side (query model 'orderitem', "
+                                "sum:line_total_uzs) "
                                 "or use the sales_report tool." % (_fld, ', '.join(sorted(_to_many)))}
-            aggs, err = _build_aggs(aggregate or {'n': 'count'})
+            requested_aggs = aggregate or {'n': 'count'}
+            if model is OrderPayment:
+                # Raw payment amounts are not safe accounting measures: CASH
+                # stores the amount tendered (including change), and replayed
+                # evidence can temporarily coexist under distinct UUIDs. Counts
+                # remain useful for integrity checks; monetary totals must use
+                # the canonical tender engine.
+                unsafe = []
+                money_fields = {
+                    'amount', 'total_amount', 'subtotal', 'discount_amount',
+                }
+                for alias, spec in requested_aggs.items():
+                    fn, sep, field = str(spec).strip().lower().partition(':')
+                    if (
+                        sep
+                        and fn in {'sum', 'avg'}
+                        and field.split('__')[-1] in money_fields
+                    ):
+                        unsafe.append(alias)
+                if unsafe:
+                    return {
+                        "error": (
+                            "raw OrderPayment money aggregation is disabled: "
+                            "payment rows can include cash change or replay "
+                            "evidence. Use sales_report/get_shift for totals or "
+                            "get_order.canonical_tender for one order. Count-only "
+                            "OrderPayment queries remain available."
+                        )
+                    }
+            aggs, err = _build_aggs(requested_aggs)
             if err:
                 return {"error": err}
             try:
                 if group_by:
-                    rows = list(qs.values(*group_by[:6]).annotate(**aggs)
-                                .order_by(*group_by[:6])[:MAX_LIST])
-                    return {"model": name, "group_by": group_by[:6],
-                            "groups": len(rows), "result": _deep_float(rows)}
+                    selected_groups = group_by[:6]
+                    total_groups = (
+                        qs.values(*selected_groups).distinct().count()
+                    )
+                    rows = list(
+                        qs.values(*selected_groups)
+                        .annotate(**aggs)
+                        .order_by(*selected_groups)[:MAX_LIST]
+                    )
+                    return {
+                        "model": name,
+                        "group_by": selected_groups,
+                        "total_groups": total_groups,
+                        "returned": len(rows),
+                        "limit": MAX_LIST,
+                        "truncated": total_groups > len(rows),
+                        "result": _deep_float(rows),
+                    }
                 return {"model": name, "matched": qs.count(),
                         "result": _deep_float(qs.aggregate(**aggs))}
             except Exception as e:  # noqa: BLE001
@@ -868,8 +987,15 @@ class AIToolbox:
             rows = list(qs.values(*fields)[offset:offset + limit])
         except Exception as e:  # noqa: BLE001
             return {"error": "bad fields/order_by (%s)" % e}
-        return {"model": name, "total_matching": total, "returned": len(rows),
-                "rows": _deep_float(rows)}
+        return {
+            "model": name,
+            "total_matching": total,
+            "returned": len(rows),
+            "offset": offset,
+            "limit": limit,
+            "truncated": offset + len(rows) < total,
+            "rows": _deep_float(rows),
+        }
 
     @classmethod
     def _t_datetime(cls, args):
@@ -916,6 +1042,7 @@ class AIToolbox:
         open_shifts = (Shift.objects.filter(is_deleted=False, status=Shift.Status.ACTIVE)
                        .select_related("user").order_by("-start_time"))
         open_shifts = scope_branch(open_shifts, context.branch_id)
+        open_shifts_count = open_shifts.count()
         open_list = []
         for s in open_shifts[:50]:
             count = _shift_orders_qs(s).count()
@@ -961,7 +1088,9 @@ class AIToolbox:
                 "paid_orders": sales_agg["paid"] or 0,
                 "unpaid_orders": volume_agg["unpaid"] or 0,
             },
-            "open_shifts_count": len(open_list),
+            "open_shifts_count": open_shifts_count,
+            "open_shifts_returned": len(open_list),
+            "open_shifts_truncated": open_shifts_count > len(open_list),
             "open_shifts": open_list,
             "cash_register_balance_uzs": _f(cash.current_balance) if cash else None,
             "cash_register_branch_id": cash.branch_id if cash else context.branch_id,
@@ -983,6 +1112,14 @@ class AIToolbox:
 
     @classmethod
     def _t_list_orders(cls, args):
+        invalid_date = _invalid_date_error(
+            args,
+            'date',
+            'date_from',
+            'date_to',
+        )
+        if invalid_date:
+            return invalid_date
         qs = (Order.objects.filter(is_deleted=False)
               .select_related("cashier", "customer", "table", "place")
               .prefetch_related("items__product"))
@@ -1040,6 +1177,9 @@ class AIToolbox:
 
     @classmethod
     def _t_get_order(cls, args):
+        invalid_date = _invalid_date_error(args, 'date')
+        if invalid_date:
+            return invalid_date
         base = (Order.objects.filter(is_deleted=False)
                 .select_related("cashier", "customer", "table", "place", "delivery_person")
                 .prefetch_related("items__product__category", "payments"))
@@ -1100,6 +1240,14 @@ class AIToolbox:
 
     @classmethod
     def _t_list_shifts(cls, args):
+        invalid_date = _invalid_date_error(
+            args,
+            'date',
+            'date_from',
+            'date_to',
+        )
+        if invalid_date:
+            return invalid_date
         qs = Shift.objects.filter(is_deleted=False).select_related("user", "shift_template", "reconciliation")
         qs = _scope_orders(qs, args)
         if args.get("status"):
@@ -1246,6 +1394,13 @@ class AIToolbox:
         if args.get("out_only"):
             qs = qs.filter(quantity__lte=0)
         total = qs.count()
+        total_value = sum(
+            _f(quantity) * _f(avg_cost)
+            for quantity, avg_cost in qs.values_list(
+                'quantity',
+                'stock_item__avg_cost_price',
+            )
+        )
         limit = _clamp(args.get("limit"), MAX_LIST, 1, MAX_LIST)
         offset = _clamp(args.get("offset"), 0, 0, _OFFSET_MAX)
         rows = list(qs.order_by("stock_item__name")[offset:offset + limit])
@@ -1255,13 +1410,23 @@ class AIToolbox:
             "returned": len(items),
             "offset": offset,
             "limit": limit,
-            "total_value_uzs": round(sum(i["value_uzs"] for i in items), 2),
+            "truncated": offset + len(items) < total,
+            "total_value_uzs": round(total_value, 2),
+            "page_value_uzs": round(sum(i["value_uzs"] for i in items), 2),
             "items": items,
         }
 
     @classmethod
     def _t_sales_report(cls, args):
         context = _context(args)
+        invalid_date = _invalid_date_error(
+            args,
+            'date',
+            'date_from',
+            'date_to',
+        )
+        if invalid_date:
+            return invalid_date
         d = _parse_date(args.get("date"))
         df, dt = _parse_date(args.get("date_from")), _parse_date(args.get("date_to"))
         if d:

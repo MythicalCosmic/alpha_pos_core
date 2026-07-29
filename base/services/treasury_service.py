@@ -19,7 +19,7 @@ a 5,000 fee → BANK -1,000,000, SAFE +995,000, fee 5,000.
 from decimal import Decimal, InvalidOperation
 
 from django.db import transaction, IntegrityError
-from django.db.models import F, Sum
+from django.db.models import Sum
 from django.utils import timezone
 
 from base.models import TreasuryAccount, TreasuryTransaction
@@ -136,30 +136,6 @@ class TreasuryService:
             )
             data[kind] = _serialize_account(acct)
         return ServiceResponse.success(data={'accounts': data})
-
-    @staticmethod
-    @transaction.atomic
-    def deposit_inkassa(cash_amount, card_amount, performed_by=None, reference_id=None):
-        """Deprecated no-op retained for binary/API compatibility.
-
-        Inkassa is now physical register movement/audit only. Shift proceeds
-        are recognized exactly once by ``post_shift_settlement`` when the
-        manager reconciles them, so this legacy helper must never mutate SAFE
-        or BANK even if an older integration still calls it.
-        """
-        return None, None
-
-    @staticmethod
-    @transaction.atomic
-    def deposit_shift(cash_amount, card_amount, performed_by=None, reference_id=None):
-        """Deprecated no-op; use ``post_shift_settlement``.
-
-        The old cash/card signature cannot preserve a dynamic tender breakdown
-        and was not idempotent. Leaving it capable of changing balances would
-        create a second recognition path, so it remains callable only as a safe
-        compatibility shim.
-        """
-        return None, None
 
     @staticmethod
     @transaction.atomic

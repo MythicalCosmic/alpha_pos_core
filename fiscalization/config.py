@@ -4,11 +4,8 @@ Mirrors the pattern in base.services.sync.config.SyncConfig: a setting provides
 the default, and a cache override lets the operator flip it at runtime (from the
 desktop control panel or an admin endpoint) without a redeploy.
 
-EVERYTHING here is PER-INSTALL. Each business runs its own deployment and enters
-its OWN fiscal identity (TIN + provider credentials) — receipts are always
-fiscalized under the selling business's tax registration, never the vendor's.
-See docs/FISCALIZATION.md for why funnelling every customer through one ID is
-illegal.
+Each installation uses the selling business's own tax identity and provider
+credentials.
 """
 from django.conf import settings
 

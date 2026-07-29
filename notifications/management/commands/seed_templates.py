@@ -7,43 +7,51 @@ TEMPLATES = [
         'notification_type': 'order.new',
         'name': 'Yangi buyurtma',
         'description': (
-            "Yangi buyurtma kelganda yuboriladi. Mavjud o'zgaruvchilar: "
-            '{display_id} {cashier_name} {order_type} {total_amount} {items_list} {time} {brand}'
+            "Yangi buyurtma kelganda bir marta yuboriladi; tayyor bo'lganda shu "
+            "xabarning o'zi yangilanadi. O'zgaruvchilar: {display_id} "
+            '{cashier_name} {order_type} {total_amount} {items_list} '
+            '{accepted_at} {time} {brand}'
         ),
         'template_text': (
-            '🆕 <b>YANGI BUYURTMA</b>\n'
-            '━━━━━━━━━━━━━━\n'
-            '🧾 Buyurtma: <b>#{display_id}</b>\n'
-            '👤 Kassir: {cashier_name}\n'
-            '📍 Turi: {order_type}\n'
-            "💰 Jami: <b>{total_amount} so'm</b>\n"
+            '🟠 <b>YANGI BUYURTMA · QABUL QILINDI</b>\n'
+            '<b>#{display_id}</b> · {order_type}\n'
+            '━━━━━━━━━━━━━━━━━━\n'
+            '👤 <b>Kassir:</b> {cashier_name}\n'
+            '🕐 <b>Qabul qilindi:</b> {accepted_at}\n'
             '\n'
-            '🛒 <b>Tarkibi:</b>\n'
+            '🛒 <b>BUYURTMA TARKIBI</b>\n'
             '{items_list}\n'
             '\n'
-            '🕒 Qabul qilindi: {time}\n'
-            '<i>{brand}</i>'
+            "💰 <b>JAMI: {total_amount} so'm</b>\n"
+            '\n'
+            '⏳ <i>Tayyorlanmoqda…</i>\n'
+            '🏪 {brand}'
         ),
     },
     {
         'notification_type': 'order.ready',
         'name': 'Buyurtma tayyor',
         'description': (
-            "Buyurtma tayyor bo'lganda yangi buyurtma xabariga JAVOB sifatida yuboriladi. "
-            "O'zgaruvchilar: {display_id} {prep_time} {total_amount} {items_list} {time} {brand}"
+            "Buyurtma tayyor bo'lganda avvalgi xabarning o'zi shu matn bilan "
+            "yangilanadi; yangi xabar yuborilmaydi. O'zgaruvchilar: {display_id} "
+            '{cashier_name} {order_type} {prep_time} {total_amount} {items_list} '
+            '{accepted_at} {ready_at} {time} {brand}'
         ),
         'template_text': (
             '✅ <b>BUYURTMA TAYYOR</b>\n'
-            '━━━━━━━━━━━━━━\n'
-            '🧾 Buyurtma: <b>#{display_id}</b>\n'
-            '⏱ Tayyorlanish vaqti: <b>{prep_time}</b>\n'
-            "💰 Jami: {total_amount} so'm\n"
+            '<b>#{display_id}</b> · {order_type}\n'
+            '━━━━━━━━━━━━━━━━━━\n'
+            '👤 <b>Kassir:</b> {cashier_name}\n'
+            '🕐 <b>Qabul qilindi:</b> {accepted_at}\n'
+            "✅ <b>Tayyor bo'ldi:</b> {ready_at}\n"
+            '⏱ <b>Tayyorlash vaqti:</b> {prep_time}\n'
             '\n'
-            '🛒 <b>Tarkibi:</b>\n'
+            '🛒 <b>BUYURTMA TARKIBI</b>\n'
             '{items_list}\n'
             '\n'
-            "🕒 Tayyor bo'ldi: {time}\n"
-            '<i>{brand}</i>'
+            "💰 <b>JAMI: {total_amount} so'm</b>\n"
+            '\n'
+            '🏪 {brand}'
         ),
     },
     {

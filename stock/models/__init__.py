@@ -1,9 +1,4 @@
-"""stock app models — split across themed submodules.
-
-External code keeps importing from `stock.models` directly; this
-__init__ re-exports every model so the public surface is unchanged.
-The split is purely for human readability (T5).
-"""
+"""Public stock model exports grouped across themed modules."""
 from stock.models.catalog import StockLocation, StockUnit, StockCategory
 from stock.models.items import StockItem, StockItemUnit
 from stock.models.recipes import Recipe, RecipeIngredient, RecipeIngredientSubstitute, RecipeByProduct, RecipeStep
@@ -58,5 +53,4 @@ __all__ = [
     'AIBriefing',
     'Anomaly',
     'AnomalySettings',
-    'AIMessage',
 ]

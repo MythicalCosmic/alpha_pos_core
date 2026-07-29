@@ -1,3 +1,6 @@
+from django.core.paginator import Paginator
+
+
 class BaseRepository:
     model = None
 
@@ -42,6 +45,11 @@ class BaseRepository:
     @classmethod
     def first(cls, **kwargs):
         return cls.model.objects.filter(**kwargs).first()
+
+    @classmethod
+    def paginate(cls, queryset, page=1, per_page=20):
+        paginator = Paginator(queryset, per_page)
+        return paginator.get_page(page), paginator
 
 
 class BaseSyncRepository(BaseRepository):

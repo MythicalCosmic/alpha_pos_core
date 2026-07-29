@@ -10,11 +10,12 @@ session token on the handshake — otherwise these sockets would stream live ord
 data to any anonymous internet client. The licensing kill-switch is enforced here
 too, because HTTP middleware does not run for the 'websocket' protocol.
 """
-from urllib.parse import parse_qs
-
 from asgiref.sync import async_to_sync
 from channels.generic.websocket import JsonWebsocketConsumer
 from django.conf import settings
+
+from base.helpers.request import SessionCredentialConflict
+from base.helpers.websocket import resolve_websocket_session_credential
 
 # Group names. Single-branch (one till) for now; multi-branch can suffix BRANCH_ID.
 ORDERS_GROUP = 'orders'
@@ -23,6 +24,11 @@ CASHIERS_GROUP = 'cashiers'
 
 _CLOSE_AUTH = 4401      # missing/invalid session
 _CLOSE_FORBIDDEN = 4403  # license blocked / insufficient role
+
+# These are the identities that operate a restaurant surface.  USER is a
+# generic/non-staff identity and COURIER belongs exclusively to the courier
+# mobile API; neither may subscribe to the order/KDS/control streams.
+_STAFF_ROLES = frozenset({'ADMIN', 'MANAGER', 'CASHIER', 'WAITER', 'CHEF'})
 
 
 class _GroupConsumer(JsonWebsocketConsumer):
@@ -81,18 +87,36 @@ class _GroupConsumer(JsonWebsocketConsumer):
             return None
         if not session or not session.user_id or session.user_id.is_deleted:
             return None
+        if session.is_expired():
+            # A cached Session object must not extend a WebSocket credential
+            # beyond its database lifetime.  Remove both cache and row so a
+            # subsequent handshake cannot keep retrying the dead credential.
+            try:
+                SessionRepository.invalidate_cache(token)
+                SessionRepository.delete(session)
+            except Exception:
+                pass
+            return None
         if getattr(session.user_id, 'status', 'ACTIVE') != 'ACTIVE':
+            return None
+        if getattr(session.user_id, 'role', None) not in _STAFF_ROLES:
+            return None
+        # Defense in depth for legacy role drift.  Edition repos install the
+        # couriers app; the shared-only core safely falls back to the role path.
+        try:
+            from base.security.auth import is_courier_identity
+            if is_courier_identity(session.user_id):
+                return None
+        except Exception:
             return None
         return session.user_id
 
     def _handshake_token(self):
-        qs = parse_qs((self.scope.get('query_string') or b'').decode('utf-8', 'ignore'))
-        if qs.get('token'):
-            return qs['token'][0]
-        for key, val in (self.scope.get('headers') or []):
-            if key == b'authorization' and val.startswith(b'Bearer '):
-                return val[7:].decode('utf-8', 'ignore')
-        return None
+        try:
+            token, _source = resolve_websocket_session_credential(self.scope)
+        except SessionCredentialConflict:
+            return None
+        return token
 
 
 class OrderQueueConsumer(_GroupConsumer):

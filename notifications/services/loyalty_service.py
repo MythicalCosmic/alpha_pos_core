@@ -17,6 +17,7 @@ Design notes:
 import logging
 
 from django.db import IntegrityError, transaction
+from base.services.phone import normalize_uz_phone
 
 from notifications.models import (
     LoyaltyAccount, LoyaltyRedemption, LoyaltySettings, OrderLoyaltyCredit,
@@ -26,17 +27,8 @@ logger = logging.getLogger(__name__)
 
 
 def _normalize_phone(phone):
-    """Strip whitespace and a single leading '+' for the lookup key.
-
-    Telegram returns "998901234567" with no '+'; cashiers often type
-    "+998…". We store the digits-only form so both sides agree.
-    """
-    if not phone:
-        return ''
-    phone = phone.strip()
-    if phone.startswith('+'):
-        phone = phone[1:]
-    return phone[:20]
+    """Use the same normalized phone identity as ``base.Customer``."""
+    return normalize_uz_phone(phone)
 
 
 def maybe_accrue(order):

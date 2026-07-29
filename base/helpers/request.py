@@ -1,19 +1,34 @@
+import hmac
 import json
 from django.conf import settings
 
 
-def coerce_quantity(value, default=None):
-    """Coerce a JSON order quantity to a positive int, or None if invalid.
+SESSION_CREDENTIAL_CONFLICT_CODE = "session_credential_conflict"
+SESSION_CREDENTIAL_CONFLICT_MESSAGE = (
+    "Conflicting session credentials. Remove one credential or log out and "
+    "try again."
+)
 
-    Order-item views did `if not quantity or quantity <= 0` on the raw JSON
-    value, so a string like "5" sailed past `not "5"` and then raised
-    TypeError on `"5" <= 0` — surfacing as a 500 instead of a clean 422.
-    This accepts ints and integer-valued numeric strings/floats, and rejects
-    bools, non-numeric strings, fractional floats, and anything <= 0.
+
+class SessionCredentialConflict(ValueError):
+    """Raised when cookie and Bearer credentials disagree.
+
+    Deliberately carries no credential values.  Raw session tokens must never
+    be copied into exceptions, logs, or API responses.
     """
+
+    code = SESSION_CREDENTIAL_CONFLICT_CODE
+    public_message = SESSION_CREDENTIAL_CONFLICT_MESSAGE
+
+    def __init__(self):
+        super().__init__(self.public_message)
+
+
+def coerce_quantity(value, default=None):
+    """Return a positive integer quantity, or ``None`` for invalid input."""
     if value is None:
         value = default
-    if isinstance(value, bool):  # bool is a subclass of int — reject explicitly
+    if isinstance(value, bool):
         return None
     if isinstance(value, int):
         return value if value > 0 else None
@@ -21,7 +36,7 @@ def coerce_quantity(value, default=None):
         return int(value) if value.is_integer() and value > 0 else None
     if isinstance(value, str):
         s = value.strip()
-        if s.isdigit():  # only non-negative integer literals
+        if s.isascii() and s.isdecimal():
             n = int(s)
             return n if n > 0 else None
         return None
@@ -42,14 +57,50 @@ def get_user_agent(request):
     return ua[:256]
 
 
-def get_session_key(request):
-    key = request.COOKIES.get('session_key')
-    if key:
-        return key
+def _bearer_session_key(request):
+    """Extract a Bearer credential without treating other schemes as sessions."""
     auth = request.META.get('HTTP_AUTHORIZATION', '')
-    if auth.startswith('Bearer '):
-        return auth[7:]
-    return None
+    if not isinstance(auth, str):
+        return None
+    scheme, separator, value = auth.partition(' ')
+    if not separator or scheme.lower() != 'bearer':
+        return None
+    return value.strip() or None
+
+
+def resolve_session_credential(request):
+    """Return ``(session_key, source)`` for the request.
+
+    ``source`` is one of ``cookie``, ``bearer`` or ``cookie+bearer``.  A
+    request carrying both forms is accepted only when they are identical.
+    Previously the cookie silently won, so a stale browser cookie could
+    authenticate a different account than the Authorization header displayed
+    by the client.  Differing credentials now fail closed before either token
+    is looked up.
+    """
+    cookie_key = request.COOKIES.get('session_key')
+    cookie_key = cookie_key if isinstance(cookie_key, str) and cookie_key else None
+    bearer_key = _bearer_session_key(request)
+
+    if cookie_key and bearer_key:
+        # compare_digest(str, str) rejects non-ASCII input with TypeError.
+        # Encode defensively so a malformed attacker-controlled header/cookie
+        # still gets the stable 401 path instead of producing a 500.
+        cookie_bytes = cookie_key.encode('utf-8', errors='surrogatepass')
+        bearer_bytes = bearer_key.encode('utf-8', errors='surrogatepass')
+        if not hmac.compare_digest(cookie_bytes, bearer_bytes):
+            raise SessionCredentialConflict()
+        return cookie_key, 'cookie+bearer'
+    if cookie_key:
+        return cookie_key, 'cookie'
+    if bearer_key:
+        return bearer_key, 'bearer'
+    return None, None
+
+
+def get_session_key(request):
+    session_key, _source = resolve_session_credential(request)
+    return session_key
 
 
 def validate_pagination(request, default_per_page=20):
