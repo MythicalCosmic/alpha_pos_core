@@ -68,6 +68,7 @@ def _closed_shift(*, with_expense=False):
         notes='immutable close',
         actor=cashier,
         counted={'CASH': '127.00'},
+        terminal_origin=True,
     )
     assert status == 200, response
     shift.refresh_from_db()

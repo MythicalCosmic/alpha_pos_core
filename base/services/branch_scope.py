@@ -21,6 +21,7 @@ def resolve_actor_branch(actor=None):
     """
 
     actor_branch = str(getattr(actor, "branch_id", "") or "").strip()
+    actor_branch_key = actor_branch.lower()
     deployment_mode = str(
         getattr(settings, "DEPLOYMENT_MODE", "local") or "local"
     ).strip().lower()
@@ -28,13 +29,13 @@ def resolve_actor_branch(actor=None):
 
     global_markers = {"", "cloud"}
     if deployment_mode != "cloud":
-        if actor_branch.lower() in global_markers:
+        if actor_branch_key in global_markers:
             return node_branch or None
         return actor_branch
 
     if node_branch:
-        global_markers.add(node_branch)
-    if actor_branch not in global_markers:
+        global_markers.add(node_branch.lower())
+    if actor_branch_key not in global_markers:
         return actor_branch
 
     configured = str(

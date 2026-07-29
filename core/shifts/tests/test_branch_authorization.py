@@ -44,6 +44,20 @@ def test_local_global_identity_resolves_to_bound_node_branch(identity_branch):
     assert resolve_actor_branch(actor) == 'branch-a'
 
 
+@pytest.mark.parametrize('identity_branch', ['cloud', 'CLOUD'])
+@override_settings(
+    DEPLOYMENT_MODE='cloud',
+    BRANCH_ID='cloud',
+    CLOUD_DEFAULT_TARGET_BRANCH_ID='branch-a',
+)
+def test_cloud_global_identity_resolves_case_insensitively(identity_branch):
+    from base.services.branch_scope import resolve_actor_branch
+
+    actor = SimpleNamespace(branch_id=identity_branch)
+
+    assert resolve_actor_branch(actor) == 'branch-a'
+
+
 @override_settings(DEPLOYMENT_MODE='local', BRANCH_ID='branch-a')
 def test_local_concrete_foreign_identity_does_not_resolve_to_node_branch():
     from base.services.branch_scope import resolve_actor_branch
@@ -105,6 +119,46 @@ def test_branch_manager_cannot_read_end_or_start_another_branch_shift():
         foreign_cashier.id, actor=manager, branch_id='branch-b',
     )
     assert status == 403
+
+
+@override_settings(
+    DEPLOYMENT_MODE='cloud',
+    BRANCH_ID='cloud',
+    CLOUD_DEFAULT_TARGET_BRANCH_ID='branch-a',
+)
+def test_cloud_actor_cannot_close_terminal_eligible_shift_snapshot():
+    from base.models import Shift
+    from core.shifts.service import ShiftService
+
+    admin = _staff(branch='cloud', role='ADMIN')
+    cashier = _staff(branch='cloud', role='CASHIER')
+    shift = _shift(cashier, branch='branch-a')
+    Shift.objects.filter(pk=shift.pk).update(
+        treasury_settlement_eligible=True,
+        device_id='source-terminal',
+    )
+    shift.refresh_from_db()
+
+    result, status = ShiftService.end_shift(
+        shift.id,
+        admin.id,
+        'cloud snapshot close',
+        actor=admin,
+        counted={
+            'CASH': '0',
+            'UZCARD': '0',
+            'HUMO': '0',
+            'CARD': '0',
+            'PAYME': '0',
+        },
+        terminal_origin=False,
+    )
+
+    assert status == 409, result
+    assert result['code'] == 'terminal_close_required'
+    shift.refresh_from_db()
+    assert shift.status == 'ACTIVE'
+    assert shift.settlement_manifest == {}
 
 
 @override_settings(DEPLOYMENT_MODE='cloud', BRANCH_ID='cloud')

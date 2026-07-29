@@ -94,6 +94,56 @@ def _nonnegative_money(value):
     return amount if amount is not None and amount >= 0 else None
 
 
+def _normalize_counted_tenders(counted, *, require_complete):
+    from cashbox.models import PAYMENT_METHODS
+
+    supported = tuple(str(method).upper() for method in PAYMENT_METHODS)
+    if counted is None:
+        if require_complete:
+            return None, (
+                'counted_required',
+                'Manager-assisted shift close requires a count for every '
+                f'tender: {", ".join(supported)}.',
+            )
+        return {}, None
+    if not isinstance(counted, dict):
+        return None, (
+            'counted_invalid',
+            'Tender counts must be an object keyed by payment method.',
+        )
+
+    normalized = {}
+    for raw_method, raw_amount in counted.items():
+        method = str(raw_method or '').strip().upper()
+        if method not in supported:
+            return None, (
+                'counted_invalid',
+                f'Unsupported tender count method: {method or "(blank)"}.',
+            )
+        if method in normalized:
+            return None, (
+                'counted_invalid',
+                f'Duplicate tender count method: {method}.',
+            )
+        amount = _nonnegative_money(raw_amount)
+        if amount is None:
+            return None, (
+                'counted_invalid',
+                f'{method} count must be a finite nonnegative money amount.',
+            )
+        normalized[method] = amount
+
+    if require_complete:
+        missing = [method for method in supported if method not in normalized]
+        if missing:
+            return None, (
+                'counted_required',
+                'Manager-assisted shift close is missing tender counts for: '
+                f'{", ".join(missing)}.',
+            )
+    return normalized, None
+
+
 def _is_global_admin(actor):
     role = str(getattr(actor, 'role', '') or '').upper()
     branch = str(getattr(actor, 'branch_id', '') or '').strip().lower()
@@ -1210,7 +1260,15 @@ class ShiftService:
 
     @staticmethod
     @transaction.atomic
-    def end_shift(shift_id, user_id, notes, actor=None, counted=None):
+    def end_shift(
+        shift_id,
+        user_id,
+        notes,
+        actor=None,
+        counted=None,
+        require_complete_counted=False,
+        terminal_origin=False,
+    ):
         # Row-lock the shift first so two concurrent end_shift calls can't
         # both pass the ACTIVE guard and double-write the final stats.
         try:
@@ -1226,6 +1284,37 @@ class ShiftService:
             )
         if shift.status != 'ACTIVE':
             return ServiceResponse.error("Shift is not active")
+
+        deployment_mode = str(
+            getattr(settings, 'DEPLOYMENT_MODE', 'local') or 'local'
+        ).strip().lower()
+        shift_branch = str(shift.branch_id or '').strip().lower()
+        if (
+            deployment_mode == 'cloud'
+            and shift.treasury_settlement_eligible
+            and shift_branch not in ('', 'cloud')
+            and not terminal_origin
+        ):
+            return {
+                'success': False,
+                'code': 'terminal_close_required',
+                'message': (
+                    'This restaurant shift must be closed on its source '
+                    'terminal so the complete settlement bundle can sync.'
+                ),
+            }, 409
+
+        counted, counted_error = _normalize_counted_tenders(
+            counted,
+            require_complete=require_complete_counted,
+        )
+        if counted_error:
+            code, message = counted_error
+            return {
+                'success': False,
+                'code': code,
+                'message': message,
+            }, 400
 
         now = timezone.now()
 
@@ -1316,17 +1405,13 @@ class ShiftService:
             with transaction.atomic():
                 from cashbox.services.drawer import expected_payment_totals
                 from cashbox.models import ShiftPaymentTotal
-                counted = counted if isinstance(counted, dict) else {}
                 cashier_counted_methods = set()
                 frozen_rows = []
                 for method, exp in expected_payment_totals(shift).items():
                     raw = counted.get(method)
-                    try:
-                        cnt = Decimal(str(raw)) if raw is not None else Decimal('0')
-                        if raw is not None:
-                            cashier_counted_methods.add(method)
-                    except (InvalidOperation, TypeError, ValueError):
-                        cnt = Decimal('0')
+                    cnt = raw if raw is not None else Decimal('0')
+                    if raw is not None:
+                        cashier_counted_methods.add(method)
                     row, _ = ShiftPaymentTotal.objects.update_or_create(
                         shift=shift, method=method,
                         defaults={'expected_amount': exp, 'counted_amount': cnt,
@@ -1831,14 +1916,27 @@ class ShiftService:
         return {"success": True, "message": "Success", "data": data}, 200
 
     @staticmethod
-    def end_active_for_user(user_id, notes='', counted=None, actor=None):
+    def end_active_for_user(
+        user_id,
+        notes='',
+        counted=None,
+        actor=None,
+        terminal_origin=False,
+    ):
         """End the caller's own active shift. 404 if they have none open. Threads
         the cashier's blind per-tender count (`counted`) through to end_shift so
         the ShiftPaymentTotal reconciliation rows are created on close."""
         shift = ShiftRepository.get_active_for_user(user_id)
         if not shift:
             return ServiceResponse.not_found("No active shift to end")
-        return ShiftService.end_shift(shift.id, user_id, notes, actor=actor, counted=counted)
+        return ShiftService.end_shift(
+            shift.id,
+            user_id,
+            notes,
+            actor=actor,
+            counted=counted,
+            terminal_origin=terminal_origin,
+        )
 
     @staticmethod
     def get_active_shifts(actor=None):

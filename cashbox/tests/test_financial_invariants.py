@@ -571,7 +571,12 @@ def test_end_shift_settlement_rows_inherit_shift_branch():
     )
 
     result, status = ShiftService.end_shift(
-        shift.id, user.id, notes='', actor=user, counted={'CASH': '0.00'},
+        shift.id,
+        user.id,
+        notes='',
+        actor=user,
+        counted={'CASH': '0.00'},
+        terminal_origin=True,
     )
 
     assert status == 200, result

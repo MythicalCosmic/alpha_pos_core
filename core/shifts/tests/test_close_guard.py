@@ -88,6 +88,47 @@ def test_zero_value_unpaid_order_does_not_block_close_or_reconciliation():
 
 
 @pytest.mark.django_db
+def test_manager_close_requires_every_tender_count():
+    u = _cashier('manager-counts-required@x.com')
+    s = _shift(u)
+
+    result, status = ShiftService.end_shift(
+        s.id,
+        u.id,
+        '',
+        actor=u,
+        counted={'CASH': '0'},
+        require_complete_counted=True,
+        terminal_origin=True,
+    )
+
+    assert status == 400, result
+    assert result['code'] == 'counted_required'
+    s.refresh_from_db()
+    assert s.status == 'ACTIVE'
+
+
+@pytest.mark.django_db
+def test_negative_tender_count_is_rejected_before_close():
+    u = _cashier('negative-count@x.com')
+    s = _shift(u)
+
+    result, status = ShiftService.end_shift(
+        s.id,
+        u.id,
+        '',
+        actor=u,
+        counted={'CASH': '-0.01'},
+        terminal_origin=True,
+    )
+
+    assert status == 400, result
+    assert result['code'] == 'counted_invalid'
+    s.refresh_from_db()
+    assert s.status == 'ACTIVE'
+
+
+@pytest.mark.django_db
 def test_paid_open_order_does_not_block_close():
     u = _cashier('g4@x.com')
     s = _shift(u)
