@@ -270,7 +270,7 @@ def test_openai_tool_loop_runs_function_calls(settings, monkeypatch):
     assert calls[0]['tools'][0]['type'] == 'function'
     assert calls[0]['tools'][0]['function']['name'] == 'list_orders'
     assert 'max_completion_tokens' in calls[0] and 'max_tokens' not in calls[0]
-    assert all(call['reasoning_effort'] == 'low' for call in calls)
+    assert all(call['reasoning_effort'] == 'none' for call in calls)
     # Second create() carried the tool result back as a role:'tool' message.
     assert any(m.get('role') == 'tool' and m.get('content') == '{"orders": 3}'
                for m in calls[1]['messages'])

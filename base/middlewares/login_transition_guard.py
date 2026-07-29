@@ -96,6 +96,8 @@ class LoginTransitionGuardMiddleware:
 
     def __call__(self, request):
         path = request.path.rstrip('/')
+        if request.method == 'POST' and path == '/auth-login':
+            return self.get_response(request)
         if request.method == 'POST' and path.endswith('/auth-login'):
             current_user, error_response = _valid_current_user(request)
             if error_response is not None:

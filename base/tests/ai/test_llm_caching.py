@@ -23,6 +23,11 @@ def test_openai_sampling_kwargs_reasoning_vs_classic(settings):
     luna = llm._openai_sampling_kwargs('gpt-5.6-luna')
     assert luna['reasoning_effort'] == 'low'
     assert 'temperature' not in luna
+    tool_luna = llm._openai_sampling_kwargs(
+        'gpt-5.6-luna',
+        for_tools=True,
+    )
+    assert tool_luna['reasoning_effort'] == 'none'
 
     reasoning = llm._openai_sampling_kwargs('gpt-5.4-mini')
     assert 'temperature' not in reasoning        # reasoning model rejects temperature

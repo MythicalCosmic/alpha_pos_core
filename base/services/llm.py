@@ -550,7 +550,7 @@ _OPENAI_EXTRAS = ('seed', 'prompt_cache_key', 'temperature')
 _openai_extras_ok = None
 
 
-def _openai_sampling_kwargs(model):
+def _openai_sampling_kwargs(model, *, for_tools=False):
     kw = {
         'seed': int(getattr(settings, 'OPENAI_SEED', 7)),
         'prompt_cache_key': 'alpha-pos-ai-assistant',
@@ -566,6 +566,8 @@ def _openai_sampling_kwargs(model):
                 effort,
             )
             effort = 'low'
+        if for_tools and model_name == 'gpt-5.6-luna':
+            effort = 'none'
         kw['reasoning_effort'] = effort
     if not model_name.startswith(('gpt-5', 'o1', 'o3', 'o4')):
         kw['temperature'] = float(getattr(settings, 'AI_TEMPERATURE', 0) or 0)
@@ -763,8 +765,12 @@ def _openai_tool_loop(prompt, system, tools, tool_executor, max_tokens,
     unresolved_tool_error = False
 
     def _create(include_tools):
-        kwargs = {'model': model, 'messages': messages, 'max_completion_tokens': ceiling,
-                  **_openai_sampling_kwargs(model)}
+        kwargs = {
+            'model': model,
+            'messages': messages,
+            'max_completion_tokens': ceiling,
+            **_openai_sampling_kwargs(model, for_tools=True),
+        }
         if include_tools:
             kwargs['tools'] = oai_tools
             if (

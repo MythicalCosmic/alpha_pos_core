@@ -289,6 +289,21 @@ def test_authenticated_browser_may_log_in_again_as_same_account(target_kind):
     assert json.loads(response.content) == {'reached_login': True}
 
 
+def test_root_pos_login_defers_account_switch_to_pin_verification():
+    current = _user('current-pos@example.com')
+    _session(current)
+
+    response = _through_login_guard(_request(
+        cookie=TOKEN_A,
+        method='post',
+        path='/auth-login',
+        data={'user_id': current.pk + 1000},
+    ))
+
+    assert response.status_code == 200
+    assert json.loads(response.content) == {'reached_login': True}
+
+
 def test_expired_browser_session_does_not_block_fresh_login():
     current = _user('expired@example.com')
     _session(current, expired=True)
