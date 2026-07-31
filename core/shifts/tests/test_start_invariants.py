@@ -82,7 +82,7 @@ def test_cashier_cannot_start_another_users_shift():
 @override_settings(
     DEPLOYMENT_MODE='local', BRANCH_ID='branch-a', DEVICE_ID='device-a',
 )
-def test_cashier_device_slot_blocks_second_cashier_but_allows_other_tills():
+def test_shared_terminal_allows_each_cashier_to_keep_an_active_shift():
     from base.models import Shift
     from core.shifts.service import ShiftService
 
@@ -95,12 +95,16 @@ def test_cashier_device_slot_blocks_second_cashier_but_allows_other_tills():
     assert result['data']['device_id'] == 'device-a'
 
     result, status = ShiftService.start_shift(same_till.id, actor=same_till)
-    assert status == 400, result
-    assert result['message'] == 'This terminal already has an active cashier shift'
+    assert status == 201, result
+    assert result['data']['device_id'] == 'device-a'
 
     with override_settings(DEVICE_ID='device-b'):
         result, status = ShiftService.start_shift(other_till.id, actor=other_till)
     assert status == 201, result
+    assert Shift.objects.filter(
+        status=Shift.Status.ACTIVE,
+        end_time__isnull=True,
+    ).count() == 3
     assert Shift.objects.get(user=other_till).device_id == 'device-b'
 
 
@@ -202,29 +206,63 @@ def test_cashier_can_close_legacy_or_other_installation_shift(
     assert legacy.end_time is not None
 
 
-def test_database_device_constraint_and_blank_legacy_lane():
+def test_database_allows_multiple_users_on_one_device_but_not_duplicate_user_shifts():
     from base.models import Shift
 
     first = _staff(branch='branch-a')
     second = _staff(branch='branch-a')
     now = timezone.now()
 
-    # Migration 0054 deliberately leaves legacy ACTIVE rows blank. Multiple
-    # unknown-device rows can finish normally because ownership cannot be
-    # reconstructed safely after the fact.
     Shift.objects.create(
         user=first, status=Shift.Status.ACTIVE, start_time=now,
-        branch_id='branch-a', device_id='',
+        branch_id='branch-a', device_id='device-a',
     )
     Shift.objects.create(
         user=second, status=Shift.Status.ACTIVE,
-        start_time=now + timedelta(seconds=1), branch_id='branch-a', device_id='',
+        start_time=now + timedelta(seconds=1),
+        branch_id='branch-a',
+        device_id='device-a',
     )
 
-    Shift.objects.filter(user=first).update(device_id='device-a')
     with pytest.raises(IntegrityError):
         with transaction.atomic():
-            Shift.objects.filter(user=second).update(device_id='device-a')
+            Shift.objects.create(
+                user=first,
+                status=Shift.Status.ACTIVE,
+                start_time=now + timedelta(seconds=2),
+                branch_id='branch-a',
+                device_id='device-a',
+            )
+
+
+@override_settings(
+    DEPLOYMENT_MODE='local', BRANCH_ID='branch-a', DEVICE_ID='device-a',
+)
+def test_ensure_active_shift_creates_once_then_resumes_same_row():
+    from base.models import Shift
+    from core.shifts.service import ShiftService
+
+    cashier = _staff(branch='branch-a')
+
+    created, created_status = ShiftService.ensure_active_shift(
+        cashier.id,
+        actor=cashier,
+    )
+    resumed, resumed_status = ShiftService.ensure_active_shift(
+        cashier.id,
+        actor=cashier,
+    )
+
+    assert created_status == 201, created
+    assert created['data']['resumed'] is False
+    assert resumed_status == 200, resumed
+    assert resumed['data']['resumed'] is True
+    assert resumed['data']['id'] == created['data']['id']
+    assert Shift.objects.filter(
+        user=cashier,
+        status=Shift.Status.ACTIVE,
+        end_time__isnull=True,
+    ).count() == 1
 
 
 @override_settings(DEPLOYMENT_MODE='cloud', BRANCH_ID='cloud')

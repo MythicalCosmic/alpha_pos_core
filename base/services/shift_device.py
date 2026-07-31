@@ -47,10 +47,10 @@ def cashier_shift_device_error(user, shift):
     """Return why ``shift`` cannot settle cashier money on this process.
 
     Cloud administration and non-cashier staff intentionally keep their
-    existing semantics.  A local CASHIER must have the one ACTIVE shift owned
-    by this exact desktop installation.  Blank legacy ownership and another
-    installation's identity are both denied with the same recovery instruction
-    so callers expose a stable API contract.
+    existing semantics. A local CASHIER must have their ACTIVE shift owned by
+    this exact desktop installation. Authenticated login may claim a blank
+    legacy shift before this guard is used; another installation's identity is
+    always denied.
     """
     role = str(getattr(user, 'role', '') or '').upper()
     if (

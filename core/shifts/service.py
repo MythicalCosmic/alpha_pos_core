@@ -1094,7 +1094,13 @@ class ShiftService:
 
     @staticmethod
     @transaction.atomic
-    def start_shift(user_id, shift_template_id=None, actor=None, branch_id=None):
+    def start_shift(
+        user_id,
+        shift_template_id=None,
+        actor=None,
+        branch_id=None,
+        reuse_existing=False,
+    ):
         # The user row is the serialization point for concurrent starts. The
         # partial unique constraint remains the definitive cross-process guard
         # (and protects writers that bypass this service).
@@ -1175,9 +1181,9 @@ class ShiftService:
         from base.services.accounting_cursor import lock_branch_accounting
         lock_branch_accounting(operational_branch)
 
-        # Managers/admins/waiters do not own the till's exclusive cashier slot.
-        # A local CASHIER does, and upgraded code must never create another
-        # anonymous legacy shift when installation identity is missing.
+        # Cashier shifts retain terminal provenance so settlement cannot move
+        # to another installation. A shared till may keep one live shift per
+        # cashier; managers/admins/waiters remain outside device ownership.
         from base.services.shift_device import (
             cashier_shift_device_error,
             terminal_device_id,
@@ -1197,27 +1203,31 @@ class ShiftService:
             end_time__isnull=True,
         ).first()
         if active:
+            if (
+                reuse_existing
+                and user.role == User.RoleChoices.CASHIER
+                and mode != 'cloud'
+                and not str(active.device_id or '').strip()
+            ):
+                active.device_id = device_id
+                active.save(update_fields=['device_id'])
             device_error = cashier_shift_device_error(user, active)
             if device_error:
                 return ServiceResponse.error(device_error)
+            if reuse_existing:
+                active = ShiftRepository.get_with_relations(active.id)
+                data = ShiftService._serialize_shift(active)
+                data['resumed'] = True
+                return ServiceResponse.success(
+                    data=data,
+                    message='Active shift resumed',
+                )
             return ServiceResponse.error("User already has an active shift")
 
         # DEVICE_ID is minted once per desktop install and is already used by
-        # sync presence. Persist it only for CASHIER shifts: managers, admins,
-        # and waiters may work alongside the cashier on the same physical till
-        # without taking its exclusive cash-drawer slot. Cloud-created shifts
-        # stay blank; pre-upgrade blank rows may close but cannot settle new
-        # cashier money after upgraded local code starts.
-        if device_id and Shift.objects.filter(
-            is_deleted=False,
-            device_id=device_id,
-            status=Shift.Status.ACTIVE,
-            end_time__isnull=True,
-        ).exists():
-            return ServiceResponse.error(
-                'This terminal already has an active cashier shift',
-            )
-
+        # sync presence. Persist it only for CASHIER shifts. Managers, admins,
+        # and waiters keep non-device semantics. A blank pre-upgrade shift can
+        # only be claimed by its authenticated cashier through ensure_active_shift.
         kwargs = {
             'user_id': user_id,
             'start_time': timezone.now(),
@@ -1241,22 +1251,45 @@ class ShiftService:
             with transaction.atomic():
                 shift = ShiftRepository.create(**kwargs)
         except IntegrityError:
-            # Different users lock different User rows. The conditional device
-            # unique constraint is therefore the definitive concurrent-start
-            # guard; re-read after the savepoint rollback to return the useful
-            # error rather than misreporting it as a per-user duplicate.
-            if device_id and Shift.objects.filter(
-                is_deleted=False,
-                device_id=device_id,
-                status=Shift.Status.ACTIVE,
-                end_time__isnull=True,
-            ).exists():
-                return ServiceResponse.error(
-                    'This terminal already has an active cashier shift',
-                )
+            if reuse_existing:
+                active = Shift.objects.filter(
+                    is_deleted=False,
+                    user=user,
+                    status=Shift.Status.ACTIVE,
+                    end_time__isnull=True,
+                ).first()
+                if active:
+                    device_error = cashier_shift_device_error(user, active)
+                    if device_error:
+                        return ServiceResponse.error(device_error)
+                    active = ShiftRepository.get_with_relations(active.id)
+                    data = ShiftService._serialize_shift(active)
+                    data['resumed'] = True
+                    return ServiceResponse.success(
+                        data=data,
+                        message='Active shift resumed',
+                    )
             return ServiceResponse.error('User already has an active shift')
         shift = ShiftRepository.get_with_relations(shift.id)
-        return ServiceResponse.created(data=ShiftService._serialize_shift(shift))
+        data = ShiftService._serialize_shift(shift)
+        if reuse_existing:
+            data['resumed'] = False
+        return ServiceResponse.created(data=data)
+
+    @staticmethod
+    def ensure_active_shift(
+        user_id,
+        shift_template_id=None,
+        actor=None,
+        branch_id=None,
+    ):
+        return ShiftService.start_shift(
+            user_id=user_id,
+            shift_template_id=shift_template_id,
+            actor=actor,
+            branch_id=branch_id,
+            reuse_existing=True,
+        )
 
     @staticmethod
     @transaction.atomic

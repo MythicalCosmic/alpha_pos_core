@@ -2438,11 +2438,9 @@ class Shift(SyncMixin, models.Model):
     cash_collected = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     notes = models.TextField(blank=True, default='')
     # Stable install identity for CASHIER shifts opened by an upgraded till.
-    # Non-cashier and cloud shifts deliberately keep this blank so a
-    # manager/waiter can work on the same till. Pre-upgrade blank cashier shifts
-    # may still close, but upgraded settlement code rejects them for new money
-    # writes. The conditional unique constraint below makes the non-empty value
-    # the exclusive live cashier slot for that physical device.
+    # It proves which installation may settle the shift. Multiple cashiers may
+    # keep their own long-lived shifts on a shared till; per-user uniqueness
+    # prevents duplicate live shifts for the same cashier.
     device_id = models.CharField(max_length=128, blank=True, default='')
     # Rollout eligibility for the reconciliation->SAFE lifecycle. Migration
     # 0048 leaves every already-ended historical shift false because its money
@@ -2484,16 +2482,6 @@ class Shift(SyncMixin, models.Model):
                     & models.Q(end_time__isnull=True)
                 ),
                 name='uniq_live_active_shift_per_user',
-            ),
-            models.UniqueConstraint(
-                fields=['device_id'],
-                condition=(
-                    models.Q(is_deleted=False)
-                    & models.Q(status='ACTIVE')
-                    & models.Q(end_time__isnull=True)
-                    & ~models.Q(device_id='')
-                ),
-                name='uniq_live_shift_per_device',
             ),
         ]
 
