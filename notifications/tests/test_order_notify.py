@@ -873,7 +873,12 @@ def test_polished_ready_template_renders_complete_replacement_card(
         'display_id': 42,
         'cashier_name': 'Dilnoza',
         'order_type': 'Zalda',
-        'prep_time': '12:34',
+        'prep_time': '🟢 12:34 · me\'yor 15–20 daqiqa · VAQTIDA',
+        'prep_elapsed': '12:34',
+        'prep_target': '15–20 daqiqa',
+        'prep_status_icon': '🟢',
+        'prep_status_label': 'VAQTIDA',
+        'prep_status_level': 'ON_TIME',
         'total_amount': '296,000',
         'items_list': '  • Osh x2 — 296,000 so\'m',
         'accepted_at': '2026-07-26 14:01:00',
@@ -888,10 +893,11 @@ def test_polished_ready_template_renders_complete_replacement_card(
         42,
         'edit',
     )
-    assert '✅ <b>BUYURTMA TAYYOR</b>' in text
+    assert '🟢 <b>BUYURTMA TAYYOR · VAQTIDA</b>' in text
     assert '2026-07-26 14:01:00' in text
     assert '2026-07-26 14:13:34' in text
     assert '12:34' in text
+    assert '15–20 daqiqa' in text
     assert 'Dilnoza' in text
     assert '296,000' in text
     assert 'Ruxsora' in text

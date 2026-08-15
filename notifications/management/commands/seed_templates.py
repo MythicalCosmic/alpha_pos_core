@@ -34,17 +34,19 @@ TEMPLATES = [
         'description': (
             "Buyurtma tayyor bo'lganda avvalgi xabarning o'zi shu matn bilan "
             "yangilanadi; yangi xabar yuborilmaydi. O'zgaruvchilar: {display_id} "
-            '{cashier_name} {order_type} {prep_time} {total_amount} {items_list} '
-            '{accepted_at} {ready_at} {time} {brand}'
+            '{cashier_name} {order_type} {prep_time} {prep_elapsed} {prep_target} '
+            '{prep_status_icon} {prep_status_label} {prep_status_level} '
+            '{total_amount} {items_list} {accepted_at} {ready_at} {time} {brand}'
         ),
         'template_text': (
-            '✅ <b>BUYURTMA TAYYOR</b>\n'
+            '{prep_status_icon} <b>BUYURTMA TAYYOR · {prep_status_label}</b>\n'
             '<b>#{display_id}</b> · {order_type}\n'
             '━━━━━━━━━━━━━━━━━━\n'
             '👤 <b>Kassir:</b> {cashier_name}\n'
             '🕐 <b>Qabul qilindi:</b> {accepted_at}\n'
             "✅ <b>Tayyor bo'ldi:</b> {ready_at}\n"
-            '⏱ <b>Tayyorlash vaqti:</b> {prep_time}\n'
+            '⏱ <b>Tayyorlash vaqti:</b> {prep_elapsed}\n'
+            "🎯 <b>Me'yor:</b> {prep_target}\n"
             '\n'
             '🛒 <b>BUYURTMA TARKIBI</b>\n'
             '{items_list}\n'

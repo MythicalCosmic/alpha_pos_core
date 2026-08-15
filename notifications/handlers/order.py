@@ -15,6 +15,10 @@ from django.conf import settings
 
 from notifications.services.sender_service import SenderService
 from notifications.helpers import format_datetime, format_money, format_prep_time
+from notifications.preparation import (
+    classify_preparation,
+    preparation_target_for_order,
+)
 
 ORDER_TYPE_LABELS = {
     'HALL': 'Zalda',
@@ -134,11 +138,35 @@ class OrderNotification:
         except Order.DoesNotExist:
             return False
 
+        prep_elapsed = '—'
         prep_time = '—'
+        prep_target = 'Belgilanmagan'
+        prep_status_icon = '✅'
+        prep_status_label = 'TAYYOR'
+        prep_status_level = 'UNTRACKED'
         if order.ready_at and order.created_at:
             seconds = (order.ready_at - order.created_at).total_seconds()
             if seconds >= 0:
-                prep_time = '0:00' if seconds == 0 else format_prep_time(seconds)
+                prep_elapsed = '0:00' if seconds == 0 else format_prep_time(seconds)
+                prep_time = prep_elapsed
+                product_names = order.items.filter(
+                    is_deleted=False,
+                    product_id__isnull=False,
+                ).values_list('product__name', flat=True)
+                target = preparation_target_for_order(product_names)
+                if target is not None:
+                    performance = classify_preparation(seconds, target)
+                    prep_target = target.display
+                    prep_status_icon = performance.icon
+                    prep_status_label = performance.label
+                    prep_status_level = performance.key
+                    # Legacy/operator-customized templates generally only use
+                    # {prep_time}. Keep the new color and target visible there
+                    # too, while exposing individual fields to the new default.
+                    prep_time = (
+                        f'{performance.icon} {prep_elapsed} · '
+                        f"me'yor {target.display} · {performance.label}"
+                    )
 
         accepted_at = _format_timestamp(order.created_at)
         ready_at = _format_timestamp(order.ready_at)
@@ -148,6 +176,11 @@ class OrderNotification:
             'cashier_name': _cashier_name(order),
             'order_type': ORDER_TYPE_LABELS.get(order.order_type, order.order_type),
             'prep_time': prep_time,
+            'prep_elapsed': prep_elapsed,
+            'prep_target': prep_target,
+            'prep_status_icon': prep_status_icon,
+            'prep_status_label': prep_status_label,
+            'prep_status_level': prep_status_level,
             'total_amount': format_money(order.total_amount),
             'items_list': _items_list(order),
             'accepted_at': accepted_at,
