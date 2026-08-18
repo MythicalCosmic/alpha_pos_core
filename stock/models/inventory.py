@@ -186,6 +186,14 @@ class StockTransaction(SyncMixin, models.Model):
         blank=True,
         related_name="stock_transactions",
     )
+    order_item = models.ForeignKey(
+        "base.OrderItem",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="stock_transactions",
+        help_text="Exact sold line that caused this movement, when available.",
+    )
     production_order = models.ForeignKey(
         "ProductionOrder",
         on_delete=models.SET_NULL,
@@ -226,6 +234,9 @@ class StockTransaction(SyncMixin, models.Model):
         data['batch_uuid'] = str(self.batch.uuid) if self.batch else None
         data['unit_uuid'] = str(self.unit.uuid) if self.unit else None
         data['order_uuid'] = str(self.order.uuid) if self.order else None
+        data['order_item_uuid'] = (
+            str(self.order_item.uuid) if self.order_item else None
+        )
         data['production_order_uuid'] = str(self.production_order.uuid) if self.production_order else None
         data['transfer_uuid'] = str(self.transfer.uuid) if self.transfer else None
         data['user_uuid'] = str(self.user.uuid) if self.user else None

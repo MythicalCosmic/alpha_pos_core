@@ -52,7 +52,10 @@ def cashbox_categories(request):
     if error:
         return json_response(error)
     result, status_code = CashboxCategoryService.create(
-        name=data.get("name", ""), sort_order=data.get("sort_order", 0))
+        name=data.get("name", ""),
+        sort_order=data.get("sort_order", 0),
+        reporting_group=data.get("reporting_group", "REVIEW"),
+    )
     return JsonResponse(result, status=status_code)
 
 

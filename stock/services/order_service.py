@@ -59,12 +59,14 @@ class OrderStockService:
 
         for order_item in order_items:
             product_id = order_item["product_id"]
+            order_item_id = order_item.get("order_item_id")
             quantity = to_decimal(order_item.get("quantity", 1))
             modifiers = order_item.get("modifiers", [])
 
             result, status = cls._deduct_for_product(
                 order_id=order_id,
                 product_id=product_id,
+                order_item_id=order_item_id,
                 quantity=quantity,
                 modifiers=modifiers,
                 location_id=location_id,
@@ -102,6 +104,7 @@ class OrderStockService:
     def _deduct_for_product(cls,
                             order_id: int,
                             product_id: int,
+                            order_item_id: int,
                             quantity: Decimal,
                             modifiers: List[Dict],
                             location_id: int,
@@ -124,6 +127,7 @@ class OrderStockService:
                 user_id=user_id,
                 unit_id=item.get("unit_id"),
                 order_id=order_id,
+                order_item_id=order_item_id,
                 notes=f"Order #{order_id} - Product #{product_id}"
             )
 
@@ -200,7 +204,9 @@ class OrderStockService:
                 movement_type="RETURN_FROM_CUSTOMER",
                 user_id=user_id,
                 batch_id=trans.batch_id,
+                unit_cost=trans.unit_cost,
                 order_id=order_id,
+                order_item_id=trans.order_item_id,
                 reference_type=cls.ORDER_REVERSAL_REF,
                 reference_id=order_id,
                 notes=f"Reversal: {reason}"
@@ -415,7 +421,9 @@ class OrderStockService:
                                product_id: int,
                                quantity_delta: int,
                                location_id: int,
-                               user_id: int) -> Tuple[Dict[str, Any], int]:
+                               user_id: int,
+                               order_item_id: int = None,
+                               ) -> Tuple[Dict[str, Any], int]:
         """
         Adjust stock when items change in an order that already had stock deducted.
         quantity_delta > 0: more items added/increased -> deduct more stock
@@ -469,6 +477,7 @@ class OrderStockService:
                     user_id=user_id,
                     unit_id=item.get("unit_id"),
                     order_id=order_id,
+                    order_item_id=order_item_id,
                     notes=f"Item added/increased in order #{order_id} - Product #{product_id}"
                 )
             else:
@@ -480,6 +489,7 @@ class OrderStockService:
                     user_id=user_id,
                     unit_id=item.get("unit_id"),
                     order_id=order_id,
+                    order_item_id=order_item_id,
                     notes=f"Item removed/decreased in order #{order_id} - Product #{product_id}"
                 )
 

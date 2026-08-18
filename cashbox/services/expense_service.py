@@ -10,6 +10,7 @@ from django.conf import settings
 from django.db import transaction
 
 from base.helpers.response import ServiceResponse
+from base.financial import EXPENSE_REPORTING_GROUPS, FinancialReportingGroup
 from base.models import Inkassa, Shift
 from base.repositories import CashRegisterRepository
 from cashbox.models import CashboxExpense, CashboxExpenseCategory
@@ -273,11 +274,31 @@ class CashboxCategoryService:
     def list():
         rows = CashboxExpenseCategory.objects.filter(is_deleted=False, is_active=True)
         return ServiceResponse.success(data=[
-            {'id': c.id, 'name': c.name, 'sort_order': c.sort_order} for c in rows])
+            {
+                'id': c.id,
+                'name': c.name,
+                'sort_order': c.sort_order,
+                'reporting_group': c.reporting_group,
+            }
+            for c in rows
+        ])
 
     @staticmethod
-    def create(name, sort_order=0):
+    def create(name, sort_order=0,
+               reporting_group=FinancialReportingGroup.REVIEW):
         if not (name or '').strip():
             return ServiceResponse.validation_error(errors={'name': 'Name is required'})
-        c = CashboxExpenseCategory.objects.create(name=name.strip(), sort_order=sort_order or 0)
-        return ServiceResponse.created(data={'id': c.id, 'name': c.name})
+        if reporting_group not in EXPENSE_REPORTING_GROUPS:
+            return ServiceResponse.validation_error(errors={
+                'reporting_group': 'Invalid financial reporting group',
+            })
+        c = CashboxExpenseCategory.objects.create(
+            name=name.strip(),
+            sort_order=sort_order or 0,
+            reporting_group=reporting_group,
+        )
+        return ServiceResponse.created(data={
+            'id': c.id,
+            'name': c.name,
+            'reporting_group': c.reporting_group,
+        })

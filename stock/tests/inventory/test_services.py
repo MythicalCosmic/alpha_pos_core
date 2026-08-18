@@ -267,7 +267,7 @@ class TestComponentModifierStockIntegrity:
     def test_deduct_and_cancel_reverse_only_components_actually_consumed(
         self, base_unit, stock_item, location, stock_enabled, admin_user,
     ):
-        from base.models import Order
+        from base.models import Order, OrderItem
         from stock.models import StockTransaction
         from stock.repositories import StockLevelRepository
         from stock.services.order_service import OrderStockService
@@ -288,8 +288,12 @@ class TestComponentModifierStockIntegrity:
         order = Order.objects.create(
             user=admin_user, cashier=admin_user, status='PREPARING',
         )
+        order_item = OrderItem.objects.create(
+            order=order, product=product, quantity=2, price=product.price,
+        )
         order_items = [{
             'product_id': product.id,
+            'order_item_id': order_item.id,
             'quantity': 2,
             'modifiers': [
                 {'component_id': default.id, 'action': 'REMOVE'},
@@ -312,6 +316,11 @@ class TestComponentModifierStockIntegrity:
         )
         assert sold.count() == 1
         assert sold.get().stock_item_id == extra_item.id
+        assert sold.get().order_item_id == order_item.id
+        assert sold.get().to_sync_dict()['order_item_uuid'] == str(order_item.uuid)
+        original_total_cost = sold.get().total_cost
+        extra_item.avg_cost_price = Decimal('999')
+        extra_item.save(update_fields=['avg_cost_price'])
 
         result, status = OrderStockService.reverse_deduction(
             order.id, admin_user.id,
@@ -321,6 +330,11 @@ class TestComponentModifierStockIntegrity:
         extra_level.refresh_from_db()
         assert default_level.quantity == Decimal('10')
         assert extra_level.quantity == Decimal('10')
+        returned = StockTransaction.objects.get(
+            order=order, movement_type='RETURN_FROM_CUSTOMER',
+        )
+        assert returned.order_item_id == order_item.id
+        assert returned.total_cost == original_total_cost
 
 
 class TestDocumentNumberAllocation:

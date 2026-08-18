@@ -18,6 +18,7 @@ from decimal import Decimal, InvalidOperation
 
 from django.db import models
 
+from base.financial import FinancialReportingGroup
 from base.models import SyncMixin, SyncManager
 
 
@@ -135,6 +136,12 @@ class CashboxExpenseCategory(SyncMixin, models.Model):
     name = models.CharField(max_length=100)
     is_active = models.BooleanField(default=True)
     sort_order = models.IntegerField(default=0)
+    reporting_group = models.CharField(
+        max_length=32,
+        choices=FinancialReportingGroup.choices,
+        default=FinancialReportingGroup.REVIEW,
+        db_index=True,
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

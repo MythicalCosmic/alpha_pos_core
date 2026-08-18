@@ -5,6 +5,7 @@ from django.db.models import Count, Q
 from django.core.paginator import Paginator
 
 from base.helpers.response import ServiceResponse
+from base.financial import EXPENSE_REPORTING_GROUPS, FinancialReportingGroup
 from hr.models import ExpenseCategory
 from hr.repositories import ExpenseCategoryRepository
 
@@ -31,6 +32,7 @@ class ExpenseCategoryService:
             "description": category.description,
             "budget_limit": str(category.budget_limit) if category.budget_limit is not None else None,
             "is_active": category.is_active,
+            "reporting_group": category.reporting_group,
             "expense_count": getattr(category, "expense_count", 0),
             "created_at": category.created_at.isoformat(),
             "updated_at": category.updated_at.isoformat(),
@@ -90,16 +92,24 @@ class ExpenseCategoryService:
                name: str,
                description: str = "",
                budget_limit=None,
-               is_active: bool = True) -> Tuple[Dict[str, Any], int]:
+               is_active: bool = True,
+               reporting_group: str = FinancialReportingGroup.REVIEW,
+               ) -> Tuple[Dict[str, Any], int]:
         if ExpenseCategoryRepository.name_exists(name):
             return ServiceResponse.validation_error(
                 errors={"name": f"Expense category '{name}' already exists"},
             )
 
+        if reporting_group not in EXPENSE_REPORTING_GROUPS:
+            return ServiceResponse.validation_error(errors={
+                "reporting_group": "Invalid financial reporting group",
+            })
+
         kwargs = {
             "name": name,
             "description": description,
             "is_active": is_active,
+            "reporting_group": reporting_group,
         }
         if budget_limit is not None:
             kwargs["budget_limit"] = Decimal(str(budget_limit))
@@ -128,7 +138,15 @@ class ExpenseCategoryService:
                 )
 
         update_fields = ["updated_at"]
-        for field in ["name", "description", "is_active"]:
+        if (
+            "reporting_group" in kwargs
+            and kwargs["reporting_group"] not in EXPENSE_REPORTING_GROUPS
+        ):
+            return ServiceResponse.validation_error(errors={
+                "reporting_group": "Invalid financial reporting group",
+            })
+
+        for field in ["name", "description", "is_active", "reporting_group"]:
             if field in kwargs:
                 setattr(category, field, kwargs[field])
                 update_fields.append(field)

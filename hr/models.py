@@ -1,4 +1,5 @@
 from django.db import models
+from base.financial import FinancialReportingGroup
 from base.models import SyncMixin, SyncManager
 
 
@@ -107,6 +108,12 @@ class ExpenseCategory(SyncMixin, models.Model):
         max_digits=12, decimal_places=2, null=True, blank=True,
     )
     is_active = models.BooleanField(default=True)
+    reporting_group = models.CharField(
+        max_length=32,
+        choices=FinancialReportingGroup.choices,
+        default=FinancialReportingGroup.REVIEW,
+        db_index=True,
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

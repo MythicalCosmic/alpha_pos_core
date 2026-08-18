@@ -141,6 +141,7 @@ FK_UUID_MAPPINGS = {
     'customer_uuid': ('base', 'Customer', 'customer'),
     'category_uuid': ('base', 'Category', 'category'),
     'order_uuid': ('base', 'Order', 'order'),
+    'order_item_uuid': ('base', 'OrderItem', 'order_item'),
     'product_uuid': ('base', 'Product', 'product'),
     'parent_category_uuid': ('base', 'Category', 'parent'),
     'place_uuid': ('base', 'Place', 'place'),

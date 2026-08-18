@@ -51,6 +51,7 @@ class ExpenseService:
             data["category"] = {
                 "id": expense.category.id,
                 "name": expense.category.name,
+                "reporting_group": expense.category.reporting_group,
             }
 
         if expense.created_by_id and expense.created_by:
