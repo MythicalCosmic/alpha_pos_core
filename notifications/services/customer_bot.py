@@ -92,11 +92,17 @@ def _has_phone(telegram_id) -> bool:
         return False
 
 
-def handle_update(update: dict) -> bool:
+def handle_update(update: dict, token=None) -> bool:
     """On any update with a chat: capture a shared contact, else open the web app
     if we already know the phone, else ask for name+phone. Best-effort; never
     raises (the webhook must 200)."""
-    token = getattr(settings, 'CUSTOMER_BOT_TOKEN', '') or ''
+    if token is None:
+        try:
+            from smartfood.credentials import customer_bot_token
+
+            token = customer_bot_token()
+        except (ImportError, RuntimeError):
+            token = getattr(settings, 'CUSTOMER_BOT_TOKEN', '') or ''
     if not token:
         logger.debug('customer bot: CUSTOMER_BOT_TOKEN not set; ignoring update')
         return False
