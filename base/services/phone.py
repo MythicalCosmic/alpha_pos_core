@@ -17,7 +17,10 @@ def normalize_uz_phone(value):
     """
     if value is None:
         return ""
-    digits = "".join(ch for ch in str(value) if ch.isdigit())
+    # Canonical phone keys must be ASCII and dialable. ``str.isdigit`` also
+    # accepts Arabic-Indic/full-width numerals, which look numeric but produce
+    # a different database key and cannot be sent to ordinary telephony APIs.
+    digits = "".join(ch for ch in str(value) if "0" <= ch <= "9")
     if digits.startswith("00"):
         digits = digits[2:]
     if len(digits) == UZ_NATIONAL_DIGITS:
@@ -28,9 +31,10 @@ def normalize_uz_phone(value):
 
 
 def is_canonical_uz_phone(value):
-    normalized = normalize_uz_phone(value)
+    raw = str(value or "")
+    normalized = normalize_uz_phone(raw)
     return (
-        len(normalized) == UZ_CANONICAL_DIGITS
+        raw == normalized
+        and len(normalized) == UZ_CANONICAL_DIGITS
         and normalized.startswith(UZ_COUNTRY_CODE)
     )
-
