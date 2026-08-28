@@ -1,6 +1,7 @@
 from django.urls import path
 from hr.views import department_views, employee_views, expense_views, salary_views, cash_views
 from hr.views import contract_views, leave_views, attendance_views, document_views, review_views, event_views
+from hr.views import operational_audit_views
 
 app_name = 'hr'
 
@@ -77,6 +78,30 @@ urlpatterns = [
     path('attendance/daily-report/', attendance_views.attendance_daily_report, name='attendance-daily-report'),
     path('attendance/monthly-report/', attendance_views.attendance_monthly_report, name='attendance-monthly-report'),
     path('attendance/<int:attendance_id>/', attendance_views.attendance_detail, name='attendance-detail'),
+    path('attendance/manual-entry/', operational_audit_views.attendance_manual_entry, name='attendance-manual-entry'),
+    path('attendance/summary/', operational_audit_views.attendance_summary, name='attendance-summary'),
+    path('attendance/<int:attendance_id>/adjustment-requests/', operational_audit_views.attendance_adjustment_request, name='attendance-adjustment-request'),
+    path('attendance-adjustments/<int:request_id>/<str:action>/', operational_audit_views.attendance_adjustment_review, name='attendance-adjustment-review'),
+    path('attendance/<int:attendance_id>/excuses/', operational_audit_views.attendance_excuse_create, name='attendance-excuse-create'),
+    path('attendance-excuses/<int:excuse_id>/<str:action>/', operational_audit_views.attendance_excuse_review, name='attendance-excuse-review'),
+
+    # Work schedules and operational discipline
+    path('work-schedules/', operational_audit_views.work_schedules, name='work-schedule-list'),
+    path('work-schedules/<int:schedule_id>/', operational_audit_views.work_schedule_detail, name='work-schedule-detail'),
+    path('discipline-rules/', operational_audit_views.discipline_rules, name='discipline-rule-list'),
+    path('discipline-rules/<int:rule_id>/', operational_audit_views.discipline_rule_detail, name='discipline-rule-detail'),
+    path('discipline-cases/', operational_audit_views.discipline_cases, name='discipline-case-list'),
+    path('discipline-cases/<int:case_id>/', operational_audit_views.discipline_case_detail, name='discipline-case-detail'),
+    path('discipline-cases/<int:case_id>/<str:action>/', operational_audit_views.discipline_case_review, name='discipline-case-review'),
+
+    # Central READY-event preparation audits
+    path('preparation-audits/', operational_audit_views.preparation_audits, name='preparation-audit-list'),
+    path('preparation-audits/<int:audit_id>/', operational_audit_views.preparation_audit_detail, name='preparation-audit-detail'),
+    path('preparation-audit-categories/', operational_audit_views.preparation_audit_categories, name='preparation-audit-category-list'),
+    path('preparation-audits/<int:audit_id>/review/', operational_audit_views.preparation_audit_review, name='preparation-audit-review'),
+    path('preparation-audits/<int:audit_id>/reopen/', operational_audit_views.preparation_audit_reopen, name='preparation-audit-reopen'),
+    path('audit-dashboard/', operational_audit_views.audit_dashboard, name='operational-audit-dashboard'),
+    path('audit-periods/close/', operational_audit_views.audit_period_close, name='operational-audit-period-close'),
 
     # Documents
     path('documents/', document_views.documents, name='document-list'),

@@ -76,6 +76,19 @@ def admin_required(view_func):
     return _session_role_required(('ADMIN',), "Admin access required")(view_func)
 
 
+def backoffice_required(view_func):
+    """Authenticate active internal back-office users before permission checks.
+
+    ADMIN retains its catalog-wide bypass. MANAGER and WAREHOUSE identities
+    receive no implicit access here; each operational endpoint must additionally
+    apply ``permission_required`` (or perform an equivalent method-specific
+    permission check).
+    """
+    return _session_role_required(
+        ('ADMIN', 'MANAGER', 'WAREHOUSE'), "Back-office access required"
+    )(view_func)
+
+
 def manager_required(view_func):
     # POS management tier: ADMIN (back office) + MANAGER (in-app settings).
     # MANAGER logs in on the monoblock and runs Settings there; ADMIN can't
@@ -118,4 +131,32 @@ def permission_required(*permissions):
                 )
             return view_func(request, *args, **kwargs)
         return wrapper
+    return decorator
+
+
+def user_has_permission(user, permission):
+    if not user:
+        return False
+    permissions = user.permissions if isinstance(user.permissions, list) else []
+    return user.role == 'ADMIN' or '*' in permissions or permission in permissions
+
+
+def permission_denied_response(request, permission):
+    """Return ``None`` when allowed, otherwise the standard endpoint 403."""
+    if user_has_permission(getattr(request, 'user', None), permission):
+        return None
+    return JsonResponse(
+        {
+            "success": False,
+            "message": "You don't have permission to perform this action",
+            "errors": {"permission": permission},
+        },
+        status=403,
+    )
+
+
+def backoffice_permission_required(*permissions):
+    """Authenticate first, then enforce every named catalog permission."""
+    def decorator(view_func):
+        return backoffice_required(permission_required(*permissions)(view_func))
     return decorator

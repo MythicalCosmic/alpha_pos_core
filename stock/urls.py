@@ -5,6 +5,7 @@ from stock.views import (
     purchase_views, recipe_views, production_views,
     transfer_views, count_views, product_link_views,
     order_views, ai_views,
+    adjustment_request_views,
 )
 
 app_name = 'stock'
@@ -45,6 +46,8 @@ urlpatterns = [
 
     # Stock Adjustments & Reservations
     path('adjust/', level_views.stock_adjust, name='adjust'),
+    path('adjustment-requests/', adjustment_request_views.adjustment_requests, name='adjustment-request-list'),
+    path('adjustment-requests/<int:request_id>/<str:action>/', adjustment_request_views.adjustment_review, name='adjustment-request-review'),
     path('reserve/', level_views.stock_reserve, name='reserve'),
     path('release-reservation/', level_views.stock_release_reservation, name='release-reservation'),
 
@@ -75,7 +78,11 @@ urlpatterns = [
     path('purchase-order/<int:po_id>/receiving/', purchase_views.purchase_receiving, name='po-receiving'),
     path('purchase-order-items/<int:item_id>/', purchase_views.purchase_order_item_detail, name='po-item-detail'),
     path('receiving/<int:receiving_id>/items/', purchase_views.purchase_receiving_items, name='receiving-items'),
+    path('receiving-items/<int:item_id>/', purchase_views.purchase_receiving_item_detail, name='receiving-item-detail'),
     path('receiving/<int:receiving_id>/complete/', purchase_views.purchase_receiving_complete, name='receiving-complete'),
+    path('receiving/<int:receiving_id>/approve-over-receipt/', purchase_views.purchase_receiving_approve_over, name='receiving-approve-over'),
+    path('receiving/<int:receiving_id>/corrections/', purchase_views.purchase_receiving_correction_request, name='receiving-correction-request'),
+    path('receiving-corrections/<int:correction_id>/<str:action>/', purchase_views.purchase_receiving_correction_review, name='receiving-correction-review'),
 
     # Recipes
     path('recipes/', recipe_views.recipes, name='recipe-list'),

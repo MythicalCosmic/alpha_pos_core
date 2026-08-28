@@ -581,6 +581,18 @@ class Attendance(SyncMixin, models.Model):
     source = models.CharField(max_length=10, choices=Source.choices, default=Source.MANUAL)
     work_hours = models.DecimalField(max_digits=5, decimal_places=2, default=0)
     overtime_hours = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    scheduled_start = models.DateTimeField(null=True, blank=True)
+    scheduled_end = models.DateTimeField(null=True, blank=True)
+    grace_minutes = models.PositiveIntegerField(default=0)
+    worked_minutes = models.PositiveIntegerField(default=0)
+    scheduled_minutes = models.PositiveIntegerField(default=0)
+    overtime_minutes = models.PositiveIntegerField(default=0)
+    late_minutes = models.PositiveIntegerField(default=0)
+    early_leave_minutes = models.PositiveIntegerField(default=0)
+    created_by = models.ForeignKey(
+        'base.User', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='created_attendance_records',
+    )
     notes = models.TextField(blank=True, default='')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -594,10 +606,338 @@ class Attendance(SyncMixin, models.Model):
     def to_sync_dict(self):
         data = super().to_sync_dict()
         data['employee_uuid'] = str(self.employee.uuid) if self.employee else None
+        data['created_by_uuid'] = str(self.created_by.uuid) if self.created_by else None
         return data
 
     def __str__(self):
         return f"{self.employee} - {self.date} ({self.status})"
+
+
+class EmployeeWorkSchedule(SyncMixin, models.Model):
+    employee = models.ForeignKey(
+        Employee, on_delete=models.CASCADE, related_name='work_schedules',
+    )
+    weekday = models.PositiveSmallIntegerField()
+    scheduled_start_local = models.TimeField()
+    scheduled_end_local = models.TimeField()
+    is_overnight = models.BooleanField(default=False)
+    grace_minutes = models.PositiveIntegerField(default=0)
+    effective_from = models.DateField()
+    effective_to = models.DateField(null=True, blank=True)
+    created_by = models.ForeignKey(
+        'base.User', on_delete=models.PROTECT, related_name='created_work_schedules',
+    )
+    updated_by = models.ForeignKey(
+        'base.User', on_delete=models.PROTECT, related_name='updated_work_schedules',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    objects = SyncManager()
+    SYNC_PULL_SCOPE = 'global'
+
+    class Meta:
+        ordering = ['employee_id', 'weekday', '-effective_from']
+        indexes = [models.Index(fields=['employee', 'weekday', 'effective_from', 'effective_to'])]
+        constraints = [
+            models.CheckConstraint(condition=models.Q(weekday__gte=0, weekday__lte=6), name='schedule_weekday_0_6'),
+            models.CheckConstraint(
+                condition=models.Q(effective_to__isnull=True) | models.Q(effective_to__gte=models.F('effective_from')),
+                name='schedule_effective_range_valid',
+            ),
+            models.UniqueConstraint(
+                fields=['employee', 'weekday', 'effective_from'],
+                name='uniq_employee_schedule_effective_start',
+            ),
+        ]
+
+    def to_sync_dict(self):
+        data = super().to_sync_dict()
+        data['employee_uuid'] = str(self.employee.uuid) if self.employee else None
+        data['created_by_uuid'] = str(self.created_by.uuid) if self.created_by else None
+        data['updated_by_uuid'] = str(self.updated_by.uuid) if self.updated_by else None
+        return data
+
+
+class AttendanceAdjustmentRequest(SyncMixin, models.Model):
+    class ReasonCategory(models.TextChoices):
+        MISSING_ENTRY = 'MISSING_ENTRY', 'Missing entry'
+        DEVICE_FAILURE = 'DEVICE_FAILURE', 'Device failure'
+        MANAGER_INSTRUCTION = 'MANAGER_INSTRUCTION', 'Manager instruction'
+        DATA_ENTRY_ERROR = 'DATA_ENTRY_ERROR', 'Data entry error'
+        OTHER = 'OTHER', 'Other'
+
+    class Status(models.TextChoices):
+        PENDING = 'PENDING', 'Pending'
+        APPROVED = 'APPROVED', 'Approved'
+        REJECTED = 'REJECTED', 'Rejected'
+        CANCELLED = 'CANCELLED', 'Cancelled'
+
+    attendance = models.ForeignKey(Attendance, on_delete=models.PROTECT, related_name='adjustment_requests')
+    original_check_in = models.DateTimeField(null=True, blank=True)
+    original_check_out = models.DateTimeField(null=True, blank=True)
+    requested_check_in = models.DateTimeField(null=True, blank=True)
+    requested_check_out = models.DateTimeField(null=True, blank=True)
+    reason_category = models.CharField(max_length=24, choices=ReasonCategory.choices)
+    reason_text = models.TextField(blank=True, default='')
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING)
+    requested_by = models.ForeignKey(
+        'base.User', on_delete=models.PROTECT, related_name='attendance_adjustment_requests',
+    )
+    requested_at = models.DateTimeField(auto_now_add=True)
+    reviewed_by = models.ForeignKey(
+        'base.User', on_delete=models.PROTECT, null=True, blank=True,
+        related_name='reviewed_attendance_adjustments',
+    )
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    review_note = models.TextField(blank=True, default='')
+    updated_at = models.DateTimeField(auto_now=True)
+
+    objects = SyncManager()
+
+    class Meta:
+        ordering = ['-requested_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['attendance'], condition=models.Q(status='PENDING'),
+                name='uniq_pending_attendance_adjustment',
+            ),
+        ]
+
+    def to_sync_dict(self):
+        data = super().to_sync_dict()
+        data['attendance_uuid'] = str(self.attendance.uuid) if self.attendance else None
+        data['requested_by_uuid'] = str(self.requested_by.uuid) if self.requested_by else None
+        data['reviewed_by_uuid'] = str(self.reviewed_by.uuid) if self.reviewed_by else None
+        return data
+
+
+class AttendanceExcuse(SyncMixin, models.Model):
+    class Category(models.TextChoices):
+        MEDICAL = 'MEDICAL', 'Medical'
+        FAMILY = 'FAMILY', 'Family'
+        TRANSPORT = 'TRANSPORT', 'Transport'
+        APPROVED_LEAVE = 'APPROVED_LEAVE', 'Approved leave'
+        MANAGER_INSTRUCTION = 'MANAGER_INSTRUCTION', 'Manager instruction'
+        OTHER = 'OTHER', 'Other'
+
+    class Status(models.TextChoices):
+        PENDING = 'PENDING', 'Pending'
+        APPROVED = 'APPROVED', 'Approved'
+        REJECTED = 'REJECTED', 'Rejected'
+
+    attendance = models.ForeignKey(Attendance, on_delete=models.PROTECT, related_name='excuses')
+    employee = models.ForeignKey(Employee, on_delete=models.PROTECT, related_name='attendance_excuses')
+    submitted_by = models.ForeignKey(
+        'base.User', on_delete=models.PROTECT, related_name='submitted_attendance_excuses',
+    )
+    submitted_at = models.DateTimeField(auto_now_add=True)
+    category = models.CharField(max_length=24, choices=Category.choices)
+    description = models.TextField(blank=True, default='')
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING)
+    excused_late_minutes = models.PositiveIntegerField(default=0)
+    excused_early_leave_minutes = models.PositiveIntegerField(default=0)
+    excused_absence_minutes = models.PositiveIntegerField(default=0)
+    reviewer = models.ForeignKey(
+        'base.User', on_delete=models.PROTECT, null=True, blank=True,
+        related_name='reviewed_attendance_excuses',
+    )
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    review_note = models.TextField(blank=True, default='')
+    updated_at = models.DateTimeField(auto_now=True)
+
+    objects = SyncManager()
+
+    class Meta:
+        ordering = ['-submitted_at']
+
+    def to_sync_dict(self):
+        data = super().to_sync_dict()
+        data['attendance_uuid'] = str(self.attendance.uuid) if self.attendance else None
+        data['employee_uuid'] = str(self.employee.uuid) if self.employee else None
+        data['submitted_by_uuid'] = str(self.submitted_by.uuid) if self.submitted_by else None
+        data['reviewer_uuid'] = str(self.reviewer.uuid) if self.reviewer else None
+        return data
+
+
+class DisciplinaryRule(models.Model):
+    class Category(models.TextChoices):
+        ATTENDANCE = 'ATTENDANCE', 'Attendance'
+        CONDUCT = 'CONDUCT', 'Conduct'
+        QUALITY = 'QUALITY', 'Quality'
+        PREPARATION_TIME = 'PREPARATION_TIME', 'Preparation time'
+        OTHER = 'OTHER', 'Other'
+
+    code = models.CharField(max_length=50, unique=True)
+    category = models.CharField(max_length=24, choices=Category.choices)
+    title = models.CharField(max_length=200)
+    description = models.TextField()
+    default_amount_uzs = models.PositiveBigIntegerField(default=0)
+    is_active = models.BooleanField(default=True)
+    effective_from = models.DateField()
+    effective_to = models.DateField(null=True, blank=True)
+    requires_evidence = models.BooleanField(default=True)
+    requires_comment = models.BooleanField(default=True)
+    created_by = models.ForeignKey('base.User', on_delete=models.PROTECT, related_name='+')
+    updated_by = models.ForeignKey('base.User', on_delete=models.PROTECT, related_name='+')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['category', 'code']
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(effective_to__isnull=True) | models.Q(effective_to__gte=models.F('effective_from')),
+                name='discipline_rule_effective_range_valid',
+            ),
+        ]
+
+
+class PreparationAuditCategory(models.Model):
+    code = models.CharField(max_length=50, unique=True)
+    name = models.CharField(max_length=100)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['code']
+
+
+class PreparationAudit(models.Model):
+    class PerformanceStatus(models.TextChoices):
+        ON_TIME = 'ON_TIME', 'On time'
+        SLIGHTLY_LATE = 'SLIGHTLY_LATE', 'Slightly late'
+        VERY_LATE = 'VERY_LATE', 'Very late'
+        UNTRACKED = 'UNTRACKED', 'Untracked'
+
+    class ReviewStatus(models.TextChoices):
+        NOT_REQUIRED = 'NOT_REQUIRED', 'Not required'
+        PENDING = 'PENDING', 'Pending'
+        COMPLETED = 'COMPLETED', 'Completed'
+        EXCUSED = 'EXCUSED', 'Excused'
+
+    order = models.OneToOneField('base.Order', on_delete=models.PROTECT, related_name='preparation_audit')
+    branch_id = models.CharField(max_length=50, blank=True, default='', db_index=True)
+    created_at_snapshot = models.DateTimeField()
+    ready_at_snapshot = models.DateTimeField()
+    elapsed_seconds = models.PositiveIntegerField()
+    target_seconds = models.PositiveIntegerField(null=True, blank=True)
+    target_name_snapshot = models.CharField(max_length=100, blank=True, default='')
+    performance_status = models.CharField(max_length=20, choices=PerformanceStatus.choices)
+    review_required = models.BooleanField(default=False)
+    review_status = models.CharField(max_length=16, choices=ReviewStatus.choices)
+    created_at = models.DateTimeField(auto_now_add=True)
+    reviewer = models.ForeignKey('base.User', on_delete=models.PROTECT, null=True, blank=True, related_name='+')
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    reopened_by = models.ForeignKey('base.User', on_delete=models.PROTECT, null=True, blank=True, related_name='+')
+    reopened_at = models.DateTimeField(null=True, blank=True)
+    reopen_reason = models.TextField(blank=True, default='')
+
+    class Meta:
+        ordering = ['-ready_at_snapshot']
+        indexes = [
+            models.Index(fields=['branch_id', 'ready_at_snapshot']),
+            models.Index(fields=['performance_status', 'review_status']),
+        ]
+
+
+class DisciplinaryCase(models.Model):
+    class Status(models.TextChoices):
+        DRAFT = 'DRAFT', 'Draft'
+        SUBMITTED = 'SUBMITTED', 'Submitted'
+        EXCUSED = 'EXCUSED', 'Excused'
+        APPROVED = 'APPROVED', 'Approved'
+        REJECTED = 'REJECTED', 'Rejected'
+        VOIDED = 'VOIDED', 'Voided'
+        APPROVED_PENDING_PAYROLL = 'APPROVED_PENDING_PAYROLL', 'Approved pending payroll'
+
+    employee = models.ForeignKey(Employee, on_delete=models.PROTECT, related_name='disciplinary_cases')
+    occurred_at = models.DateTimeField()
+    business_date = models.DateField(db_index=True)
+    rule = models.ForeignKey(DisciplinaryRule, on_delete=models.PROTECT, related_name='cases')
+    rule_code_snapshot = models.CharField(max_length=50)
+    rule_title_snapshot = models.CharField(max_length=200)
+    rule_category_snapshot = models.CharField(max_length=24)
+    rule_amount_snapshot_uzs = models.PositiveBigIntegerField(default=0)
+    amount_uzs = models.PositiveBigIntegerField(default=0)
+    evidence = models.TextField(blank=True, default='')
+    comment = models.TextField(blank=True, default='')
+    attendance = models.ForeignKey(Attendance, on_delete=models.PROTECT, null=True, blank=True, related_name='disciplinary_cases')
+    attendance_excuse = models.ForeignKey(AttendanceExcuse, on_delete=models.PROTECT, null=True, blank=True, related_name='disciplinary_cases')
+    preparation_audit = models.ForeignKey(PreparationAudit, on_delete=models.PROTECT, null=True, blank=True, related_name='disciplinary_cases')
+    excuse_text = models.TextField(blank=True, default='')
+    excuse_review_state = models.CharField(max_length=10, blank=True, default='')
+    status = models.CharField(max_length=32, choices=Status.choices, default=Status.DRAFT)
+    created_by = models.ForeignKey('base.User', on_delete=models.PROTECT, related_name='created_disciplinary_cases')
+    created_at = models.DateTimeField(auto_now_add=True)
+    reviewed_by = models.ForeignKey('base.User', on_delete=models.PROTECT, null=True, blank=True, related_name='reviewed_disciplinary_cases')
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    review_note = models.TextField(blank=True, default='')
+    void_reason = models.TextField(blank=True, default='')
+    payroll_period_year = models.PositiveIntegerField(null=True, blank=True)
+    payroll_period_month = models.PositiveSmallIntegerField(null=True, blank=True)
+    salary_deduction = models.OneToOneField(SalaryDeduction, on_delete=models.PROTECT, null=True, blank=True, related_name='disciplinary_case')
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-business_date', '-created_at']
+        indexes = [models.Index(fields=['employee', 'business_date', 'status'])]
+
+
+class PreparationAuditReview(models.Model):
+    preparation_audit = models.ForeignKey(PreparationAudit, on_delete=models.PROTECT, related_name='reviews')
+    category = models.ForeignKey(PreparationAuditCategory, on_delete=models.PROTECT, related_name='reviews')
+    comment = models.TextField()
+    responsible_employee = models.ForeignKey(Employee, on_delete=models.PROTECT, null=True, blank=True, related_name='preparation_audit_reviews')
+    linked_disciplinary_case = models.ForeignKey(DisciplinaryCase, on_delete=models.PROTECT, null=True, blank=True, related_name='preparation_reviews')
+    reviewed_by = models.ForeignKey('base.User', on_delete=models.PROTECT, related_name='preparation_audit_reviews')
+    reviewed_at = models.DateTimeField(auto_now_add=True)
+    is_current = models.BooleanField(default=True)
+    reopened_by = models.ForeignKey('base.User', on_delete=models.PROTECT, null=True, blank=True, related_name='+')
+    reopened_at = models.DateTimeField(null=True, blank=True)
+    reopen_reason = models.TextField(blank=True, default='')
+
+    class Meta:
+        ordering = ['-reviewed_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['preparation_audit'], condition=models.Q(is_current=True),
+                name='uniq_current_preparation_audit_review',
+            ),
+        ]
+
+
+class PreparationAuditPeriodClose(models.Model):
+    branch_id = models.CharField(max_length=50, blank=True, default='', db_index=True)
+    period_start = models.DateTimeField()
+    period_end = models.DateTimeField()
+    closed_by = models.ForeignKey('base.User', on_delete=models.PROTECT, related_name='+')
+    closed_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['branch_id', 'period_start', 'period_end'],
+                name='uniq_preparation_audit_period_close',
+            ),
+        ]
+
+
+class OperationalAuditEvent(models.Model):
+    entity_type = models.CharField(max_length=60, db_index=True)
+    entity_id = models.PositiveBigIntegerField(db_index=True)
+    action = models.CharField(max_length=40)
+    actor = models.ForeignKey('base.User', on_delete=models.PROTECT, related_name='+')
+    occurred_at = models.DateTimeField(auto_now_add=True)
+    previous_state = models.CharField(max_length=40, blank=True, default='')
+    new_state = models.CharField(max_length=40, blank=True, default='')
+    reason = models.TextField(blank=True, default='')
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ['occurred_at', 'id']
+        indexes = [models.Index(fields=['entity_type', 'entity_id', 'occurred_at'])]
 
 
 class EmployeeDocument(SyncMixin, models.Model):

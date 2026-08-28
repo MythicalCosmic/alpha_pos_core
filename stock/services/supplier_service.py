@@ -38,7 +38,8 @@ class SupplierService:
 
             "payment_terms_days": supplier.payment_terms_days,
             "credit_limit": str(supplier.credit_limit) if supplier.credit_limit else None,
-            "current_balance": str(supplier.current_balance),
+            "current_balance": int(supplier.current_balance or 0),
+            "current_balance_uzs": int(supplier.current_balance or 0),
             "currency": supplier.currency,
 
             "lead_time_days": supplier.lead_time_days,
@@ -82,6 +83,8 @@ class SupplierService:
             "city": supplier.city,
             "rating": supplier.rating,
             "is_active": supplier.is_active,
+            "current_balance": int(supplier.current_balance or 0),
+            "current_balance_uzs": int(supplier.current_balance or 0),
         }
 
     @classmethod

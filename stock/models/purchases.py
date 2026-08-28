@@ -97,6 +97,9 @@ class PurchaseOrderItem(SyncMixin, models.Model):
     quantity_received = models.DecimalField(
         max_digits=15, decimal_places=4, default=0
     )
+    quantity_canceled = models.DecimalField(
+        max_digits=15, decimal_places=4, default=0
+    )
     unit = models.ForeignKey('stock.StockUnit', on_delete=models.PROTECT, related_name="+")
     unit_price = models.DecimalField(max_digits=15, decimal_places=4)
     discount_percent = models.DecimalField(
@@ -141,6 +144,19 @@ class PurchaseReceiving(SyncMixin, models.Model):
     status = models.CharField(
         max_length=20, choices=Status.choices, default=Status.DRAFT
     )
+    completed_at = models.DateTimeField(null=True, blank=True)
+    supplier_balance_before = models.DecimalField(
+        max_digits=15, decimal_places=2, null=True, blank=True,
+    )
+    supplier_balance_after = models.DecimalField(
+        max_digits=15, decimal_places=2, null=True, blank=True,
+    )
+    over_receipt_approved_by = models.ForeignKey(
+        'base.User', on_delete=models.PROTECT, null=True, blank=True,
+        related_name='approved_purchase_over_receipts',
+    )
+    over_receipt_approved_at = models.DateTimeField(null=True, blank=True)
+    over_receipt_reason = models.TextField(blank=True, default='')
     notes = models.TextField(blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -152,6 +168,10 @@ class PurchaseReceiving(SyncMixin, models.Model):
         data['purchase_order_uuid'] = str(self.purchase_order.uuid) if self.purchase_order else None
         data['location_uuid'] = str(self.location.uuid) if self.location else None
         data['received_by_uuid'] = str(self.received_by.uuid) if self.received_by else None
+        data['over_receipt_approved_by_uuid'] = (
+            str(self.over_receipt_approved_by.uuid)
+            if self.over_receipt_approved_by else None
+        )
         return data
 
     def __str__(self):
@@ -208,3 +228,46 @@ class PurchaseReceivingItem(SyncMixin, models.Model):
 
     def __str__(self):
         return f"{self.stock_item.name} × {self.quantity_received}"
+
+
+class PurchaseReceivingCorrection(SyncMixin, models.Model):
+    class Status(models.TextChoices):
+        PENDING = 'PENDING', 'Pending'
+        APPROVED = 'APPROVED', 'Approved'
+        REJECTED = 'REJECTED', 'Rejected'
+
+    receiving = models.ForeignKey(
+        PurchaseReceiving, on_delete=models.PROTECT, related_name='corrections',
+    )
+    reason = models.TextField()
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING)
+    requested_by = models.ForeignKey(
+        'base.User', on_delete=models.PROTECT, related_name='requested_receiving_corrections',
+    )
+    requested_at = models.DateTimeField(auto_now_add=True)
+    reviewed_by = models.ForeignKey(
+        'base.User', on_delete=models.PROTECT, null=True, blank=True,
+        related_name='reviewed_receiving_corrections',
+    )
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    review_note = models.TextField(blank=True, default='')
+    supplier_balance_before = models.DecimalField(max_digits=15, decimal_places=2, null=True, blank=True)
+    supplier_balance_after = models.DecimalField(max_digits=15, decimal_places=2, null=True, blank=True)
+
+    objects = SyncManager()
+
+    class Meta:
+        ordering = ['-requested_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['receiving'], condition=models.Q(status='PENDING'),
+                name='uniq_pending_receiving_correction',
+            ),
+        ]
+
+    def to_sync_dict(self):
+        data = super().to_sync_dict()
+        data['receiving_uuid'] = str(self.receiving.uuid) if self.receiving else None
+        data['requested_by_uuid'] = str(self.requested_by.uuid) if self.requested_by else None
+        data['reviewed_by_uuid'] = str(self.reviewed_by.uuid) if self.reviewed_by else None
+        return data

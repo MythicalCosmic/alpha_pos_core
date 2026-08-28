@@ -211,6 +211,9 @@ class SalaryService:
         )
 
         salary = SalaryPaymentRepository.get_with_relations(salary.pk)
+        from hr.services.operational_audit_service import DisciplineService
+        DisciplineService.attach_pending_for_salary(salary)
+        salary.refresh_from_db()
 
         return ServiceResponse.created(data={
             "id": salary.id,
@@ -237,6 +240,13 @@ class SalaryService:
 
         for employee in active_employees:
             if SalaryPaymentRepository.exists_for_period(employee.id, year, month):
+                existing = SalaryPayment.objects.filter(
+                    employee=employee, period_year=year, period_month=month,
+                    is_deleted=False,
+                ).first()
+                if existing:
+                    from hr.services.operational_audit_service import DisciplineService
+                    DisciplineService.attach_pending_for_salary(existing)
                 skipped += 1
                 continue
 
@@ -256,7 +266,7 @@ class SalaryService:
             # payroll run — just count it as skipped.
             try:
                 with transaction.atomic():
-                    SalaryPaymentRepository.create(
+                    salary = SalaryPaymentRepository.create(
                         employee_id=employee.id,
                         period_year=year,
                         period_month=month,
@@ -268,6 +278,8 @@ class SalaryService:
                         payment_method="CASH",
                         created_by_id=created_by_id,
                     )
+                    from hr.services.operational_audit_service import DisciplineService
+                    DisciplineService.attach_pending_for_salary(salary)
                 created += 1
             except IntegrityError:
                 skipped += 1

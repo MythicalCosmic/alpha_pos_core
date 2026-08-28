@@ -3,15 +3,19 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods, require_POST
 from base.helpers.request import parse_json_body, safe_int
 from base.helpers.response import json_response
-from base.security.permissions import admin_required
+from base.security.permissions import (
+    backoffice_required, permission_denied_response,
+)
 from stock.services import StockLocationService
 
 
 @csrf_exempt
 @require_http_methods(["GET", "POST"])
-@admin_required
+@backoffice_required
 def locations(request):
     if request.method == "GET":
+        if denied := permission_denied_response(request, 'stock.level.view'):
+            return denied
         location_type = request.GET.get("type")
         parent_id = safe_int(request, "parent_id")
         tree = request.GET.get("tree", "false").lower() == "true"
@@ -29,6 +33,8 @@ def locations(request):
             )
         return JsonResponse(result, status=status)
 
+    if denied := permission_denied_response(request, 'stock.manage'):
+        return denied
     data, error = parse_json_body(request)
     if error:
         return json_response(error)
@@ -39,12 +45,16 @@ def locations(request):
 
 @csrf_exempt
 @require_http_methods(["GET", "PUT", "DELETE"])
-@admin_required
+@backoffice_required
 def location_detail(request, location_id):
     if request.method == "GET":
+        if denied := permission_denied_response(request, 'stock.level.view'):
+            return denied
         result, status = StockLocationService.get(location_id)
         return JsonResponse(result, status=status)
 
+    if denied := permission_denied_response(request, 'stock.manage'):
+        return denied
     if request.method == "DELETE":
         result, status = StockLocationService.deactivate(location_id)
         return JsonResponse(result, status=status)
@@ -59,15 +69,19 @@ def location_detail(request, location_id):
 
 @csrf_exempt
 @require_POST
-@admin_required
+@backoffice_required
 def location_set_default(request, location_id):
+    if denied := permission_denied_response(request, 'stock.manage'):
+        return denied
     result, status = StockLocationService.set_default(location_id)
     return JsonResponse(result, status=status)
 
 
 @csrf_exempt
 @require_POST
-@admin_required
+@backoffice_required
 def location_activate(request, location_id):
+    if denied := permission_denied_response(request, 'stock.manage'):
+        return denied
     result, status = StockLocationService.activate(location_id)
     return JsonResponse(result, status=status)

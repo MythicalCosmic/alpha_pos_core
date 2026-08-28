@@ -3,13 +3,13 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_POST
 from base.helpers.request import parse_json_body, safe_page, safe_per_page, safe_int, safe_date
 from base.helpers.response import json_response
-from base.security.permissions import admin_required
+from base.security.permissions import admin_required, backoffice_permission_required
 from stock.services.level_service import StockLevelService, StockTransactionService
 
 
 @csrf_exempt
 @require_GET
-@admin_required
+@backoffice_permission_required('stock.level.view')
 def stock_levels(request):
     result, status = StockLevelService.get_all(
         page=safe_page(request),
@@ -25,7 +25,7 @@ def stock_levels(request):
 
 @csrf_exempt
 @require_GET
-@admin_required
+@backoffice_permission_required('stock.level.view')
 def stock_level_item(request, item_id):
     result, status = StockLevelService.get_for_item(item_id)
     return JsonResponse(result, status=status)
@@ -33,7 +33,7 @@ def stock_level_item(request, item_id):
 
 @csrf_exempt
 @require_GET
-@admin_required
+@backoffice_permission_required('stock.level.view')
 def stock_level_location(request, location_id):
     result, status = StockLevelService.get_for_location(location_id)
     return JsonResponse(result, status=status)
@@ -74,7 +74,7 @@ def stock_release_reservation(request):
 
 @csrf_exempt
 @require_GET
-@admin_required
+@backoffice_permission_required('stock.level.view')
 def low_stock(request):
     location_id = safe_int(request, "location_id")
     result, status = StockLevelService.get_low_stock_items(location_id=location_id)
@@ -83,7 +83,7 @@ def low_stock(request):
 
 @csrf_exempt
 @require_GET
-@admin_required
+@backoffice_permission_required('stock.batch.view')
 def transactions(request):
     date_from = safe_date(request, "date_from")
     date_to = safe_date(request, "date_to")
@@ -102,7 +102,7 @@ def transactions(request):
 
 @csrf_exempt
 @require_GET
-@admin_required
+@backoffice_permission_required('stock.batch.view')
 def transaction_history(request, item_id):
     days = safe_int(request, "days", 30, minimum=1, maximum=3650)
     result, status = StockTransactionService.get_item_history(item_id, days)

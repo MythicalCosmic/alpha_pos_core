@@ -73,6 +73,10 @@ class StockSettings(SyncMixin, models.Model):
     require_transfer_approval = models.BooleanField(default=False)
     require_adjustment_approval = models.BooleanField(default=False)
     require_count_approval = models.BooleanField(default=True)
+    receiving_quantity_tolerance_percent = models.DecimalField(
+        max_digits=6, decimal_places=2, default=0,
+        help_text='Quantity variance allowed before a receiving note is required.',
+    )
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

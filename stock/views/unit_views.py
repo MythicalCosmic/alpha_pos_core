@@ -3,15 +3,19 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods, require_POST
 from base.helpers.request import parse_json_body
 from base.helpers.response import json_response
-from base.security.permissions import admin_required
+from base.security.permissions import (
+    backoffice_required, backoffice_permission_required, permission_denied_response,
+)
 from stock.services import StockUnitService
 
 
 @csrf_exempt
 @require_http_methods(["GET", "POST"])
-@admin_required
+@backoffice_required
 def units(request):
     if request.method == "GET":
+        if denied := permission_denied_response(request, 'stock.catalog.view'):
+            return denied
         unit_type = request.GET.get("type")
         if unit_type:
             result, status = StockUnitService.get_by_type(unit_type)
@@ -19,6 +23,8 @@ def units(request):
             result, status = StockUnitService.list()
         return JsonResponse(result, status=status)
 
+    if denied := permission_denied_response(request, 'stock.manage'):
+        return denied
     data, error = parse_json_body(request)
     if error:
         return json_response(error)
@@ -33,12 +39,16 @@ def units(request):
 
 @csrf_exempt
 @require_http_methods(["GET", "PUT", "DELETE"])
-@admin_required
+@backoffice_required
 def unit_detail(request, unit_id):
     if request.method == "GET":
+        if denied := permission_denied_response(request, 'stock.catalog.view'):
+            return denied
         result, status = StockUnitService.get(unit_id)
         return JsonResponse(result, status=status)
 
+    if denied := permission_denied_response(request, 'stock.manage'):
+        return denied
     if request.method == "DELETE":
         result, status = StockUnitService.deactivate(unit_id)
         return JsonResponse(result, status=status)
@@ -53,7 +63,7 @@ def unit_detail(request, unit_id):
 
 @csrf_exempt
 @require_POST
-@admin_required
+@backoffice_permission_required('stock.catalog.view')
 def unit_convert(request):
     data, error = parse_json_body(request)
     if error:

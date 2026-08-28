@@ -74,6 +74,17 @@ class OrderNotification:
             disp, _ = OrderNotificationDispatch.objects.get_or_create(order_id=order.id)
             disp = OrderNotificationDispatch.objects.select_for_update().get(pk=disp.pk)
 
+            # The central READY event is also the single source for the immutable
+            # operational preparation snapshot. Wait for synced items so target
+            # selection is meaningful; the receiver re-dispatches after the item
+            # batch lands. The unique order relation makes retries harmless and
+            # this does not create a second Telegram delivery path.
+            if (status == 'READY'
+                    and order.created_at and order.ready_at
+                    and order.items.filter(is_deleted=False).exists()):
+                from hr.services.operational_audit_service import ensure_preparation_audit
+                ensure_preparation_audit(order.id)
+
             if status == 'CANCELED':
                 # Announce once, but only if we already announced the order.
                 if disp.new_sent and not disp.cancelled_sent:

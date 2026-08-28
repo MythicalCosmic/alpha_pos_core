@@ -1034,6 +1034,10 @@ class User(SyncMixin, models.Model):
         # only. They must never inherit CASHIER/POS permissions merely because
         # both products use the same Session table.
         COURIER = "COURIER", "Courier"
+        # Back-office operational identity. Warehouse users authenticate with
+        # email/password and are authorized per permission; they are never
+        # included in the POS staff picker.
+        WAREHOUSE = "WAREHOUSE", "Warehouse"
         # Kitchen staff. Created without a password (non-login label — used for
         # kitchen attribution / KDS), so it never appears in the cashier login
         # picker (get_pos_staff admits only CASHIER/MANAGER) and can't sign in.

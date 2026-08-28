@@ -98,6 +98,15 @@ class SupplierLedgerService:
         )
 
     @classmethod
+    def record_return(cls, supplier_id, amount, reference_type='',
+                      reference_id=None, performed_by=None, note=''):
+        return cls._post(
+            supplier_id, SupplierTransaction.Type.RETURN, amount,
+            reference_type=reference_type, reference_id=reference_id,
+            performed_by=performed_by, note=note,
+        )
+
+    @classmethod
     @transaction.atomic
     def pay_supplier(cls, supplier_id, amount, source_account='SAFE',
                      commission=0, note='', performed_by=None):
@@ -146,24 +155,50 @@ class SupplierLedgerService:
             message='Supplier paid')
 
     @staticmethod
-    def history(supplier_id, page=1, per_page=20):
+    def history(supplier_id, page=1, per_page=20, *, date_from=None,
+                date_to=None, transaction_type=None, source_reference=None):
         qs = SupplierTransaction.objects.filter(
             supplier_id=supplier_id, is_deleted=False,
         ).select_related('performed_by')
+        if date_from:
+            qs = qs.filter(created_at__date__gte=date_from)
+        if date_to:
+            qs = qs.filter(created_at__date__lte=date_to)
+        if transaction_type:
+            qs = qs.filter(type=transaction_type)
+        if source_reference:
+            from django.db.models import Q
+            reference = str(source_reference).strip()
+            query = Q(reference_type__icontains=reference)
+            if reference.isdigit():
+                query |= Q(reference_id=int(reference))
+            qs = qs.filter(query)
         total = qs.count()
         items = qs[(page - 1) * per_page: page * per_page]
         return ServiceResponse.success(data={
             'transactions': [{
                 'id': t.id,
                 'type': t.type,
-                'amount': str(t.amount),
-                'balance_after': str(t.balance_after),
+                'transaction_type': t.type,
+                'amount_uzs': int(t.amount),
+                'debit_uzs': int(t.amount) if t.type not in _DEBT_MINUS else 0,
+                'credit_uzs': int(t.amount) if t.type in _DEBT_MINUS else 0,
+                'change_uzs': -int(t.amount) if t.type in _DEBT_MINUS else int(t.amount),
+                'balance_after_uzs': int(t.balance_after),
                 'source_account': t.source_account,
-                'fee': str(t.fee),
+                'fee_uzs': int(t.fee),
                 'reference_type': t.reference_type,
                 'reference_id': t.reference_id,
+                'source_reference': (
+                    f'{t.reference_type}:{t.reference_id}'
+                    if t.reference_type and t.reference_id is not None else t.reference_type
+                ),
                 'note': t.note,
                 'created_at': t.created_at.isoformat() if t.created_at else None,
+                'creator': ({
+                    'id': t.performed_by_id,
+                    'name': f'{t.performed_by.first_name} {t.performed_by.last_name}'.strip(),
+                } if t.performed_by_id else None),
             } for t in items],
             'pagination': {'page': page, 'per_page': per_page, 'total': total},
         })

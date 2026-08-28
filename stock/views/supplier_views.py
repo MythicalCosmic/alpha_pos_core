@@ -1,17 +1,19 @@
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
-from base.helpers.request import parse_json_body, safe_page, safe_per_page
+from base.helpers.request import parse_json_body, safe_page, safe_per_page, safe_date
 from base.helpers.response import json_response
-from base.security.permissions import admin_required
+from base.security.permissions import admin_required, backoffice_required, permission_denied_response
 from stock.services import SupplierService, SupplierStockItemService
 
 
 @csrf_exempt
 @require_http_methods(["GET", "POST"])
-@admin_required
+@backoffice_required
 def suppliers(request):
     if request.method == "GET":
+        if denied := permission_denied_response(request, 'stock.supplier.view'):
+            return denied
         result, status_code = SupplierService.list(
             page=safe_page(request),
             per_page=safe_per_page(request, 20),
@@ -20,6 +22,8 @@ def suppliers(request):
         )
         return JsonResponse(result, status=status_code)
 
+    if denied := permission_denied_response(request, 'stock.manage'):
+        return denied
     data, error = parse_json_body(request)
     if error:
         return json_response(error)
@@ -30,12 +34,16 @@ def suppliers(request):
 
 @csrf_exempt
 @require_http_methods(["GET", "PUT", "DELETE"])
-@admin_required
+@backoffice_required
 def supplier_detail(request, supplier_id):
     if request.method == "GET":
+        if denied := permission_denied_response(request, 'stock.supplier.view'):
+            return denied
         result, status_code = SupplierService.get(supplier_id)
         return JsonResponse(result, status=status_code)
 
+    if denied := permission_denied_response(request, 'stock.manage'):
+        return denied
     if request.method == "DELETE":
         result, status_code = SupplierService.deactivate(supplier_id)
         return JsonResponse(result, status=status_code)
@@ -50,12 +58,16 @@ def supplier_detail(request, supplier_id):
 
 @csrf_exempt
 @require_http_methods(["GET", "POST"])
-@admin_required
+@backoffice_required
 def supplier_items(request, supplier_id):
     if request.method == "GET":
+        if denied := permission_denied_response(request, 'stock.supplier.view'):
+            return denied
         result, status_code = SupplierService.get(supplier_id, include_items=True, include_stats=False)
         return JsonResponse(result, status=status_code)
 
+    if denied := permission_denied_response(request, 'stock.manage'):
+        return denied
     data, error = parse_json_body(request)
     if error:
         return json_response(error)
@@ -87,11 +99,17 @@ def supplier_pay(request, supplier_id):
 
 @csrf_exempt
 @require_http_methods(["GET"])
-@admin_required
+@backoffice_required
 def supplier_ledger(request, supplier_id):
     """Supplier balance ledger (purchases, payments, returns, adjustments)."""
+    if denied := permission_denied_response(request, 'stock.supplier.view'):
+        return denied
     from stock.services.supplier_ledger_service import SupplierLedgerService
     result, status_code = SupplierLedgerService.history(
         supplier_id, page=safe_page(request), per_page=safe_per_page(request, 20),
+        date_from=safe_date(request, 'date_from'),
+        date_to=safe_date(request, 'date_to'),
+        transaction_type=request.GET.get('transaction_type'),
+        source_reference=request.GET.get('source_reference'),
     )
     return JsonResponse(result, status=status_code)

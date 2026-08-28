@@ -8,6 +8,7 @@ from django.utils import timezone
 from base.helpers.response import ServiceResponse
 from stock.models import (
     PurchaseOrder, PurchaseOrderItem, PurchaseReceiving, PurchaseReceivingItem,
+    PurchaseReceivingCorrection,
     SupplierStockItem, StockBatch, StockSettings
 )
 from stock.services.base_service import to_decimal, generate_number
@@ -61,11 +62,16 @@ class PurchaseOrderService:
             "received_date": po.received_date.isoformat() if po.received_date else None,
             "payment_due_date": po.payment_due_date.isoformat() if po.payment_due_date else None,
 
-            "subtotal": str(po.subtotal),
-            "tax_amount": str(po.tax_amount),
-            "shipping_cost": str(po.shipping_cost),
-            "discount": str(po.discount),
-            "total": str(po.total),
+            "subtotal_uzs": int(po.subtotal),
+            "subtotal": int(po.subtotal),
+            "tax_amount_uzs": int(po.tax_amount),
+            "tax_amount": int(po.tax_amount),
+            "shipping_cost_uzs": int(po.shipping_cost),
+            "shipping_cost": int(po.shipping_cost),
+            "discount_uzs": int(po.discount),
+            "discount": int(po.discount),
+            "total_uzs": int(po.total),
+            "total": int(po.total),
             "currency": po.currency,
 
             "created_by_id": po.created_by_id,
@@ -100,7 +106,8 @@ class PurchaseOrderService:
             "status": po.status,
             "status_display": po.get_status_display(),
             "order_date": po.order_date.isoformat(),
-            "total": str(po.total),
+            "total_uzs": int(po.total),
+            "total": int(po.total),
             "currency": po.currency,
         }
 
@@ -548,12 +555,17 @@ class PurchaseOrderItemService:
             },
             "quantity_ordered": str(item.quantity_ordered),
             "quantity_received": str(item.quantity_received),
-            "quantity_pending": str(item.quantity_ordered - item.quantity_received),
+            "quantity_canceled": str(item.quantity_canceled),
+            "quantity_pending": str(max(
+                Decimal('0'), item.quantity_ordered - item.quantity_received - item.quantity_canceled,
+            )),
             "unit": item.unit.short_name,
-            "unit_price": str(item.unit_price),
+            "unit_price_uzs": int(item.unit_price),
+            "unit_price": int(item.unit_price),
             "discount_percent": str(item.discount_percent),
             "tax_percent": str(item.tax_percent),
-            "total_price": str(item.total_price),
+            "total_price_uzs": int(item.total_price),
+            "total_price": int(item.total_price),
             "notes": item.notes,
         }
 
@@ -684,6 +696,15 @@ class PurchaseReceivingService:
             "received_by_id": rcv.received_by_id,
             "status": rcv.status,
             "status_display": rcv.get_status_display(),
+            "completed_at": rcv.completed_at.isoformat() if rcv.completed_at else None,
+            "supplier_balance_before_uzs": (
+                int(rcv.supplier_balance_before)
+                if rcv.supplier_balance_before is not None else None
+            ),
+            "supplier_balance_after_uzs": (
+                int(rcv.supplier_balance_after)
+                if rcv.supplier_balance_after is not None else None
+            ),
             "notes": rcv.notes,
             "created_at": rcv.created_at.isoformat(),
         }
@@ -780,18 +801,74 @@ class PurchaseReceivingService:
         if not rcv:
             return ServiceResponse.not_found("Receiving not found")
 
+        if rcv.status == PurchaseReceiving.Status.COMPLETED:
+            return cls._completion_response(rcv)
         if rcv.status != PurchaseReceiving.Status.DRAFT:
-            return ServiceResponse.error("Receiving already completed")
+            return ServiceResponse.error("Receiving cannot be completed")
 
         if not rcv.items.exists():
             return ServiceResponse.error("No items in receiving")
 
         settings = StockSettings.load()
-        po = rcv.purchase_order
-        received_value = Decimal("0")
+        po = PurchaseOrder.objects.select_for_update().get(pk=rcv.purchase_order_id)
+        receiving_items = list(
+            rcv.items.select_related("stock_item", "unit", "po_item").order_by('id')
+        )
+        if any(item.quality_status == PurchaseReceivingItem.QualityStatus.PENDING
+               for item in receiving_items):
+            return ServiceResponse.validation_error(
+                errors={'quality_status': 'Resolve all PENDING quality results before completion'},
+            )
+        errors = {}
+        for item in receiving_items:
+            if item.unit_cost != item.unit_cost.to_integral_value() or item.unit_cost < 0:
+                errors[f'items.{item.id}.unit_cost'] = 'Must be a non-negative whole UZS integer'
+            if item.stock_item.track_batches and not item.batch_number.strip():
+                errors[f'items.{item.id}.batch_number'] = 'Required for batch-tracked items'
+            if item.stock_item.track_expiry and not item.expiry_date:
+                errors[f'items.{item.id}.expiry_date'] = 'Required for expiry-tracked items'
+            if item.quality_status == PurchaseReceivingItem.QualityStatus.FAILED and not item.notes.strip():
+                errors[f'items.{item.id}.notes'] = 'Required for failed quality'
+        received_value = sum(
+            (to_decimal(item.unit_cost) * to_decimal(item.quantity_received)
+             for item in receiving_items
+             if item.quality_status == PurchaseReceivingItem.QualityStatus.PASSED),
+            Decimal('0'),
+        )
+        if received_value != received_value.to_integral_value():
+            errors['received_total_uzs'] = 'Receiving total must be a whole UZS amount'
+        if errors:
+            return ServiceResponse.validation_error(errors=errors)
 
-        for item in rcv.items.select_related("stock_item", "unit", "po_item"):
-            received_value += to_decimal(item.unit_cost) * to_decimal(item.quantity_received)
+        # Lock every affected PO line and validate the aggregate under one PO
+        # lock. This closes both the multiple-lines-in-one-draft hole and the
+        # concurrent-receivings over-post race.
+        line_ids = sorted({item.po_item_id for item in receiving_items})
+        locked_lines = {
+            line.id: line for line in PurchaseOrderItem.objects.select_for_update()
+            .filter(id__in=line_ids).order_by('id')
+        }
+        for line_id in line_ids:
+            passed_qty = sum(
+                (item.quantity_received for item in receiving_items
+                 if item.po_item_id == line_id
+                 and item.quality_status == PurchaseReceivingItem.QualityStatus.PASSED),
+                Decimal('0'),
+            )
+            line = locked_lines[line_id]
+            allowed = line.quantity_ordered - line.quantity_canceled
+            if line.quantity_received + passed_qty > allowed and not rcv.over_receipt_approved_by_id:
+                return ({
+                    'success': False,
+                    'message': 'Manager approval is required for over-receipt',
+                    'errors': {'po_item_id': line_id, 'code': 'over_receipt_approval_required'},
+                }, 409)
+
+        for item in receiving_items:
+            # A failed inspection remains immutable evidence but never creates
+            # usable stock or supplier debt.
+            if item.quality_status == PurchaseReceivingItem.QualityStatus.FAILED:
+                continue
             batch = None
             if settings.track_batches or item.stock_item.track_batches:
                 from .batch_service import StockBatchService
@@ -843,10 +920,7 @@ class PurchaseReceivingService:
             # overwritten. Lock the row first, increment the current value, and
             # use one SyncMixin.save() so both the quantity and sync version are
             # published atomically.
-            PurchaseOrderItem = item.po_item.__class__
-            po_item = PurchaseOrderItem.objects.select_for_update().get(
-                pk=item.po_item_id,
-            )
+            po_item = locked_lines[item.po_item_id]
             po_item.quantity_received += item.quantity_received
             po_item.save(update_fields=['quantity_received'])
 
@@ -859,25 +933,175 @@ class PurchaseReceivingService:
                 transaction.set_rollback(True)
                 return cost_result, cost_status
 
-        rcv.status = PurchaseReceiving.Status.COMPLETED
-        rcv.save(update_fields=["status", "updated_at"])
-
         cls._update_po_status(po)
 
         # Record the supplier debt: receiving goods worth `received_value` means
         # we now owe the supplier that much (a PURCHASE ledger row). Previously
         # the debt was never recorded — the money owed vanished.
+        before = po.supplier.current_balance
+        after = before
         if received_value > 0 and po.supplier_id:
             from .supplier_ledger_service import SupplierLedgerService
-            SupplierLedgerService.record_purchase(
+            supplier_txn = SupplierLedgerService.record_purchase(
                 po.supplier_id, received_value,
                 reference_type="PurchaseReceiving", reference_id=rcv.id,
                 performed_by=rcv.received_by,
             )
+            if supplier_txn is None:
+                transaction.set_rollback(True)
+                return ServiceResponse.not_found('Supplier not found')
+            before = supplier_txn.balance_before
+            after = supplier_txn.balance_after
 
+        rcv.status = PurchaseReceiving.Status.COMPLETED
+        rcv.completed_at = timezone.now()
+        rcv.supplier_balance_before = before
+        rcv.supplier_balance_after = after
+        rcv.save(update_fields=[
+            "status", "completed_at", "supplier_balance_before",
+            "supplier_balance_after", "updated_at",
+        ])
+
+        return cls._completion_response(rcv)
+
+    @classmethod
+    def _completion_response(cls, rcv):
         return ServiceResponse.success(data={
-            "receiving": cls.serialize(rcv)
-        }, message="Receiving completed")
+            'receiving_id': str(rcv.uuid),
+            'status': 'COMPLETE',
+            'supplier_id': str(rcv.purchase_order.supplier.uuid),
+            'supplier_balance_before_uzs': int(rcv.supplier_balance_before or 0),
+            'supplier_balance_after_uzs': int(rcv.supplier_balance_after or 0),
+            'posted_at': rcv.completed_at.isoformat() if rcv.completed_at else None,
+            'timezone': 'Asia/Tashkent',
+            'receiving': cls.serialize(rcv),
+        }, message='Receiving completed')
+
+    @classmethod
+    @transaction.atomic
+    def request_correction(cls, receiving_id, requested_by, reason):
+        rcv = PurchaseReceiving.objects.select_for_update().filter(
+            id=receiving_id, is_deleted=False,
+        ).first()
+        if not rcv:
+            return ServiceResponse.not_found('Receiving not found')
+        if rcv.status != PurchaseReceiving.Status.COMPLETED:
+            return ({'success': False, 'message': 'Only completed receiving can be corrected',
+                     'errors': {'code': 'receiving_not_completed'}}, 409)
+        reason = str(reason or '').strip()
+        if not reason:
+            return ServiceResponse.validation_error(errors={'reason': 'Required'})
+        existing = rcv.corrections.filter(status=PurchaseReceivingCorrection.Status.PENDING,
+                                          is_deleted=False).first()
+        if existing:
+            return ServiceResponse.success(data={'correction_id': existing.id,
+                                                 'status': existing.status})
+        row = PurchaseReceivingCorrection.objects.create(
+            receiving=rcv, reason=reason, requested_by=requested_by,
+            branch_id=rcv.branch_id,
+        )
+        return ServiceResponse.created(data={'correction_id': row.id, 'status': row.status})
+
+    @classmethod
+    @transaction.atomic
+    def review_correction(cls, correction_id, reviewer, approve, note):
+        correction = PurchaseReceivingCorrection.objects.select_for_update().select_related(
+            'receiving__purchase_order__supplier', 'requested_by', 'reviewed_by',
+        ).filter(id=correction_id, is_deleted=False).first()
+        if not correction:
+            return ServiceResponse.not_found('Receiving correction not found')
+        if correction.status == PurchaseReceivingCorrection.Status.APPROVED:
+            return ServiceResponse.success(data={
+                'correction_id': correction.id, 'status': correction.status,
+                'supplier_balance_before_uzs': int(correction.supplier_balance_before or 0),
+                'supplier_balance_after_uzs': int(correction.supplier_balance_after or 0),
+            })
+        if correction.status != PurchaseReceivingCorrection.Status.PENDING:
+            return ({'success': False, 'message': 'Correction already reviewed',
+                     'errors': {'code': 'correction_already_reviewed'}}, 409)
+        if correction.requested_by_id == reviewer.id:
+            return ({'success': False, 'message': 'You cannot approve your own correction',
+                     'errors': {'code': 'self_approval_forbidden'}}, 403)
+        note = str(note or '').strip()
+        if not note:
+            return ServiceResponse.validation_error(errors={'review_note': 'Required'})
+        if not approve:
+            correction.status = PurchaseReceivingCorrection.Status.REJECTED
+            correction.reviewed_by = reviewer
+            correction.reviewed_at = timezone.now()
+            correction.review_note = note
+            correction.save(update_fields=['status', 'reviewed_by', 'reviewed_at', 'review_note'])
+            return ServiceResponse.success(data={'correction_id': correction.id,
+                                                 'status': correction.status})
+
+        rcv = PurchaseReceiving.objects.select_for_update().get(pk=correction.receiving_id)
+        if rcv.corrections.filter(status=PurchaseReceivingCorrection.Status.APPROVED,
+                                  is_deleted=False).exclude(pk=correction.pk).exists():
+            return ({'success': False, 'message': 'Receiving was already reversed',
+                     'errors': {'code': 'receiving_already_reversed'}}, 409)
+        po = PurchaseOrder.objects.select_for_update().get(pk=rcv.purchase_order_id)
+        items = list(rcv.items.select_related('stock_item', 'unit', 'po_item', 'batch_created'))
+        passed = [item for item in items
+                  if item.quality_status == PurchaseReceivingItem.QualityStatus.PASSED]
+        from stock.models import StockBatch
+        from .level_service import StockLevelService
+        batches = {}
+        for item in passed:
+            level = StockLevelService.get_level_for_update(item.stock_item_id, rcv.location_id)
+            if level.quantity < item.quantity_received:
+                return ({'success': False, 'message': 'Received stock has already been consumed',
+                         'errors': {'code': 'receiving_reversal_stock_unavailable',
+                                    'stock_item_id': item.stock_item_id}}, 409)
+            if item.batch_created_id:
+                batch = StockBatch.objects.select_for_update().get(pk=item.batch_created_id)
+                if batch.current_quantity < item.quantity_received:
+                    return ({'success': False, 'message': 'Received batch has already been consumed',
+                             'errors': {'code': 'receiving_reversal_batch_unavailable',
+                                        'batch_id': batch.id}}, 409)
+                batches[item.id] = batch
+        line_ids = sorted({item.po_item_id for item in passed})
+        lines = {line.id: line for line in PurchaseOrderItem.objects.select_for_update()
+                 .filter(id__in=line_ids).order_by('id')}
+        reversed_value = Decimal('0')
+        for item in passed:
+            result, status = StockLevelService.adjust(
+                stock_item_id=item.stock_item_id, location_id=rcv.location_id,
+                quantity=item.quantity_received, movement_type='RETURN_TO_SUPPLIER',
+                user_id=reviewer.id, unit_id=item.unit_id,
+                batch_id=item.batch_created_id,
+                reference_type='PurchaseReceivingCorrection', reference_id=correction.id,
+                unit_cost=item.unit_cost, notes=note,
+            )
+            if status >= 400:
+                transaction.set_rollback(True)
+                return result, status
+            if item.id in batches:
+                batch = batches[item.id]
+                batch.current_quantity -= item.quantity_received
+                batch.save(update_fields=['current_quantity', 'updated_at'])
+            line = lines[item.po_item_id]
+            line.quantity_received = max(Decimal('0'), line.quantity_received - item.quantity_received)
+            line.save(update_fields=['quantity_received'])
+            reversed_value += item.unit_cost * item.quantity_received
+        cls._update_po_status(po)
+        from .supplier_ledger_service import SupplierLedgerService
+        supplier_txn = SupplierLedgerService.record_return(
+            po.supplier_id, reversed_value, reference_type='PurchaseReceivingCorrection',
+            reference_id=correction.id, performed_by=reviewer, note=note,
+        )
+        correction.status = PurchaseReceivingCorrection.Status.APPROVED
+        correction.reviewed_by = reviewer
+        correction.reviewed_at = timezone.now()
+        correction.review_note = note
+        correction.supplier_balance_before = supplier_txn.balance_before
+        correction.supplier_balance_after = supplier_txn.balance_after
+        correction.save()
+        return ServiceResponse.success(data={
+            'correction_id': correction.id, 'status': correction.status,
+            'supplier_balance_before_uzs': int(correction.supplier_balance_before),
+            'supplier_balance_after_uzs': int(correction.supplier_balance_after),
+            'reversed_at': correction.reviewed_at.isoformat(),
+        })
 
     @classmethod
     @transaction.atomic
@@ -907,12 +1131,6 @@ class PurchaseReceivingService:
                     errors={"quantity_received": "Must be greater than 0"},
                 )
 
-            pending = item.po_item.quantity_ordered - item.po_item.quantity_received
-            if quantity_received > pending:
-                return ServiceResponse.validation_error(
-                    errors={"quantity_received": f"Cannot receive more than pending quantity ({pending})"}
-                )
-
             item.quantity_received = quantity_received
 
         if batch_number is not None:
@@ -922,13 +1140,45 @@ class PurchaseReceivingService:
             item.expiry_date = expiry_date
 
         if unit_cost is not None:
-            item.unit_cost = to_decimal(unit_cost)
+            unit_cost = to_decimal(unit_cost)
+            if unit_cost < 0 or unit_cost != unit_cost.to_integral_value():
+                return ServiceResponse.validation_error(
+                    errors={'unit_cost': 'Must be a non-negative whole UZS integer'},
+                )
+            item.unit_cost = unit_cost
 
         if quality_status is not None:
+            if quality_status not in PurchaseReceivingItem.QualityStatus.values:
+                return ServiceResponse.validation_error(
+                    errors={'quality_status': 'Must be PASSED, FAILED, or PENDING'},
+                )
             item.quality_status = quality_status
 
         if notes is not None:
             item.notes = notes
+
+        if item.stock_item.track_batches and not item.batch_number.strip():
+            return ServiceResponse.validation_error(
+                errors={'batch_number': 'Required for batch-tracked items'},
+            )
+        if item.stock_item.track_expiry and not item.expiry_date:
+            return ServiceResponse.validation_error(
+                errors={'expiry_date': 'Required for expiry-tracked items'},
+            )
+        pending = max(
+            Decimal('0'), item.po_item.quantity_ordered
+            - item.po_item.quantity_received - item.po_item.quantity_canceled,
+        )
+        tolerance = StockSettings.load().receiving_quantity_tolerance_percent or Decimal('0')
+        variance_percent = (
+            abs(item.quantity_received - pending) * Decimal('100') / pending
+            if pending else Decimal('100')
+        )
+        if (item.quality_status == PurchaseReceivingItem.QualityStatus.FAILED
+                or variance_percent > tolerance) and not item.notes.strip():
+            return ServiceResponse.validation_error(
+                errors={'notes': 'Required for failed quality or quantity variance'},
+            )
 
         item.save()
 
@@ -941,7 +1191,7 @@ class PurchaseReceivingService:
         items = po.items.all()
 
         fully_received = all(
-            item.quantity_received >= item.quantity_ordered
+            item.quantity_received >= item.quantity_ordered - item.quantity_canceled
             for item in items
         )
         partially_received = any(
@@ -954,6 +1204,10 @@ class PurchaseReceivingService:
             po.received_date = timezone.localdate()
         elif partially_received:
             po.status = PurchaseOrder.Status.PARTIAL
+            po.received_date = None
+        else:
+            po.status = PurchaseOrder.Status.CONFIRMED
+            po.received_date = None
 
         po.save(update_fields=["status", "received_date", "updated_at"])
 
@@ -973,7 +1227,8 @@ class PurchaseReceivingItemService:
             "unit": item.unit.short_name,
             "batch_number": item.batch_number,
             "expiry_date": item.expiry_date.isoformat() if item.expiry_date else None,
-            "unit_cost": str(item.unit_cost),
+            "unit_cost_uzs": int(item.unit_cost),
+            "unit_cost": int(item.unit_cost),
             "quality_status": item.quality_status,
             "notes": item.notes,
             "batch_created_id": item.batch_created_id,
@@ -1019,11 +1274,37 @@ class PurchaseReceivingItemService:
             )
 
         already_received = po_item.quantity_received
-        pending = po_item.quantity_ordered - already_received
+        pending = max(
+            Decimal('0'), po_item.quantity_ordered - already_received - po_item.quantity_canceled,
+        )
 
-        if quantity_received > pending:
+        unit_cost = to_decimal(unit_cost if unit_cost is not None else po_item.unit_price)
+        if unit_cost < 0 or unit_cost != unit_cost.to_integral_value():
             return ServiceResponse.validation_error(
-                errors={"quantity_received": f"Cannot receive more than pending quantity ({pending})"}
+                errors={'unit_cost': 'Must be a non-negative whole UZS integer'},
+            )
+        if quality_status not in PurchaseReceivingItem.QualityStatus.values:
+            return ServiceResponse.validation_error(
+                errors={'quality_status': 'Must be PASSED, FAILED, or PENDING'},
+            )
+        if po_item.stock_item.track_batches and not str(batch_number or '').strip():
+            return ServiceResponse.validation_error(
+                errors={'batch_number': 'Required for batch-tracked items'},
+            )
+        if po_item.stock_item.track_expiry and not expiry_date:
+            return ServiceResponse.validation_error(
+                errors={'expiry_date': 'Required for expiry-tracked items'},
+            )
+
+        tolerance = StockSettings.load().receiving_quantity_tolerance_percent or Decimal('0')
+        variance_percent = (
+            abs(quantity_received - pending) * Decimal('100') / pending
+            if pending else Decimal('100')
+        )
+        if (quality_status == PurchaseReceivingItem.QualityStatus.FAILED
+                or variance_percent > tolerance) and not str(notes or '').strip():
+            return ServiceResponse.validation_error(
+                errors={'notes': 'Required for failed quality or quantity variance'},
             )
 
         item = PurchaseReceivingItemRepository.create(
@@ -1034,7 +1315,7 @@ class PurchaseReceivingItemService:
             unit=po_item.unit,
             batch_number=batch_number,
             expiry_date=expiry_date,
-            unit_cost=unit_cost or po_item.unit_price,
+            unit_cost=unit_cost,
             quality_status=quality_status,
             notes=notes,
         )

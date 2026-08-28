@@ -3,15 +3,20 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods, require_GET, require_POST
 from base.helpers.request import parse_json_body, safe_page, safe_per_page, safe_int
 from base.helpers.response import json_response
-from base.security.permissions import admin_required
+from base.security.permissions import (
+    admin_required, backoffice_required, backoffice_permission_required,
+    permission_denied_response,
+)
 from stock.services import StockBatchService
 
 
 @csrf_exempt
 @require_http_methods(["GET", "POST"])
-@admin_required
+@backoffice_required
 def batches(request):
     if request.method == "GET":
+        if denied := permission_denied_response(request, 'stock.batch.view'):
+            return denied
         expiring_within_days = None
         if request.GET.get("expiring_within_days"):
             expiring_within_days = safe_int(request, "expiring_within_days", minimum=0, maximum=3650)
@@ -28,6 +33,8 @@ def batches(request):
         )
         return JsonResponse(result, status=status_code)
 
+    if denied := permission_denied_response(request, 'stock.manage'):
+        return denied
     data, error = parse_json_body(request)
     if error:
         return json_response(error)
@@ -38,12 +45,16 @@ def batches(request):
 
 @csrf_exempt
 @require_http_methods(["GET", "PUT"])
-@admin_required
+@backoffice_required
 def batch_detail(request, batch_id):
     if request.method == "GET":
+        if denied := permission_denied_response(request, 'stock.batch.view'):
+            return denied
         result, status_code = StockBatchService.get(batch_id)
         return JsonResponse(result, status=status_code)
 
+    if denied := permission_denied_response(request, 'stock.manage'):
+        return denied
     data, error = parse_json_body(request)
     if error:
         return json_response(error)
@@ -88,7 +99,7 @@ def batch_auto_consume(request):
 
 @csrf_exempt
 @require_GET
-@admin_required
+@backoffice_permission_required('stock.batch.view')
 def expiring_batches(request):
     days = safe_int(request, "days", 7, minimum=1, maximum=3650)
     result, status_code = StockBatchService.get_expiring_batches(days)
@@ -97,7 +108,7 @@ def expiring_batches(request):
 
 @csrf_exempt
 @require_GET
-@admin_required
+@backoffice_permission_required('stock.batch.view')
 def expired_batches(request):
     result, status_code = StockBatchService.get_expired_batches()
     return JsonResponse(result, status=status_code)

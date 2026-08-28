@@ -51,6 +51,58 @@ class StockLevel(SyncMixin, models.Model):
         return f"{self.stock_item.name} @ {self.location.name}: {self.quantity}"
 
 
+class StockAdjustmentRequest(SyncMixin, models.Model):
+    class Status(models.TextChoices):
+        PENDING = 'PENDING', 'Pending'
+        APPROVED = 'APPROVED', 'Approved'
+        REJECTED = 'REJECTED', 'Rejected'
+        CANCELLED = 'CANCELLED', 'Cancelled'
+
+    stock_item = models.ForeignKey(
+        'stock.StockItem', on_delete=models.PROTECT, related_name='adjustment_requests',
+    )
+    location = models.ForeignKey(
+        'stock.StockLocation', on_delete=models.PROTECT, related_name='adjustment_requests',
+    )
+    unit = models.ForeignKey('stock.StockUnit', on_delete=models.PROTECT, related_name='+')
+    quantity = models.DecimalField(max_digits=15, decimal_places=4)
+    reason = models.TextField()
+    evidence = models.TextField()
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING)
+    requested_by = models.ForeignKey(
+        'base.User', on_delete=models.PROTECT, related_name='stock_adjustment_requests',
+    )
+    requested_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    reviewed_by = models.ForeignKey(
+        'base.User', on_delete=models.PROTECT, null=True, blank=True,
+        related_name='reviewed_stock_adjustment_requests',
+    )
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    review_note = models.TextField(blank=True, default='')
+    stock_transaction = models.OneToOneField(
+        'stock.StockTransaction', on_delete=models.PROTECT, null=True, blank=True,
+        related_name='adjustment_request',
+    )
+
+    objects = SyncManager()
+
+    class Meta:
+        ordering = ['-requested_at']
+
+    def to_sync_dict(self):
+        data = super().to_sync_dict()
+        data['stock_item_uuid'] = str(self.stock_item.uuid) if self.stock_item else None
+        data['location_uuid'] = str(self.location.uuid) if self.location else None
+        data['unit_uuid'] = str(self.unit.uuid) if self.unit else None
+        data['requested_by_uuid'] = str(self.requested_by.uuid) if self.requested_by else None
+        data['reviewed_by_uuid'] = str(self.reviewed_by.uuid) if self.reviewed_by else None
+        data['stock_transaction_uuid'] = (
+            str(self.stock_transaction.uuid) if self.stock_transaction else None
+        )
+        return data
+
+
 class StockBatch(SyncMixin, models.Model):
     class BatchStatus(models.TextChoices):
         AVAILABLE = "AVAILABLE", "Available"
