@@ -634,7 +634,6 @@ class EmployeeWorkSchedule(SyncMixin, models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     objects = SyncManager()
-    SYNC_PULL_SCOPE = 'global'
 
     class Meta:
         ordering = ['employee_id', 'weekday', '-effective_from']
