@@ -36,6 +36,7 @@ class StockLevel(SyncMixin, models.Model):
 
     class Meta:
         unique_together = [("stock_item", "location")]
+        indexes = [models.Index(fields=['branch_id', 'location', 'stock_item'])]
 
     @property
     def available_quantity(self):

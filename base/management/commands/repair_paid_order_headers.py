@@ -53,10 +53,13 @@ class Command(BaseCommand):
         if apply_changes:
             orders = orders.select_for_update()
 
-        concrete_methods = {
-            value for value, _label in Order.PaymentMethod.choices
-            if value != Order.PaymentMethod.MIXED
-        }
+        from base.services.tender import (
+            concrete_payment_methods,
+            configured_electronic_methods,
+        )
+        concrete_methods = concrete_payment_methods(
+            configured_electronic_methods()
+        )
         candidates = []
 
         for order in orders:

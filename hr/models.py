@@ -1,6 +1,13 @@
+import re
+
+from django.core.exceptions import ValidationError
 from django.db import models
 from base.financial import FinancialReportingGroup
 from base.models import SyncMixin, SyncManager
+
+
+def _default_expense_sources():
+    return ['DRAWER', 'SAFE', 'BANK']
 
 
 class Department(SyncMixin, models.Model):
@@ -102,17 +109,32 @@ class Employee(SyncMixin, models.Model):
 
 class ExpenseCategory(SyncMixin, models.Model):
     SYNC_PULL_SCOPE = 'global'
+    code = models.CharField(max_length=64, unique=True)
     name = models.CharField(max_length=100)
     description = models.TextField(blank=True, default='')
     budget_limit = models.DecimalField(
         max_digits=12, decimal_places=2, null=True, blank=True,
     )
     is_active = models.BooleanField(default=True)
+    sort_order = models.PositiveIntegerField(default=0)
+    allowed_sources = models.JSONField(
+        default=_default_expense_sources, blank=True,
+    )
+    requires_receipt = models.BooleanField(default=False)
+    requires_description = models.BooleanField(default=False)
     reporting_group = models.CharField(
         max_length=32,
         choices=FinancialReportingGroup.choices,
         default=FinancialReportingGroup.REVIEW,
         db_index=True,
+    )
+    created_by = models.ForeignKey(
+        'base.User', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='created_expense_categories',
+    )
+    updated_by = models.ForeignKey(
+        'base.User', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='updated_expense_categories',
     )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -121,7 +143,31 @@ class ExpenseCategory(SyncMixin, models.Model):
 
     class Meta:
         verbose_name_plural = 'expense categories'
-        ordering = ['name']
+        ordering = ['sort_order', 'name', 'id']
+
+    def to_sync_dict(self):
+        data = super().to_sync_dict()
+        data['created_by_uuid'] = str(self.created_by.uuid) if self.created_by else None
+        data['updated_by_uuid'] = str(self.updated_by.uuid) if self.updated_by else None
+        return data
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            original = type(self).objects.filter(pk=self.pk).values_list(
+                'code', flat=True,
+            ).first()
+            if original is not None and self.code != original:
+                raise ValidationError({'code': 'Code is immutable.'})
+        elif not str(self.code or '').strip():
+            stem = re.sub(
+                r'[^A-Z0-9]+', '_', str(self.name or '').upper(),
+            ).strip('_') or 'EXPENSE'
+            stem = stem[:55]
+            candidate = stem
+            if type(self).objects.filter(code=candidate).exists():
+                candidate = f'{stem}_{self.uuid.hex[:8].upper()}'
+            self.code = candidate
+        return super().save(*args, **kwargs)
 
     def __str__(self):
         return self.name
@@ -140,6 +186,13 @@ class Expense(SyncMixin, models.Model):
         APPROVED = 'APPROVED', 'Approved'
         REJECTED = 'REJECTED', 'Rejected'
         PAID = 'PAID', 'Paid'
+        CANCELED = 'CANCELED', 'Canceled'
+        VOIDED = 'VOIDED', 'Voided'
+
+    class Source(models.TextChoices):
+        DRAWER = 'DRAWER', 'Shift drawer'
+        SAFE = 'SAFE', 'Safe'
+        BANK = 'BANK', 'Bank'
 
     category = models.ForeignKey(
         ExpenseCategory,
@@ -148,6 +201,9 @@ class Expense(SyncMixin, models.Model):
         blank=True,
         related_name='expenses',
     )
+    category_code_snapshot = models.CharField(max_length=64, blank=True, default='')
+    category_name_snapshot = models.CharField(max_length=100, blank=True, default='')
+    category_allowed_sources_snapshot = models.JSONField(default=list, blank=True)
     amount = models.DecimalField(max_digits=12, decimal_places=2)
     description = models.TextField(blank=True, default='')
     expense_date = models.DateField()
@@ -160,6 +216,21 @@ class Expense(SyncMixin, models.Model):
         max_length=10,
         choices=Status.choices,
         default=Status.PENDING,
+    )
+    requested_source = models.CharField(
+        max_length=10, choices=Source.choices, blank=True, default='',
+    )
+    shift = models.ForeignKey(
+        'base.Shift', on_delete=models.PROTECT, null=True, blank=True,
+        related_name='expense_requests',
+    )
+    subject_user = models.ForeignKey(
+        'base.User', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='expense_requests_as_subject',
+    )
+    fee_uzs = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    fee_percent = models.DecimalField(
+        max_digits=7, decimal_places=4, null=True, blank=True,
     )
     receipt_number = models.CharField(max_length=100, blank=True, default='')
     receipt_image_url = models.URLField(
@@ -190,6 +261,31 @@ class Expense(SyncMixin, models.Model):
         blank=True,
         related_name='paid_expenses',
     )
+    canceled_by = models.ForeignKey(
+        'base.User', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='canceled_expenses',
+    )
+    voided_by = models.ForeignKey(
+        'base.User', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='voided_expenses',
+    )
+    treasury_transaction = models.OneToOneField(
+        'base.TreasuryTransaction', on_delete=models.PROTECT,
+        null=True, blank=True, related_name='expense_payment',
+    )
+    treasury_reversal = models.OneToOneField(
+        'base.TreasuryTransaction', on_delete=models.PROTECT,
+        null=True, blank=True, related_name='expense_void',
+    )
+    payment_action_id = models.UUIDField(null=True, blank=True, unique=True)
+    void_action_id = models.UUIDField(null=True, blank=True, unique=True)
+    approved_at = models.DateTimeField(null=True, blank=True)
+    rejected_at = models.DateTimeField(null=True, blank=True)
+    paid_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    canceled_at = models.DateTimeField(null=True, blank=True)
+    voided_at = models.DateTimeField(null=True, blank=True)
+    cancel_reason = models.TextField(blank=True, default='')
+    void_reason = models.TextField(blank=True, default='')
     notes = models.TextField(blank=True, default='')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -198,17 +294,68 @@ class Expense(SyncMixin, models.Model):
 
     class Meta:
         ordering = ['-expense_date', '-created_at']
+        indexes = [
+            models.Index(fields=['branch_id', 'status', 'expense_date']),
+            models.Index(fields=['branch_id', 'category', 'paid_at']),
+        ]
 
     def to_sync_dict(self):
         data = super().to_sync_dict()
         data['expense_category_uuid'] = str(self.category.uuid) if self.category else None
+        data['shift_uuid'] = str(self.shift.uuid) if self.shift else None
+        data['subject_user_uuid'] = (
+            str(self.subject_user.uuid) if self.subject_user else None
+        )
         data['created_by_uuid'] = str(self.created_by.uuid) if self.created_by else None
         data['approved_by_uuid'] = str(self.approved_by.uuid) if self.approved_by else None
         data['paid_by_uuid'] = str(self.paid_by.uuid) if self.paid_by else None
+        data['canceled_by_uuid'] = str(self.canceled_by.uuid) if self.canceled_by else None
+        data['voided_by_uuid'] = str(self.voided_by.uuid) if self.voided_by else None
         return data
 
     def __str__(self):
         return f"Expense #{self.id} - {self.amount} ({self.status})"
+
+
+class ExpenseTransition(SyncMixin, models.Model):
+    expense = models.ForeignKey(
+        Expense, on_delete=models.PROTECT, related_name='transitions',
+    )
+    previous_status = models.CharField(max_length=10, blank=True, default='')
+    new_status = models.CharField(max_length=10)
+    actor = models.ForeignKey(
+        'base.User', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='expense_transitions',
+    )
+    actor_display_snapshot = models.CharField(max_length=200, blank=True, default='')
+    reason = models.TextField(blank=True, default='')
+    idempotency_key = models.CharField(max_length=128, blank=True, default='')
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    objects = SyncManager()
+    _sync_append_only = True
+
+    class Meta:
+        ordering = ['created_at', 'id']
+        indexes = [models.Index(fields=['expense', 'created_at'])]
+
+    def to_sync_dict(self):
+        data = super().to_sync_dict()
+        data['expense_uuid'] = str(self.expense.uuid)
+        data['actor_uuid'] = str(self.actor.uuid) if self.actor else None
+        return data
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            raise TypeError('ExpenseTransition is append-only and cannot be updated')
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise TypeError('ExpenseTransition is append-only and cannot be deleted')
+
+    def hard_delete(self, *args, **kwargs):
+        raise TypeError('ExpenseTransition is append-only and cannot be deleted')
 
 
 class SalaryPayment(SyncMixin, models.Model):

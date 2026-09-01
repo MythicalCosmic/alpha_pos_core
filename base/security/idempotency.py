@@ -2,6 +2,7 @@ import hashlib
 import json
 import logging
 from functools import wraps
+from urllib.parse import parse_qsl, urlencode
 from uuid import UUID, uuid5
 
 from django.db import IntegrityError, transaction
@@ -31,6 +32,7 @@ def _in_progress_response(retry_after_seconds=None):
     response = JsonResponse(
         {
             'success': False,
+            'code': 'IDEMPOTENCY_REQUEST_IN_PROGRESS',
             'message': 'Duplicate request - original is still in progress.',
         },
         status=409,
@@ -69,6 +71,7 @@ def _try_take_over_stale_claim(record):
 def idempotent(
     scope,
     *,
+    required=False,
     fallback_key_from_request=False,
     expose_action_id=False,
     recover_inflight_after_seconds=None,
@@ -117,6 +120,16 @@ def idempotent(
             supplied_key = (
                 request.META.get('HTTP_IDEMPOTENCY_KEY') or ''
             ).strip()
+            if required and not supplied_key:
+                return JsonResponse(
+                    {
+                        'success': False,
+                        'code': 'IDEMPOTENCY_KEY_REQUIRED',
+                        'message': 'Idempotency-Key is required.',
+                        'errors': {'Idempotency-Key': ['This header is required.']},
+                    },
+                    status=422,
+                )
             if len(supplied_key) > 128:
                 # Silently bypassing protection for an invalid client key is
                 # dangerous: the caller believes it supplied a retry identity
@@ -124,11 +137,12 @@ def idempotent(
                 return JsonResponse(
                     {
                         'success': False,
+                        'code': 'IDEMPOTENCY_KEY_INVALID',
                         'message': (
                             'Idempotency-Key must be at most 128 characters.'
                         ),
                     },
-                    status=400,
+                    status=422,
                 )
             if not supplied_key and not fallback_key_from_request:
                 return view_func(request, *args, **kwargs)
@@ -148,20 +162,44 @@ def idempotent(
             resource_hash = hashlib.sha256(
                 resource.encode('utf-8')
             ).hexdigest()[:16]
+            from base.services.branch_scope import resolve_actor_branch
+
+            branch_id = resolve_actor_branch(actor) or str(
+                getattr(actor, 'branch_id', '') or ''
+            ).strip()
             full_scope = (
-                f'{view_func.__module__}:{actor_id}:{scope}:{resource_hash}'
+                f'actor:{actor_id}:branch:{branch_id}:operation:{scope}:'
+                f'resource:{resource_hash}'
             )
+            body = request.body or b''
+            try:
+                parsed_body = json.loads(body) if body else None
+            except (TypeError, ValueError):
+                canonical_body = body
+            else:
+                canonical_body = json.dumps(
+                    parsed_body,
+                    sort_keys=True,
+                    separators=(',', ':'),
+                    ensure_ascii=True,
+                ).encode('utf-8')
+            query = urlencode(sorted(parse_qsl(
+                request.META.get('QUERY_STRING') or '',
+                keep_blank_values=True,
+            )))
             fingerprint_input = b'\x00'.join((
                 request.method.encode('utf-8'),
                 request.path_info.encode('utf-8'),
-                (request.META.get('QUERY_STRING') or '').encode('utf-8'),
-                request.body or b'',
+                query.encode('utf-8'),
+                canonical_body,
             ))
             request_fingerprint = hashlib.sha256(
                 fingerprint_input
             ).hexdigest()
             key_was_generated = not bool(supplied_key)
             key = supplied_key or f'auto:{request_fingerprint}'
+            request.idempotency_key = key
+            request.idempotency_request_hash = request_fingerprint
 
             if expose_action_id:
                 action_name = '\x00'.join((
@@ -210,6 +248,7 @@ def idempotent(
                     return JsonResponse(
                         {
                             'success': False,
+                            'code': 'IDEMPOTENCY_KEY_REUSED',
                             'message': (
                                 'Idempotency-Key was already used for a '
                                 'different request.'

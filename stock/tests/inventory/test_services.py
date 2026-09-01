@@ -582,6 +582,41 @@ class TestSupplierLedger:
         from stock.models import Supplier
         return Supplier.objects.create(name='ACME Foods')
 
+    @staticmethod
+    def _record_received_purchase(supplier, location, actor, amount, suffix):
+        from django.utils import timezone
+        from stock.models import PurchaseOrder, PurchaseReceiving
+        from stock.services.supplier_ledger_service import SupplierLedgerService
+
+        po = PurchaseOrder.objects.create(
+            order_number=f'PO-{suffix}',
+            supplier=supplier,
+            delivery_location=location,
+            order_date=timezone.localdate(),
+            created_by=actor,
+            total=amount,
+        )
+        receiving = PurchaseReceiving.objects.create(
+            receiving_number=f'RCV-{suffix}',
+            purchase_order=po,
+            location=location,
+            received_date=timezone.localdate(),
+            received_by=actor,
+            status=PurchaseReceiving.Status.COMPLETED,
+            completed_at=timezone.now(),
+            received_value_uzs=amount,
+        )
+        ledger = SupplierLedgerService.record_purchase(
+            supplier.id,
+            amount,
+            reference_type='PurchaseReceiving',
+            reference_id=receiving.id,
+            performed_by=actor,
+        )
+        receiving.supplier_transaction = ledger
+        receiving.save(update_fields=['supplier_transaction'])
+        return po
+
     def test_record_purchase_increases_balance(self):
         from stock.services.supplier_ledger_service import SupplierLedgerService
         s = self._supplier()
@@ -590,27 +625,35 @@ class TestSupplierLedger:
         s.refresh_from_db()
         assert s.current_balance == Decimal('50000.00')
 
-    def test_pay_supplier_from_safe_reduces_balance_and_debits_treasury(self):
+    def test_pay_supplier_from_safe_reduces_balance_and_debits_treasury(
+        self, location, admin_user,
+    ):
         from decimal import Decimal as D
         from stock.services.supplier_ledger_service import SupplierLedgerService
         from base.models import TreasuryAccount
         TreasuryAccount.objects.create(kind='SAFE', balance=D('100000'))
         s = self._supplier()
-        SupplierLedgerService.record_purchase(s.id, D('50000'))
+        self._record_received_purchase(
+            s, location, admin_user, D('50000'), 'FUNDED-SAFE',
+        )
         result, status = SupplierLedgerService.pay_supplier(
             s.id, D('30000'), source_account='SAFE')
-        assert status == 200, result
+        assert status == 201, result
         s.refresh_from_db()
         assert s.current_balance == D('20000.00')  # 50k owed - 30k paid
         assert TreasuryAccount.objects.get(kind='SAFE').balance == D('70000.00')
 
-    def test_pay_supplier_insufficient_safe_is_rejected(self):
+    def test_pay_supplier_insufficient_safe_is_rejected(
+        self, location, admin_user,
+    ):
         from decimal import Decimal as D
         from stock.services.supplier_ledger_service import SupplierLedgerService
         from base.models import TreasuryAccount
         TreasuryAccount.objects.create(kind='SAFE', balance=D('100'))
         s = self._supplier()
-        SupplierLedgerService.record_purchase(s.id, D('50000'))
+        self._record_received_purchase(
+            s, location, admin_user, D('50000'), 'INSUFFICIENT-SAFE',
+        )
         result, status = SupplierLedgerService.pay_supplier(
             s.id, D('30000'), source_account='SAFE')
         assert status >= 400
@@ -618,22 +661,26 @@ class TestSupplierLedger:
         # Treasury rejected before the supplier ledger moved.
         assert s.current_balance == D('50000.00')
 
-    def test_bank_payment_commission_debits_amount_plus_fee(self):
+    def test_bank_payment_commission_debits_amount_plus_fee(
+        self, location, admin_user,
+    ):
         from decimal import Decimal as D
         from stock.services.supplier_ledger_service import SupplierLedgerService
         from base.models import TreasuryAccount
         TreasuryAccount.objects.create(kind='BANK', balance=D('100000'))
         s = self._supplier()
-        SupplierLedgerService.record_purchase(s.id, D('50000'))
+        self._record_received_purchase(
+            s, location, admin_user, D('50000'), 'FUNDED-BANK',
+        )
         result, status = SupplierLedgerService.pay_supplier(
             s.id, D('30000'), source_account='BANK', commission=D('500'))
-        assert status == 200, result
+        assert status == 201, result
         # amount + fee left the bank.
         assert TreasuryAccount.objects.get(kind='BANK').balance == D('69500.00')
         s.refresh_from_db()
         assert s.current_balance == D('20000.00')  # debt reduced by amount only
 
-    def test_purchase_order_payment_is_locked_and_audited(
+    def test_unfunded_purchase_order_payment_route_is_retired(
         self, location, admin_user,
     ):
         from django.utils import timezone
@@ -656,26 +703,19 @@ class TestSupplierLedger:
             po.id, Decimal('25000.00'), notes='First instalment',
         )
 
-        assert status == 200, result
+        assert status == 410, result
+        assert result['code'] == 'UNFUNDED_PAYMENT_ROUTE_RETIRED'
         po.refresh_from_db()
         supplier.refresh_from_db()
-        assert po.amount_paid == Decimal('25000.00')
-        assert po.payment_status == PurchaseOrder.PaymentStatus.PARTIAL
-        assert supplier.current_balance == Decimal('75000.00')
-
-        payment = SupplierTransaction.objects.get(
+        assert po.amount_paid == Decimal('0.00')
+        assert po.payment_status == PurchaseOrder.PaymentStatus.UNPAID
+        assert supplier.current_balance == Decimal('100000.00')
+        assert not SupplierTransaction.objects.filter(
             supplier=supplier,
             type=SupplierTransaction.Type.PAYMENT,
-            reference_type='PurchaseOrder',
-            reference_id=po.id,
-        )
-        assert payment.amount == Decimal('25000.00')
-        assert payment.balance_before == Decimal('100000.00')
-        assert payment.balance_after == Decimal('75000.00')
-        assert payment.source_account == ''
-        assert payment.note == 'First instalment'
+        ).exists()
 
-    def test_payments_on_different_pos_do_not_overwrite_supplier_balance(
+    def test_unfunded_routes_on_multiple_pos_do_not_mutate_supplier_balance(
         self, location, admin_user,
     ):
         from django.utils import timezone
@@ -701,19 +741,16 @@ class TestSupplierLedger:
             result, status = PurchaseOrderService.record_payment(
                 po.id, Decimal('20000.00'),
             )
-            assert status == 200, result
+            assert status == 410, result
 
         supplier.refresh_from_db()
-        assert supplier.current_balance == Decimal('60000.00')
+        assert supplier.current_balance == Decimal('100000.00')
         payments = SupplierTransaction.objects.filter(
             supplier=supplier,
             type=SupplierTransaction.Type.PAYMENT,
             reference_type='PurchaseOrder',
         ).order_by('created_at')
-        assert list(payments.values_list('balance_before', 'balance_after')) == [
-            (Decimal('100000.00'), Decimal('80000.00')),
-            (Decimal('80000.00'), Decimal('60000.00')),
-        ]
+        assert not payments.exists()
 
 
 class TestReceivingAtomicity:

@@ -511,6 +511,39 @@ class StockItemService:
 
     @classmethod
     @transaction.atomic
+    def reverse_received_cost(cls, item_id, returned_qty, returned_unit_cost):
+        item = StockItemRepository.get_for_update(item_id)
+        if not item:
+            return ServiceResponse.not_found(
+                f'Stock item with id {item_id} not found'
+            )
+        returned_qty = to_decimal(returned_qty)
+        returned_unit_cost = to_decimal(returned_unit_cost)
+        remaining_qty = to_decimal(
+            StockLevelRepository.get_total_quantity(item.id)
+        )
+        original_qty = remaining_qty + returned_qty
+        remaining_value = (
+            original_qty * item.avg_cost_price
+            - returned_qty * returned_unit_cost
+        )
+        if remaining_qty < 0 or remaining_value < 0:
+            return ServiceResponse.conflict(
+                'STOCK_COST_REVERSAL_INVALID',
+                'The receiving cost basis cannot be reversed safely.',
+                details={'stock_item_id': item.id},
+            )
+        item.avg_cost_price = (
+            round_decimal(remaining_value / remaining_qty, 4)
+            if remaining_qty > 0 else Decimal('0')
+        )
+        item.save(update_fields=['avg_cost_price', 'updated_at'])
+        return ServiceResponse.success(data={
+            'avg_cost_price': str(item.avg_cost_price),
+        })
+
+    @classmethod
+    @transaction.atomic
     def deactivate(cls, item_id: int, force: bool = False) -> Tuple[Dict[str, Any], int]:
         item = StockItemRepository.get_by_id(item_id)
         if not item:

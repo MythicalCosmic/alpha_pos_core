@@ -32,7 +32,7 @@ SYNC_ORDER = [
     'stocksettings', 'stockalertconfig',
     # HR models
     'department', 'employee', 'employeeworkschedule',
-    'expensecategory', 'expense',
+    'expensecategory', 'expense', 'expensetransition',
     'salarypayment', 'salarybonus', 'salarydeduction', 'cashtransaction',
     'employeecontract', 'contractdocument',
     'leavetype', 'leaverequest', 'leavebalance',
@@ -112,6 +112,7 @@ MODEL_MAP = {
     'employeeworkschedule': 'hr.EmployeeWorkSchedule',
     'expensecategory': 'hr.ExpenseCategory',
     'expense': 'hr.Expense',
+    'expensetransition': 'hr.ExpenseTransition',
     'salarypayment': 'hr.SalaryPayment',
     'salarybonus': 'hr.SalaryBonus',
     'salarydeduction': 'hr.SalaryDeduction',
@@ -201,6 +202,7 @@ FK_UUID_MAPPINGS = {
     'supplier_stock_item_uuid': ('stock', 'SupplierStockItem', 'supplier_stock_item'),
     'po_item_uuid': ('stock', 'PurchaseOrderItem', 'po_item'),
     'receiving_uuid': ('stock', 'PurchaseReceiving', 'receiving'),
+    'supplier_transaction_uuid': ('stock', 'SupplierTransaction', 'supplier_transaction'),
     'batch_created_uuid': ('stock', 'StockBatch', 'batch_created'),
     'batch_used_uuid': ('stock', 'StockBatch', 'batch_used'),
     'stock_count_uuid': ('stock', 'StockCount', 'stock_count'),
@@ -213,7 +215,17 @@ FK_UUID_MAPPINGS = {
     'employee_uuid': ('hr', 'Employee', 'employee'),
     'attendance_uuid': ('hr', 'Attendance', 'attendance'),
     'expense_category_uuid': ('hr', 'ExpenseCategory', 'category'),
+    'expense_uuid': ('hr', 'Expense', 'expense'),
+    'subject_user_uuid': ('base', 'User', 'subject_user'),
+    'treasury_transaction_uuid': (
+        'base', 'TreasuryTransaction', 'treasury_transaction'
+    ),
+    'treasury_reversal_uuid': (
+        'base', 'TreasuryTransaction', 'treasury_reversal'
+    ),
     'paid_by_uuid': ('base', 'User', 'paid_by'),
+    'canceled_by_uuid': ('base', 'User', 'canceled_by'),
+    'voided_by_uuid': ('base', 'User', 'voided_by'),
     'performed_by_uuid': ('base', 'User', 'performed_by'),
     'submitted_by_uuid': ('base', 'User', 'submitted_by'),
     'updated_by_uuid': ('base', 'User', 'updated_by'),
@@ -233,6 +245,13 @@ FK_UUID_MAPPINGS = {
     # Cashbox FK mappings (distinct uuid keys — category_uuid is claimed by
     # base.Category, so the cashbox category uses its own key).
     'cashbox_category_uuid': ('cashbox', 'CashboxExpenseCategory', 'category'),
+    'canonical_expense_category_uuid': (
+        'hr', 'ExpenseCategory', 'canonical_category'
+    ),
+    'canonical_expense_uuid': ('hr', 'Expense', 'canonical_expense'),
+    'reversal_of_cashbox_expense_uuid': (
+        'cashbox', 'CashboxExpense', 'reversal_of'
+    ),
     'recipient_user_uuid': ('base', 'User', 'recipient_user'),
     'recipient_supplier_uuid': ('stock', 'Supplier', 'recipient_supplier'),
 }

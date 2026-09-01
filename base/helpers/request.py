@@ -181,7 +181,15 @@ def parse_json_body(request):
     try:
         data = json.loads(request.body)
         if not isinstance(data, dict):
-            return None, ({"success": False, "message": "Expected JSON object"}, 400)
+            return None, ({
+                "success": False,
+                "code": "INVALID_JSON_BODY",
+                "message": "Expected JSON object",
+            }, 400)
         return data, None
     except (json.JSONDecodeError, ValueError):
-        return None, ({"success": False, "message": "Invalid JSON"}, 400)
+        return None, ({
+            "success": False,
+            "code": "INVALID_JSON_BODY",
+            "message": "Invalid JSON",
+        }, 400)

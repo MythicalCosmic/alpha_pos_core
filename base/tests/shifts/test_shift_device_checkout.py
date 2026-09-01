@@ -157,21 +157,36 @@ def test_cashier_drawer_expense_rejects_legacy_shift_but_manager_can_intervene()
     from base.services.shift_device import CASHIER_SHIFT_NOT_BOUND_TO_TERMINAL
     from cashbox.models import CashboxExpense
     from cashbox.services.expense_service import CashboxExpenseService
+    from hr.models import ExpenseCategory
 
     cashier = _staff()
     legacy = _shift(cashier, device_id='')
     _fund_cash(cashier)
+    category = ExpenseCategory.objects.create(
+        code='DRAWER_TEST',
+        name='Drawer test',
+        allowed_sources=['DRAWER'],
+    )
 
     denied, denied_status = CashboxExpenseService.create(
-        legacy.id, '5.00', comment='cashier attempt', actor=cashier,
+        legacy.id,
+        '5.00',
+        category_id=category.id,
+        comment='cashier attempt',
+        actor=cashier,
     )
-    assert denied_status == 400, denied
+    assert denied_status == 403, denied
+    assert denied['code'] == 'DRAWER_DEVICE_FORBIDDEN'
     assert denied['message'] == CASHIER_SHIFT_NOT_BOUND_TO_TERMINAL
     assert not CashboxExpense.objects.exists()
 
     manager = _staff(role=User.RoleChoices.MANAGER)
     allowed, allowed_status = CashboxExpenseService.create(
-        legacy.id, '5.00', comment='manager intervention', actor=manager,
+        legacy.id,
+        '5.00',
+        category_id=category.id,
+        comment='manager intervention',
+        actor=manager,
     )
     assert allowed_status == 201, allowed
     assert CashboxExpense.objects.get().created_by_id == manager.id

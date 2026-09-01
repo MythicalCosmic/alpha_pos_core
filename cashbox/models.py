@@ -6,8 +6,8 @@ Design (see the Money & Shift Logic spec):
     since shift start), so there is no stored running-balance column to drift.
   * At shift close the cashier counts each tender type; ShiftPaymentTotal
     freezes expected/counted/difference per method and manager reconciliation
-    confirms that evidence and posts every confirmed tender to SAFE exactly
-    once. Later inkassa is physical register movement/audit only.
+    confirms that evidence and posts CASH to SAFE and classified electronic
+    tenders to BANK exactly once. Later inkassa is audit-only.
   * CashboxExpense is money paid OUT of the drawer (its own model, not hr.Expense).
 
 Money fields carry SYNC_WRITE_DENYLIST so a branch only ever owns its own
@@ -22,15 +22,11 @@ from base.financial import FinancialReportingGroup
 from base.models import SyncMixin, SyncManager
 
 
-# Concrete tender types a drawer is counted in. MIXED is never stored here —
+# Built-in tender types a drawer is counted in. MIXED is never stored here —
 # a mixed-tender order is split into its component OrderPayment rows, each of
 # which lands under its own method below. Kept loose (CharField, no DB choices)
-# because PaymentMethodConfig is operator-editable.
-#
-# 'CARD' MUST stay in step with Order.PaymentMethod: drawer.expected_payment_totals
-# seeds its dict from this tuple and `totals.get(method, 0)` would otherwise mint a
-# bucket for an unlisted method, which then becomes a real ShiftPaymentTotal row
-# (unique(shift, method)) that nothing else knows about.
+# because PaymentMethodConfig is operator-editable. Classified provider methods
+# are appended by base.services.tender.settlement_payment_methods().
 PAYMENT_METHODS = ('CASH', 'UZCARD', 'HUMO', 'CARD', 'PAYME')
 
 
@@ -142,6 +138,10 @@ class CashboxExpenseCategory(SyncMixin, models.Model):
         default=FinancialReportingGroup.REVIEW,
         db_index=True,
     )
+    canonical_category = models.OneToOneField(
+        'hr.ExpenseCategory', on_delete=models.PROTECT,
+        null=True, blank=True, related_name='legacy_cashbox_category',
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -153,14 +153,16 @@ class CashboxExpenseCategory(SyncMixin, models.Model):
     def __str__(self):
         return self.name
 
+    def to_sync_dict(self):
+        data = super().to_sync_dict()
+        data['canonical_expense_category_uuid'] = (
+            str(self.canonical_category.uuid) if self.canonical_category else None
+        )
+        return data
+
 
 class CashboxExpense(SyncMixin, models.Model):
-    """Money paid OUT of a shift's cash drawer.
-
-    Recipient is at most one of user / supplier (or none). When the recipient is
-    a supplier, the service layer also writes a SupplierTransaction so the
-    supplier balance reflects cash paid from the drawer (see P5).
-    """
+    """Append-only money posting from an authorized shift drawer."""
     REGISTER_COMMAND_MARKER = '[ALPHAPOS_CASHBOX_COMMAND_V1]'
 
     shift = models.ForeignKey(
@@ -170,6 +172,23 @@ class CashboxExpense(SyncMixin, models.Model):
         CashboxExpenseCategory, on_delete=models.SET_NULL,
         null=True, blank=True, related_name='expenses',
     )
+    canonical_category = models.ForeignKey(
+        'hr.ExpenseCategory', on_delete=models.PROTECT,
+        null=True, blank=True, related_name='cashbox_expenses',
+    )
+    category_code_snapshot = models.CharField(max_length=64, blank=True, default='')
+    category_name_snapshot = models.CharField(max_length=100, blank=True, default='')
+    canonical_expense = models.OneToOneField(
+        'hr.Expense', on_delete=models.PROTECT,
+        null=True, blank=True, related_name='cashbox_payment',
+    )
+    reversal_of = models.OneToOneField(
+        'self', on_delete=models.PROTECT, null=True, blank=True,
+        related_name='reversal',
+    )
+    command_id = models.UUIDField(null=True, blank=True, unique=True)
+    idempotency_key = models.CharField(max_length=128, blank=True, default='')
+    actor_display_snapshot = models.CharField(max_length=200, blank=True, default='')
     amount = models.DecimalField(max_digits=12, decimal_places=2)
     # Cloud-created drawer expenses are durable commands. The owning branch
     # applies them to CashRegister on pull; ordinary till-created expenses are
@@ -194,6 +213,7 @@ class CashboxExpense(SyncMixin, models.Model):
     # Branch-owned money.
     SYNC_WRITE_DENYLIST = frozenset({'amount'})
     SYNC_DENY_FROM_BRANCH = frozenset({'register_command'})
+    _sync_append_only = True
 
     objects = SyncManager()
 
@@ -209,12 +229,25 @@ class CashboxExpense(SyncMixin, models.Model):
                 name='cashboxexpense_single_recipient',
             ),
         ]
+        indexes = [
+            models.Index(fields=['branch_id', 'created_at']),
+            models.Index(fields=['canonical_category', 'created_at']),
+        ]
 
     def to_sync_dict(self):
         data = super().to_sync_dict()
         data['shift_uuid'] = str(self.shift.uuid) if self.shift else None
         # Distinct uuid key (category_uuid is globally claimed by base.Category).
         data['cashbox_category_uuid'] = str(self.category.uuid) if self.category else None
+        data['canonical_expense_category_uuid'] = (
+            str(self.canonical_category.uuid) if self.canonical_category else None
+        )
+        data['canonical_expense_uuid'] = (
+            str(self.canonical_expense.uuid) if self.canonical_expense else None
+        )
+        data['reversal_of_cashbox_expense_uuid'] = (
+            str(self.reversal_of.uuid) if self.reversal_of else None
+        )
         data['recipient_user_uuid'] = str(self.recipient_user.uuid) if self.recipient_user else None
         data['recipient_supplier_uuid'] = str(self.recipient_supplier.uuid) if self.recipient_supplier else None
         data['created_by_uuid'] = str(self.created_by.uuid) if self.created_by else None
@@ -247,3 +280,14 @@ class CashboxExpense(SyncMixin, models.Model):
 
     def __str__(self):
         return f"CashboxExpense {self.amount} (shift {self.shift_id})"
+
+    def save(self, *args, **kwargs):
+        if self.pk and not kwargs.get('_syncing', False):
+            raise TypeError('CashboxExpense is append-only and cannot be updated')
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise TypeError('CashboxExpense is append-only and cannot be deleted')
+
+    def hard_delete(self, *args, **kwargs):
+        raise TypeError('CashboxExpense is append-only and cannot be deleted')

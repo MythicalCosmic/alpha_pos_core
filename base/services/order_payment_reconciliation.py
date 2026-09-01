@@ -25,10 +25,13 @@ def reconcile_stale_paid_headers(order_ids, *, require_later_sync_evidence=True)
     )
 
     repaired = set()
-    concrete_methods = {
-        value for value, _label in Order.PaymentMethod.choices
-        if value != Order.PaymentMethod.MIXED
-    }
+    from base.services.tender import (
+        concrete_payment_methods,
+        configured_electronic_methods,
+    )
+    concrete_methods = concrete_payment_methods(
+        configured_electronic_methods()
+    )
 
     for order_id in set(order_ids or []):
         with transaction.atomic():

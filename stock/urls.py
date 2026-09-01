@@ -6,11 +6,14 @@ from stock.views import (
     transfer_views, count_views, product_link_views,
     order_views, ai_views,
     adjustment_request_views,
+    inventory_control_views,
 )
 
 app_name = 'stock'
 
 urlpatterns = [
+    path('inventory-control/', inventory_control_views.inventory_control,
+         name='inventory-control'),
     # Settings & Alerts
     path('settings/', settings_views.settings, name='settings'),
     path('settings/toggle/', settings_views.settings_toggle, name='settings-toggle'),
@@ -68,6 +71,14 @@ urlpatterns = [
     path('suppliers/<int:supplier_id>/', supplier_views.supplier_detail, name='supplier-detail'),
     path('suppliers/<int:supplier_id>/items/', supplier_views.supplier_items, name='supplier-items'),
     path('suppliers/<int:supplier_id>/pay/', supplier_views.supplier_pay, name='supplier-pay'),
+    path('suppliers/<int:supplier_id>/payments/', supplier_views.supplier_pay,
+         name='supplier-payment-create'),
+    path('suppliers/<int:supplier_id>/payments/<int:payment_id>/',
+         supplier_views.supplier_payment_detail,
+         name='supplier-payment-detail'),
+    path('suppliers/<int:supplier_id>/payments/<int:payment_id>/reverse/',
+         supplier_views.supplier_payment_reverse,
+         name='supplier-payment-reverse'),
     path('suppliers/<int:supplier_id>/ledger/', supplier_views.supplier_ledger, name='supplier-ledger'),
 
     # Purchase Orders

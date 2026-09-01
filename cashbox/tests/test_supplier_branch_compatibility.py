@@ -41,7 +41,7 @@ def _funded_shift(branch='branch-legacy'):
     return user, shift
 
 
-def test_blank_branch_legacy_supplier_is_claimed_by_expense_branch():
+def test_blank_branch_legacy_supplier_is_not_mutated_by_retired_drawer_route():
     user, shift = _funded_shift()
     supplier = Supplier.objects.create(
         name='Legacy Veg Co', current_balance=Decimal('50000'),
@@ -55,12 +55,12 @@ def test_blank_branch_legacy_supplier_is_claimed_by_expense_branch():
         created_by=user,
     )
 
-    assert status == 201, response
+    assert status == 410, response
+    assert response['code'] == 'UNFUNDED_PAYMENT_ROUTE_RETIRED'
     supplier.refresh_from_db()
-    assert supplier.branch_id == shift.branch_id
-    assert supplier.current_balance == Decimal('30000.00')
-    ledger = supplier.ledger.get(reference_type='CashboxExpense')
-    assert ledger.branch_id == shift.branch_id
+    assert supplier.branch_id == ''
+    assert supplier.current_balance == Decimal('50000.00')
+    assert not supplier.ledger.exists()
 
 
 def test_supplier_owned_by_another_branch_is_still_rejected():
@@ -75,9 +75,7 @@ def test_supplier_owned_by_another_branch_is_still_rejected():
         created_by=user,
     )
 
-    assert status == 422
-    assert response['errors']['recipient_supplier_id'] == (
-        'Supplier is not in this branch'
-    )
+    assert status == 410
+    assert response['code'] == 'UNFUNDED_PAYMENT_ROUTE_RETIRED'
     supplier.refresh_from_db()
     assert supplier.current_balance == Decimal('50000.00')

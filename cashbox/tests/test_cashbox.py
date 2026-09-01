@@ -15,9 +15,25 @@ def _upgraded_terminal(settings):
 
 def _user(email='cashier@t.local', *, role='CASHIER'):
     from base.models import User
+    permissions = []
+    if role == 'MANAGER':
+        permissions = [
+            'money.control.reconcile',
+            'expense.category.view',
+            'expense.category.manage',
+        ]
     return User.objects.create(
         first_name='Cash', last_name='Ier', email=email, password='x',
-        role=role, status='ACTIVE')
+        role=role, status='ACTIVE', permissions=permissions)
+
+
+def _expense_category(name='Drawer supplies'):
+    from hr.models import ExpenseCategory
+
+    return ExpenseCategory.objects.create(
+        name=name,
+        allowed_sources=['DRAWER'],
+    )
 
 
 def _shift(user):
@@ -62,8 +78,14 @@ class TestDrawer:
         u = _user()
         s = _shift(u)
         _paid_cash_order(u, Decimal('100000'), 'CASH')
+        category = _expense_category()
         res, st = CashboxExpenseService.create(
-            s.id, Decimal('30000'), comment='napkins', created_by=u)
+            s.id,
+            Decimal('30000'),
+            category_id=category.id,
+            comment='napkins',
+            created_by=u,
+        )
         assert st == 201, res
         assert drawer_cash(s) == Decimal('70000.00')
 
@@ -81,13 +103,18 @@ class TestDrawer:
         u = _user()
         s = _shift(u)
         _paid_cash_order(u, Decimal('100000'), 'CASH')
+        category = _expense_category()
 
         result, status = CashboxExpenseService.create(
-            s.id, bad_amount, comment='invalid', created_by=u,
+            s.id,
+            bad_amount,
+            category_id=category.id,
+            comment='invalid',
+            created_by=u,
         )
 
         assert status == 422, result
-        assert 'amount' in result['errors']
+        assert 'amount_uzs' in result['errors']
         assert not CashboxExpense.objects.exists()
         assert drawer_cash(s) == Decimal('100000.00')
 
@@ -113,7 +140,7 @@ def _authenticated_client(user):
     return client
 
 
-def test_cashier_can_list_cashbox_categories_but_cannot_create_them():
+def test_cashier_cannot_access_finance_category_catalog():
     import json
     from cashbox.models import CashboxExpenseCategory
 
@@ -127,8 +154,7 @@ def test_cashier_can_list_cashbox_categories_but_cannot_create_them():
         content_type='application/json',
     )
 
-    assert listed.status_code == 200
-    assert any(row['name'] == 'Supplies' for row in listed.json()['data'])
+    assert listed.status_code == 403
     assert denied.status_code == 403
     assert not CashboxExpenseCategory.objects.filter(name='Unauthorized').exists()
 
@@ -160,7 +186,7 @@ def test_manager_can_create_cashbox_category():
 
 
 class TestCashboxExpenseRecipients:
-    def test_supplier_recipient_reduces_supplier_balance(self):
+    def test_supplier_recipient_uses_retired_unfunded_route(self):
         from stock.models import Supplier
         from cashbox.services.expense_service import CashboxExpenseService
         u = _user()
@@ -169,9 +195,10 @@ class TestCashboxExpenseRecipients:
         sup = Supplier.objects.create(name='Veg Co', current_balance=Decimal('50000'))
         res, st = CashboxExpenseService.create(
             s.id, Decimal('20000'), recipient_supplier_id=sup.id, created_by=u)
-        assert st == 201, res
+        assert st == 410, res
+        assert res['code'] == 'UNFUNDED_PAYMENT_ROUTE_RETIRED'
         sup.refresh_from_db()
-        assert sup.current_balance == Decimal('30000.00')
+        assert sup.current_balance == Decimal('50000.00')
 
     def test_two_recipients_rejected(self):
         from base.models import User
@@ -189,7 +216,7 @@ class TestCashboxExpenseRecipients:
 
 
 class TestShiftSettlement:
-    def test_close_and_confirm_freezes_and_posts_all_tenders_to_safe(self):
+    def test_close_routes_cash_to_safe_and_uzcard_to_bank(self):
         from base.models import TreasuryAccount, TreasuryTransaction
         from core.shifts.service import ShiftService
         from cashbox.models import ShiftPaymentTotal
@@ -214,8 +241,8 @@ class TestShiftSettlement:
         assert st == 201, res
         s.refresh_from_db()
         assert s.status == 'COMPLETED'
-        assert TreasuryAccount.objects.get(kind='SAFE').balance == Decimal('140000.00')
-        assert not TreasuryAccount.objects.filter(kind='BANK').exists()
+        assert TreasuryAccount.objects.get(kind='SAFE').balance == Decimal('100000.00')
+        assert TreasuryAccount.objects.get(kind='BANK').balance == Decimal('40000.00')
         assert TreasuryTransaction.objects.filter(
             type='SHIFT_DEPOSIT', reference_type='ShiftSettlement',
         ).count() == 2

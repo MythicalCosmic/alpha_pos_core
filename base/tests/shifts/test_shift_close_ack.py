@@ -24,6 +24,9 @@ def _user(email, role='CASHIER'):
         role=role,
         status='ACTIVE',
         branch_id=BRANCH,
+        permissions=(
+            ['money.control.reconcile'] if role == 'MANAGER' else []
+        ),
     )
 
 

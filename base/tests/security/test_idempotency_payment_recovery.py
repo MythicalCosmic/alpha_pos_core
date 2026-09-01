@@ -193,7 +193,7 @@ def test_oversized_key_is_rejected_instead_of_running_unprotected():
 
     response = pay_view(_pay_request(key='x' * 129))
 
-    assert response.status_code == 400
+    assert response.status_code == 422
     assert called is False
     assert IdempotencyKey.objects.count() == 0
 

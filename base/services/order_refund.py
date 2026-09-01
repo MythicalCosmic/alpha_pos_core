@@ -265,7 +265,13 @@ def record_external_provider_refund(
     ``refunded_at``.
     """
     from base.models import Order, OrderRefund
-    from base.services.tender import bucket_for, empty_detail, empty_split, normalize_method
+    from base.services.tender import (
+        bucket_for,
+        configured_electronic_methods,
+        empty_detail,
+        empty_split,
+        normalize_method,
+    )
 
     event_id = str(source_id or '').strip()
     if not event_id:
@@ -306,12 +312,13 @@ def record_external_provider_refund(
         )
 
     normalized = normalize_method(method)
-    bucket = bucket_for(normalized)
+    electronic_methods = configured_electronic_methods()
+    bucket = bucket_for(normalized, electronic_methods)
     if bucket is None:
         raise SettlementInvariantError('Provider refund method is not supported.')
     split = empty_split()
     split[bucket] = value
-    detail = empty_detail()
+    detail = empty_detail(electronic_methods)
     if bucket == 'card' and normalized in detail:
         detail[normalized] = value
 

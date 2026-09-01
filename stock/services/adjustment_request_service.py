@@ -90,7 +90,7 @@ class StockAdjustmentRequestService:
     @staticmethod
     @transaction.atomic
     def review(request_id, *, reviewer, approve, note):
-        row = StockAdjustmentRequest.objects.select_for_update().select_related(
+        row = StockAdjustmentRequest.objects.select_for_update(of=('self',)).select_related(
             'stock_item', 'location', 'unit', 'requested_by',
         ).filter(id=request_id, is_deleted=False).first()
         if not row:

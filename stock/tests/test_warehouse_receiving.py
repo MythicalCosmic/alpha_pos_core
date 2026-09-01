@@ -65,12 +65,16 @@ def test_warehouse_read_access_and_money_routes_are_denied():
         '/api/admins/stock/adjust/', data='{}', content_type='application/json',
     ).status_code == 403
     assert client.get('/api/admins/stock/settings/').status_code == 403
+    assert client.get('/api/admins/stock/inventory-control/').status_code == 403
+    assert client.get('/api/admins/cashbox/recipients/search/').status_code == 403
     assert client.post(
         '/api/admins/hr/expenses/', data='{}', content_type='application/json',
     ).status_code == 403
 
 
 def test_receiving_completion_posts_stock_and_supplier_debt_once(admin_user):
+    admin_user.branch_id = 'branch1'
+    admin_user.save(update_fields=['branch_id'])
     unit = StockUnit.objects.create(
         name='Piece', short_name='pc', unit_type='COUNT', is_base_unit=True,
         branch_id='branch1',

@@ -3,7 +3,10 @@ from stock.models.catalog import StockLocation, StockUnit, StockCategory
 from stock.models.items import StockItem, StockItemUnit
 from stock.models.recipes import Recipe, RecipeIngredient, RecipeIngredientSubstitute, RecipeByProduct, RecipeStep
 from stock.models.product_links import ProductStockLink, ProductComponentStock
-from stock.models.suppliers import Supplier, SupplierStockItem, SupplierTransaction
+from stock.models.suppliers import (
+    Supplier, SupplierStockItem, SupplierTransaction,
+    SupplierPayment, SupplierPaymentAllocation,
+)
 from stock.models.purchases import (
     PurchaseOrder, PurchaseOrderItem, PurchaseReceiving, PurchaseReceivingItem,
     PurchaseReceivingCorrection,
@@ -33,6 +36,8 @@ __all__ = [
     'Supplier',
     'SupplierStockItem',
     'SupplierTransaction',
+    'SupplierPayment',
+    'SupplierPaymentAllocation',
     'PurchaseOrder',
     'PurchaseOrderItem',
     'PurchaseReceiving',

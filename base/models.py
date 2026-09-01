@@ -4,6 +4,7 @@ from django.db import models, transaction
 from django.db.models.functions import Now
 from django.db.models.fields.files import FieldFile
 from django.conf import settings
+from django.utils import timezone
 
 from base.services.sync.context import is_authoritative_cloud_pull
 
@@ -1854,8 +1855,8 @@ class CashRegister(SyncMixin, models.Model):
     remain for audit/recovery.
     """
     current_balance = models.DecimalField(max_digits=12, decimal_places=2, default=0)
-    # Cumulative value of cloud-issued cash-out commands (inkassa, cashbox
-    # expenses, and refunds) this branch has applied to ``current_balance``.
+    # Cumulative net value of cloud-issued drawer commands (cash-outs less
+    # linked reversals) this branch has applied to ``current_balance``.
     # The two values are saved/synced on the
     # same row, which lets the cloud derive an offline-safe available balance:
     #
@@ -2124,7 +2125,7 @@ class Inkassa(SyncMixin, models.Model):
             pass
 
         applied = register.remote_cash_out_applied_total or Decimal('0')
-        return max(issued - applied, Decimal('0'))
+        return issued - applied
 
     @classmethod
     def _apply_pending_register_commands(cls, branch_id):
@@ -2165,10 +2166,10 @@ class Inkassa(SyncMixin, models.Model):
             applied = register.remote_cash_out_applied_total or Decimal('0')
             command_total = applied + cls.pending_register_amount(register)
             delta = command_total - applied
-            if delta <= 0:
+            if delta == 0:
                 return True
             current_balance = register.current_balance or Decimal('0')
-            if delta > current_balance:
+            if delta > 0 and delta > current_balance:
                 # A branch may spend cash after the cloud's last balance report
                 # but before pulling this command. Never acknowledge money that
                 # was not physically available: returning False makes the sync
@@ -2217,10 +2218,9 @@ class Inkassa(SyncMixin, models.Model):
 class TreasuryAccount(SyncMixin, models.Model):
     """A money pot the business holds outside the till drawer.
 
-    SAFE = manager-confirmed shift proceeds. Every confirmed tender is posted
-    here at reconciliation; a later inkassa is only the physical register
-    movement/audit trail and must not recognize the proceeds a second time.
-    BANK = explicit transfers and bank-funded expenses outside shift handover.
+    SAFE holds manager-confirmed cash proceeds. BANK holds confirmed electronic
+    proceeds and bank-funded movements. Inkassa is only the physical collection
+    audit and must not recognize shift proceeds a second time.
     One (soft-undeleted) row per kind; read/created via get_or_create.
     """
     class Kind(models.TextChoices):
@@ -2244,9 +2244,9 @@ class TreasuryAccount(SyncMixin, models.Model):
     class Meta:
         constraints = [
             models.UniqueConstraint(
-                fields=['kind'],
+                fields=['branch_id', 'kind'],
                 condition=models.Q(is_deleted=False),
-                name='uniq_active_treasury_account_kind',
+                name='uniq_active_treasury_account_branch_kind',
             ),
         ]
 
@@ -2262,15 +2262,21 @@ class TreasuryTransaction(SyncMixin, models.Model):
         TRANSFER_OUT = 'TRANSFER_OUT', 'Transfer out'
         FEE = 'FEE', 'Transfer fee'
         EXPENSE = 'EXPENSE', 'Expense'
+        EXPENSE_REVERSAL = 'EXPENSE_REVERSAL', 'Expense reversal'
         ADJUSTMENT = 'ADJUSTMENT', 'Adjustment'
         SUPPLIER_PAYMENT = 'SUPPLIER_PAYMENT', 'Supplier payment'
+        SUPPLIER_PAYMENT_REVERSAL = (
+            'SUPPLIER_PAYMENT_REVERSAL', 'Supplier payment reversal'
+        )
         SALARY_PAYMENT = 'SALARY_PAYMENT', 'Salary payment'
         SHIFT_DEPOSIT = 'SHIFT_DEPOSIT', 'Shift settlement deposit'
+        SHIFT_RECLASS_OUT = 'SHIFT_RECLASS_OUT', 'Legacy shift reclass out'
+        SHIFT_RECLASS_IN = 'SHIFT_RECLASS_IN', 'Legacy shift reclass in'
 
     account = models.ForeignKey(
         TreasuryAccount, on_delete=models.CASCADE, related_name='transactions',
     )
-    type = models.CharField(max_length=20, choices=Type.choices)
+    type = models.CharField(max_length=32, choices=Type.choices)
     # Signed change applied to the account balance (+ in / - out).
     delta = models.DecimalField(max_digits=14, decimal_places=2)
     fee = models.DecimalField(max_digits=14, decimal_places=2, default=0)
@@ -2282,12 +2288,25 @@ class TreasuryTransaction(SyncMixin, models.Model):
         related_name='counterparty_transactions',
     )
     category = models.CharField(max_length=50, blank=True, default='')
+    canonical_category = models.ForeignKey(
+        'hr.ExpenseCategory', on_delete=models.PROTECT, null=True, blank=True,
+        related_name='treasury_transactions',
+    )
+    category_code_snapshot = models.CharField(max_length=64, blank=True, default='')
+    category_name_snapshot = models.CharField(max_length=100, blank=True, default='')
     description = models.TextField(blank=True, default='')
     reference_type = models.CharField(max_length=50, blank=True, default='')
     reference_id = models.PositiveIntegerField(null=True, blank=True)
     performed_by = models.ForeignKey(
         User, on_delete=models.SET_NULL, null=True,
         related_name='treasury_transactions',
+    )
+    actor_display_snapshot = models.CharField(max_length=200, blank=True, default='')
+    command_id = models.UUIDField(null=True, blank=True, db_index=True)
+    idempotency_key = models.CharField(max_length=128, blank=True, default='')
+    reversal_of = models.OneToOneField(
+        'self', on_delete=models.PROTECT, null=True, blank=True,
+        related_name='reversal',
     )
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -2323,6 +2342,21 @@ class TreasuryTransaction(SyncMixin, models.Model):
                 ),
                 name='uniq_legacy_inkassa_safe_post',
             ),
+            models.UniqueConstraint(
+                fields=['account', 'command_id', 'type', 'category'],
+                condition=models.Q(command_id__isnull=False),
+                name='uniq_treasury_command_account_type',
+            ),
+            models.UniqueConstraint(
+                fields=['account', 'reference_id'],
+                condition=models.Q(reference_type='LegacyShiftReclassification'),
+                name='uniq_legacy_shift_reclass_account',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['account', 'type', 'created_at']),
+            models.Index(fields=['branch_id', 'reference_type', 'reference_id']),
+            models.Index(fields=['canonical_category', 'created_at']),
         ]
 
     def __str__(self):
@@ -2369,6 +2403,7 @@ class AppSettings(models.Model):
     # not an enforcement gate. Per-restaurant; defaults 09:00 open / 23:00 close.
     business_open = models.TimeField(default=_default_business_open)
     business_close = models.TimeField(default=_default_business_close)
+    shift_settlement_cutover_at = models.DateTimeField(default=timezone.now)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -2514,6 +2549,14 @@ class CashReconciliation(SyncMixin, models.Model):
     # double-credit SAFE. New reconciliations stamp this atomically with their
     # per-tender SHIFT_DEPOSIT rows (including a zero-total settlement).
     treasury_posted_at = models.DateTimeField(null=True, blank=True)
+    treasury_posting_manifest = models.JSONField(default=dict, blank=True)
+    settlement_action_id = models.UUIDField(null=True, blank=True, unique=True)
+    settlement_idempotency_key = models.CharField(
+        max_length=128, blank=True, default='',
+    )
+    settlement_request_hash = models.CharField(
+        max_length=64, blank=True, default='',
+    )
     created_at = models.DateTimeField(auto_now_add=True)
 
     objects = SyncManager()
@@ -2618,6 +2661,19 @@ class AuditLog(SyncMixin, models.Model):
         LOYALTY_REDEEM = "LOYALTY_REDEEM", "Loyalty stamps redeemed"
         TREASURY_TRANSFER = "TREASURY_TRANSFER", "Treasury transfer"
         TREASURY_EXPENSE = "TREASURY_EXPENSE", "Treasury expense"
+        EXPENSE_CATEGORY_CREATE = (
+            "EXPENSE_CATEGORY_CREATE", "Expense category created"
+        )
+        EXPENSE_CATEGORY_UPDATE = (
+            "EXPENSE_CATEGORY_UPDATE", "Expense category updated"
+        )
+        EXPENSE_CATEGORY_DEACTIVATE = (
+            "EXPENSE_CATEGORY_DEACTIVATE", "Expense category deactivated"
+        )
+        SUPPLIER_PAYMENT = "SUPPLIER_PAYMENT", "Supplier payment"
+        SUPPLIER_PAYMENT_REVERSE = (
+            "SUPPLIER_PAYMENT_REVERSE", "Supplier payment reversed"
+        )
         ORDER_PAYMENT_REPAIR = (
             "ORDER_PAYMENT_REPAIR", "Order payment repaired"
         )
@@ -2664,7 +2720,11 @@ class AuditLog(SyncMixin, models.Model):
 
     @classmethod
     def record(cls, *, actor, action, target_type='', target_id=None,
-               metadata=None, ip_address=''):
+               metadata=None, ip_address='', branch_id=None):
+        if branch_id is None:
+            from base.services.branch_scope import resolve_actor_branch
+
+            branch_id = resolve_actor_branch(actor) or ''
         return cls.objects.create(
             actor=actor,
             action=action,
@@ -2672,6 +2732,7 @@ class AuditLog(SyncMixin, models.Model):
             target_id=target_id,
             metadata=metadata or {},
             ip_address=ip_address,
+            branch_id=branch_id,
         )
 
     def __str__(self):
@@ -2690,7 +2751,7 @@ class IdempotencyKey(models.Model):
     must never propagate.
     """
 
-    scope = models.CharField(max_length=100, db_index=True)
+    scope = models.CharField(max_length=180, db_index=True)
     key = models.CharField(max_length=128, db_index=True)
     # Bind one client key to the exact request it first represented.  Resource
     # path lives in ``scope`` so different orders never collide; this digest
@@ -2852,10 +2913,13 @@ class OrderPayment(SyncMixin, models.Model):
             )
         ):
             return False
-        if values.get('method') not in {
-            value for value, _label in Order.PaymentMethod.choices
-            if value != Order.PaymentMethod.MIXED
-        }:
+        from base.services.tender import (
+            concrete_payment_methods,
+            configured_electronic_methods,
+        )
+        if values.get('method') not in concrete_payment_methods(
+            configured_electronic_methods()
+        ):
             return False
         try:
             amount = Decimal(str(values.get('amount')))
@@ -3004,10 +3068,13 @@ class ExternalOrderPayment(SyncMixin, models.Model):
             return False
         if not str(values.get('source_id') or '').strip():
             return False
-        if values.get('method') not in {
-            value for value, _label in Order.PaymentMethod.choices
-            if value != Order.PaymentMethod.MIXED
-        }:
+        from base.services.tender import (
+            concrete_payment_methods,
+            configured_electronic_methods,
+        )
+        if values.get('method') not in concrete_payment_methods(
+            configured_electronic_methods()
+        ):
             return False
         try:
             amount = Decimal(str(values.get('amount')))
@@ -3337,14 +3404,20 @@ class PaymentMethodConfig(models.Model):
     their label, inline SVG icon and accent color. Seeded with the four
     built-ins; vendor-editable in admin. Plain (non-synced) per-install config
     — the frontend caches it per-PC after login."""
-    code = models.CharField(
-        max_length=10, unique=True, choices=Order.PaymentMethod.choices,
-    )
+    class TreasuryDestination(models.TextChoices):
+        SAFE = 'SAFE', 'Safe'
+        BANK = 'BANK', 'Bank'
+
+    code = models.CharField(max_length=10, unique=True)
     label = models.CharField(max_length=40)
     icon = models.TextField(blank=True, default='', help_text='Inline SVG (24x24, currentColor)')
     color = models.CharField(max_length=9, default='#3b82f6')
     sort_order = models.PositiveIntegerField(default=0)
     is_active = models.BooleanField(default=True)
+    treasury_destination = models.CharField(
+        max_length=10, choices=TreasuryDestination.choices,
+        null=True, blank=True,
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

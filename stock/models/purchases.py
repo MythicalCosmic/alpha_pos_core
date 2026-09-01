@@ -65,6 +65,11 @@ class PurchaseOrder(SyncMixin, models.Model):
 
     class Meta:
         ordering = ["-order_date"]
+        indexes = [
+            models.Index(
+                fields=['branch_id', 'supplier', 'payment_due_date', 'payment_status'],
+            ),
+        ]
 
     def to_sync_dict(self):
         data = super().to_sync_dict()
@@ -151,6 +156,20 @@ class PurchaseReceiving(SyncMixin, models.Model):
     supplier_balance_after = models.DecimalField(
         max_digits=15, decimal_places=2, null=True, blank=True,
     )
+    received_value_uzs = models.DecimalField(
+        max_digits=15, decimal_places=2, null=True, blank=True,
+    )
+    supplier_transaction = models.OneToOneField(
+        'stock.SupplierTransaction', on_delete=models.PROTECT,
+        null=True, blank=True, related_name='purchase_receiving',
+    )
+    completion_action_id = models.UUIDField(null=True, blank=True, unique=True)
+    completion_idempotency_key = models.CharField(
+        max_length=128, blank=True, default='',
+    )
+    quality_posting_policy = models.CharField(
+        max_length=64, blank=True, default='',
+    )
     over_receipt_approved_by = models.ForeignKey(
         'base.User', on_delete=models.PROTECT, null=True, blank=True,
         related_name='approved_purchase_over_receipts',
@@ -171,6 +190,10 @@ class PurchaseReceiving(SyncMixin, models.Model):
         data['over_receipt_approved_by_uuid'] = (
             str(self.over_receipt_approved_by.uuid)
             if self.over_receipt_approved_by else None
+        )
+        data['supplier_transaction_uuid'] = (
+            str(self.supplier_transaction.uuid)
+            if self.supplier_transaction else None
         )
         return data
 
@@ -196,6 +219,19 @@ class PurchaseReceivingItem(SyncMixin, models.Model):
     )
     quantity_received = models.DecimalField(max_digits=15, decimal_places=4)
     unit = models.ForeignKey('stock.StockUnit', on_delete=models.PROTECT, related_name="+")
+    conversion_to_base_snapshot = models.DecimalField(
+        max_digits=15, decimal_places=6, null=True, blank=True,
+    )
+    base_quantity = models.DecimalField(
+        max_digits=15, decimal_places=4, null=True, blank=True,
+    )
+    base_unit = models.ForeignKey(
+        'stock.StockUnit', on_delete=models.PROTECT,
+        null=True, blank=True, related_name='+',
+    )
+    base_unit_cost = models.DecimalField(
+        max_digits=15, decimal_places=4, null=True, blank=True,
+    )
     batch_number = models.CharField(max_length=100, blank=True, default="")
     expiry_date = models.DateField(null=True, blank=True)
     unit_cost = models.DecimalField(max_digits=15, decimal_places=4)
@@ -223,6 +259,7 @@ class PurchaseReceivingItem(SyncMixin, models.Model):
         data['po_item_uuid'] = str(self.po_item.uuid) if self.po_item else None
         data['stock_item_uuid'] = str(self.stock_item.uuid) if self.stock_item else None
         data['unit_uuid'] = str(self.unit.uuid) if self.unit else None
+        data['base_unit_uuid'] = str(self.base_unit.uuid) if self.base_unit else None
         data['batch_created_uuid'] = str(self.batch_created.uuid) if self.batch_created else None
         return data
 

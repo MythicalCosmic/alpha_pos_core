@@ -93,11 +93,14 @@ class SupplierService:
              per_page: int = 20,
              search: str = None,
              active_only: bool = True,
-             has_items_only: bool = False) -> Tuple[Dict[str, Any], int]:
+             has_items_only: bool = False,
+             branch_id: str = None) -> Tuple[Dict[str, Any], int]:
         if active_only:
             queryset = SupplierRepository.get_active()
         else:
             queryset = SupplierRepository.get_all()
+        if branch_id:
+            queryset = queryset.filter(branch_id=branch_id)
 
         if search:
             queryset = SupplierRepository.search(queryset, search)
@@ -161,8 +164,13 @@ class SupplierService:
     @classmethod
     def get(cls, supplier_id: int,
             include_items: bool = True,
-            include_stats: bool = True) -> Tuple[Dict[str, Any], int]:
-        supplier = SupplierRepository.get_by_id(supplier_id)
+            include_stats: bool = True,
+            branch_id: str = None) -> Tuple[Dict[str, Any], int]:
+        supplier = Supplier.objects.filter(
+            pk=supplier_id,
+            is_deleted=False,
+            **({'branch_id': branch_id} if branch_id else {}),
+        ).first()
         if not supplier:
             return ServiceResponse.not_found(f"Supplier with id {supplier_id} not found")
 
@@ -190,7 +198,8 @@ class SupplierService:
                lead_time_days: int = 1,
                minimum_order_value: Decimal = None,
                rating: int = None,
-               notes: str = "") -> Tuple[Dict[str, Any], int]:
+               notes: str = "",
+               branch_id: str = None) -> Tuple[Dict[str, Any], int]:
 
         if not code:
             code = cls._generate_code(name)
@@ -224,6 +233,7 @@ class SupplierService:
             minimum_order_value=minimum_order_value,
             rating=rating,
             notes=notes,
+            **({'branch_id': branch_id} if branch_id else {}),
         )
 
         return ServiceResponse.created(data={
@@ -244,8 +254,12 @@ class SupplierService:
 
     @classmethod
     @transaction.atomic
-    def update(cls, supplier_id: int, **kwargs) -> Tuple[Dict[str, Any], int]:
-        supplier = SupplierRepository.get_by_id(supplier_id)
+    def update(cls, supplier_id: int, branch_id=None, **kwargs) -> Tuple[Dict[str, Any], int]:
+        supplier = Supplier.objects.filter(
+            pk=supplier_id,
+            is_deleted=False,
+            **({'branch_id': branch_id} if branch_id else {}),
+        ).first()
         if not supplier:
             return ServiceResponse.not_found(f"Supplier with id {supplier_id} not found")
 
@@ -282,8 +296,12 @@ class SupplierService:
 
     @classmethod
     @transaction.atomic
-    def deactivate(cls, supplier_id: int) -> Tuple[Dict[str, Any], int]:
-        supplier = SupplierRepository.get_by_id(supplier_id)
+    def deactivate(cls, supplier_id: int, branch_id=None) -> Tuple[Dict[str, Any], int]:
+        supplier = Supplier.objects.filter(
+            pk=supplier_id,
+            is_deleted=False,
+            **({'branch_id': branch_id} if branch_id else {}),
+        ).first()
         if not supplier:
             return ServiceResponse.not_found(f"Supplier with id {supplier_id} not found")
 
@@ -314,28 +332,12 @@ class SupplierService:
     @classmethod
     @transaction.atomic
     def update_balance(cls, supplier_id: int, amount: Decimal, operation: str = "add") -> Tuple[Dict[str, Any], int]:
-        supplier = SupplierRepository.get_by_id(supplier_id)
-        if not supplier:
-            return ServiceResponse.not_found(f"Supplier with id {supplier_id} not found")
-
-        amount = to_decimal(amount)
-
-        if operation == "add":
-            supplier.current_balance += amount
-        elif operation == "subtract":
-            supplier.current_balance -= amount
-        elif operation == "set":
-            supplier.current_balance = amount
-        else:
-            return ServiceResponse.validation_error(
-                errors={"operation": "Invalid operation. Valid: add, subtract, set"}
-            )
-
-        supplier.save(update_fields=["current_balance", "updated_at"])
-
-        return ServiceResponse.success(data={
-            "current_balance": str(supplier.current_balance)
-        }, message="Balance updated")
+        return ServiceResponse.failure(
+            'UNFUNDED_PAYMENT_ROUTE_RETIRED',
+            'Supplier balances may change only through the append-only ledger.',
+            410,
+            details={'supplier_id': supplier_id},
+        )
 
 
 class SupplierStockItemService:

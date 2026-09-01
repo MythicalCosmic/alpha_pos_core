@@ -26,6 +26,18 @@ def _user(email=None, *, branch='main', role='CASHIER'):
         role=role,
         status='ACTIVE',
         branch_id=branch,
+        permissions=(
+            ['money.control.reconcile'] if role == 'MANAGER' else []
+        ),
+    )
+
+
+def _expense_category(name='Drawer operations'):
+    from hr.models import ExpenseCategory
+
+    return ExpenseCategory.objects.create(
+        name=name,
+        allowed_sources=['DRAWER'],
     )
 
 
@@ -176,7 +188,7 @@ class TestReconciliationInvariants:
         )
         return user, shift
 
-    def test_actual_cash_and_every_confirmed_tender_post_to_safe_once(self):
+    def test_actual_cash_and_confirmed_tenders_post_once_by_destination(self):
         from base.models import (
             CashReconciliation, TreasuryAccount, TreasuryTransaction,
         )
@@ -208,19 +220,16 @@ class TestReconciliationInvariants:
             shift=shift, method='PAYME', is_deleted=True,
         ).confirmed_amount == Decimal('0.00')
         posting = result['data']['treasury_posting']
-        assert posting == {
-            'status': 'posted',
-            'account': 'SAFE',
-            'total': '143.00',
-            'tenders': [
-                {'method': 'CASH', 'amount': '95.00'},
-                {'method': 'UZCARD', 'amount': '48.00'},
-            ],
-            'entry_ids': posting['entry_ids'],
-        }
+        assert posting['status'] == 'POSTED'
+        assert posting['account'] is None
+        assert posting['total'] == '143.00'
+        assert {
+            row['method']: row['destination'] for row in posting['postings']
+            if row['amount_uzs']
+        } == {'CASH': 'SAFE', 'UZCARD': 'BANK'}
         assert len(posting['entry_ids']) == 2
-        assert TreasuryAccount.objects.get(kind='SAFE').balance == Decimal('143.00')
-        assert not TreasuryAccount.objects.filter(kind='BANK').exists()
+        assert TreasuryAccount.objects.get(kind='SAFE').balance == Decimal('95.00')
+        assert TreasuryAccount.objects.get(kind='BANK').balance == Decimal('48.00')
         assert set(TreasuryTransaction.objects.values_list('category', flat=True)) == {
             'CASH', 'UZCARD',
         }
@@ -236,7 +245,8 @@ class TestReconciliationInvariants:
         )
         assert retry_status == 200, retry
         assert retry['data']['treasury_posting']['entry_ids'] == posting['entry_ids']
-        assert TreasuryAccount.objects.get(kind='SAFE').balance == Decimal('143.00')
+        assert TreasuryAccount.objects.get(kind='SAFE').balance == Decimal('95.00')
+        assert TreasuryAccount.objects.get(kind='BANK').balance == Decimal('48.00')
         assert TreasuryTransaction.objects.count() == 2
 
         conflict, conflict_status = ShiftService.reconcile(
@@ -246,8 +256,10 @@ class TestReconciliationInvariants:
             reconciled_by_id=user.id,
             confirmed={'CASH': '95.00', 'UZCARD': '49.00'},
         )
-        assert conflict_status == 422, conflict
-        assert TreasuryAccount.objects.get(kind='SAFE').balance == Decimal('143.00')
+        assert conflict_status == 409, conflict
+        assert conflict['code'] == 'SETTLEMENT_POSTING_CONFLICT'
+        assert TreasuryAccount.objects.get(kind='SAFE').balance == Decimal('95.00')
+        assert TreasuryAccount.objects.get(kind='BANK').balance == Decimal('48.00')
         assert TreasuryTransaction.objects.count() == 2
 
     def test_unpaid_ready_order_from_old_close_blocks_cloud_reconciliation(self):
@@ -283,7 +295,7 @@ class TestReconciliationInvariants:
             reference_id=shift.id,
         ).exists()
 
-    def test_mixed_all_tenders_post_to_safe_and_zero_is_ledger_noop(self):
+    def test_mixed_tenders_route_to_safe_and_bank(self):
         from base.models import TreasuryAccount, TreasuryTransaction
         from core.shifts.service import ShiftService
 
@@ -305,15 +317,75 @@ class TestReconciliationInvariants:
         )
         assert status == 201, result
         posting = result['data']['treasury_posting']
-        assert posting['account'] == 'SAFE'
+        assert posting['account'] is None
         assert posting['total'] == '240.00'
         assert len(posting['entry_ids']) == 5
         assert {row['method'] for row in posting['tenders']} == set(amounts)
-        assert TreasuryAccount.objects.get(kind='SAFE').balance == Decimal('240.00')
-        assert not TreasuryAccount.objects.filter(kind='BANK').exists()
+        assert TreasuryAccount.objects.get(kind='SAFE').balance == Decimal('100.00')
+        assert TreasuryAccount.objects.get(kind='BANK').balance == Decimal('140.00')
         assert TreasuryTransaction.objects.count() == 5
 
-    def test_net_negative_mixed_tenders_credit_and_reverse_safe_atomically(self):
+    def test_unclassified_tender_blocks_the_entire_treasury_posting(self):
+        from base.models import CashReconciliation, TreasuryAccount, TreasuryTransaction
+        from core.shifts.service import ShiftService
+
+        amounts = {'CASH': '100.00', 'CLICK': '50.00'}
+        user, shift = self._ended(amounts)
+
+        result, status = ShiftService.reconcile(
+            shift.id,
+            actual_cash='100.00',
+            notes='provider is not classified',
+            reconciled_by_id=user.id,
+            confirmed=amounts,
+        )
+
+        assert status == 422, result
+        assert result['errors']['code'] == 'SETTLEMENT_SYNC_INCOMPLETE'
+        assert not CashReconciliation.objects.filter(shift=shift).exists()
+        assert not TreasuryTransaction.objects.exists()
+        assert not TreasuryAccount.objects.exists()
+
+    def test_configured_provider_tender_posts_to_bank(self):
+        from base.models import (
+            PaymentMethodConfig,
+            TreasuryAccount,
+            TreasuryTransaction,
+        )
+        from core.shifts.service import ShiftService
+
+        PaymentMethodConfig.objects.update_or_create(
+            code='CLICK',
+            defaults={
+                'label': 'Click',
+                'is_active': True,
+                'treasury_destination': 'BANK',
+            },
+        )
+        amounts = {'CASH': '100.00', 'CLICK': '50.00'}
+        user, shift = self._ended(amounts)
+
+        result, status = ShiftService.reconcile(
+            shift.id,
+            actual_cash='100.00',
+            notes='classified provider',
+            reconciled_by_id=user.id,
+            confirmed=amounts,
+        )
+
+        assert status == 201, result
+        assert {
+            row['method']: row['destination']
+            for row in result['data']['postings']
+            if row['amount_uzs']
+        } == {'CASH': 'SAFE', 'CLICK': 'BANK'}
+        assert TreasuryAccount.objects.get(kind='SAFE').balance == Decimal('100.00')
+        assert TreasuryAccount.objects.get(kind='BANK').balance == Decimal('50.00')
+        assert set(TreasuryTransaction.objects.values_list('category', flat=True)) == {
+            'CASH', 'CLICK',
+        }
+
+    def test_net_negative_tender_reverses_its_original_destination(self):
         from base.models import TreasuryAccount, TreasuryTransaction
         from core.shifts.service import ShiftService
 
@@ -329,12 +401,12 @@ class TestReconciliationInvariants:
         assert status == 201, result
         posting = result['data']['treasury_posting']
         assert posting['total'] == '-10.00'
-        assert posting['tenders'] == [
-            {'method': 'CASH', 'amount': '20.00'},
-            {'method': 'PAYME', 'amount': '-30.00'},
-        ]
-        assert TreasuryAccount.objects.get(kind='SAFE').balance == Decimal('-10.00')
-        assert not TreasuryAccount.objects.filter(kind='BANK').exists()
+        assert {
+            row['method']: (row['destination'], row['amount_uzs'])
+            for row in posting['postings'] if row['amount_uzs']
+        } == {'CASH': ('SAFE', 20), 'PAYME': ('BANK', -30)}
+        assert TreasuryAccount.objects.get(kind='SAFE').balance == Decimal('20.00')
+        assert TreasuryAccount.objects.get(kind='BANK').balance == Decimal('-30.00')
         assert {
             row.category: row.delta
             for row in TreasuryTransaction.objects.filter(
@@ -827,10 +899,13 @@ def test_sale_and_refund_are_distinct_shift_settlement_events():
     assert result['data']['expected_cash'] == '-80.00'
     assert result['data']['difference'] == '80.00'
     posting = result['data']['treasury_posting']
-    assert posting['status'] == 'posted'
+    assert posting['status'] == 'POSTED'
     assert posting['account'] == 'SAFE'
     assert posting['total'] == '-80.00'
-    assert posting['tenders'] == [{'method': 'CASH', 'amount': '-80.00'}]
+    assert [
+        (row['method'], row['destination'], row['amount_uzs'])
+        for row in posting['postings'] if row['amount_uzs']
+    ] == [('CASH', 'SAFE', -80)]
     assert TreasuryAccount.objects.get(kind='SAFE').balance == Decimal('-80.00')
     entry = TreasuryTransaction.objects.get(
         type=TreasuryTransaction.Type.SHIFT_DEPOSIT,
@@ -863,9 +938,14 @@ class TestCashboxExpenseInvariants:
         user = _user()
         shift = _shift(user)
         _paid_order(user, Decimal('100.00'))
+        category = _expense_category()
 
         result, status = CashboxExpenseService.create(
-            shift.id, '60', comment='supplies', created_by=user,
+            shift.id,
+            '60',
+            category_id=category.id,
+            comment='supplies',
+            created_by=user,
         )
         assert status == 201, result
         register = CashRegister.objects.get(branch_id='main', is_deleted=False)
@@ -873,7 +953,11 @@ class TestCashboxExpenseInvariants:
         assert drawer_cash(shift) == Decimal('40.00')
 
         result, status = CashboxExpenseService.create(
-            shift.id, '50', comment='too much', created_by=user,
+            shift.id,
+            '50',
+            category_id=category.id,
+            comment='too much',
+            created_by=user,
         )
         assert status == 422, result
         register.refresh_from_db()
@@ -883,9 +967,13 @@ class TestCashboxExpenseInvariants:
         shift.end_time = timezone.now()
         shift.save(update_fields=['status', 'end_time'])
         result, status = CashboxExpenseService.create(
-            shift.id, '1', comment='late', created_by=user,
+            shift.id,
+            '1',
+            category_id=category.id,
+            comment='late',
+            created_by=user,
         )
-        assert status == 400, result
+        assert status == 409, result
 
     def test_expense_reads_and_writes_are_shift_and_branch_scoped(self):
         from base.models import CashRegister
@@ -898,15 +986,24 @@ class TestCashboxExpenseInvariants:
         intruder = _user(branch='main')
         foreign_manager = _user(branch='other', role='MANAGER')
         own_manager = _user(branch='main', role='MANAGER')
+        category = _expense_category()
 
         result, status = CashboxExpenseService.create(
-            shift.id, '10.00', comment='owner expense', actor=owner,
+            shift.id,
+            '10.00',
+            category_id=category.id,
+            comment='owner expense',
+            actor=owner,
         )
         assert status == 201, result
 
         for actor in (intruder, foreign_manager):
             result, status = CashboxExpenseService.create(
-                shift.id, '1.00', comment='unauthorized', actor=actor,
+                shift.id,
+                '1.00',
+                category_id=category.id,
+                comment='unauthorized',
+                actor=actor,
             )
             assert status == 403, result
             result, status = CashboxExpenseService.list_for_shift(
@@ -920,7 +1017,11 @@ class TestCashboxExpenseInvariants:
         assert status == 200, result
         assert len(result['data']) == 1
         result, status = CashboxExpenseService.create(
-            shift.id, '5.00', comment='manager approved', actor=own_manager,
+            shift.id,
+            '5.00',
+            category_id=category.id,
+            comment='manager approved',
+            actor=own_manager,
         )
         assert status == 201, result
 
@@ -939,9 +1040,14 @@ class TestCashboxExpenseInvariants:
         shift = _shift(user, branch='branch-a')
         _paid_order(user, Decimal('100.00'), branch='branch-a')
         register = CashRegister.objects.get(branch_id='branch-a')
+        category = _expense_category()
 
         result, status = CashboxExpenseService.create(
-            shift.id, '30', comment='remote approval', created_by=user,
+            shift.id,
+            '30',
+            category_id=category.id,
+            comment='remote approval',
+            created_by=user,
         )
         assert status == 201, result
         register.refresh_from_db()

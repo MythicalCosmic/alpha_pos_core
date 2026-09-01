@@ -6,12 +6,14 @@ from django.db.models import Q, Sum
 from django.utils import timezone
 
 from base.helpers.response import ServiceResponse
+from base.money import MoneyValueError, decimal_value, local_iso
 from stock.models import (
     PurchaseOrder, PurchaseOrderItem, PurchaseReceiving, PurchaseReceivingItem,
     PurchaseReceivingCorrection,
-    SupplierStockItem, StockBatch, StockSettings
+    Supplier, SupplierStockItem, StockBatch, StockItemUnit, StockSettings,
+    StockTransaction,
 )
-from stock.services.base_service import to_decimal, generate_number
+from stock.services.base_service import generate_number, round_decimal, to_decimal
 from stock.repositories import (
     PurchaseOrderRepository, PurchaseOrderItemRepository,
     PurchaseReceivingRepository, PurchaseReceivingItemRepository,
@@ -28,6 +30,35 @@ def _pagination_data(page_obj, paginator):
         "total_pages": paginator.num_pages,
         "has_next": page_obj.has_next(),
         "has_previous": page_obj.has_previous(),
+    }
+
+
+def _base_receipt_values(item, item_unit_factors):
+    quantity = to_decimal(item.quantity_received)
+    unit_cost = to_decimal(item.unit_cost)
+    if item.unit_id == item.stock_item.base_unit_id:
+        factor = Decimal('1')
+    else:
+        factor = item_unit_factors.get((item.stock_item_id, item.unit_id))
+        if factor is None and item.unit.base_unit_id == item.stock_item.base_unit_id:
+            factor = to_decimal(item.unit.conversion_factor)
+    if factor is None or factor <= 0:
+        return None
+    base_quantity = round_decimal(quantity * factor, 4)
+    if base_quantity <= 0:
+        return None
+    base_cost = round_decimal(quantity * unit_cost / base_quantity, 4)
+    if (
+        factor > Decimal('999999999.999999')
+        or base_quantity > Decimal('99999999999.9999')
+        or base_cost > Decimal('99999999999.9999')
+    ):
+        return None
+    return {
+        'factor': factor,
+        'quantity': base_quantity,
+        'unit_id': item.stock_item.base_unit_id,
+        'unit_cost': base_cost,
     }
 
 
@@ -121,8 +152,11 @@ class PurchaseOrderService:
              payment_status: str = None,
              date_from: date = None,
              date_to: date = None,
-             location_id: int = None) -> Tuple[Dict[str, Any], int]:
+             location_id: int = None,
+             branch_id: str = None) -> Tuple[Dict[str, Any], int]:
         queryset = PurchaseOrder.objects.select_related("supplier", "delivery_location")
+        if branch_id:
+            queryset = queryset.filter(branch_id=branch_id, is_deleted=False)
 
         if search:
             queryset = queryset.filter(
@@ -176,9 +210,16 @@ class PurchaseOrderService:
         })
 
     @classmethod
-    def get(cls, po_id: int,
-            include_receivings: bool = True) -> Tuple[Dict[str, Any], int]:
-        po = PurchaseOrderRepository.get_with_relations(po_id)
+    def get(cls, po_id: int, include_receivings: bool = True,
+            branch_id: str = None) -> Tuple[Dict[str, Any], int]:
+        queryset = PurchaseOrder.objects.filter(pk=po_id, is_deleted=False)
+        if branch_id:
+            queryset = queryset.filter(branch_id=branch_id)
+        po = queryset.select_related(
+            'supplier', 'delivery_location', 'created_by', 'approved_by',
+        ).prefetch_related(
+            'items__stock_item', 'items__unit', 'receivings',
+        ).first()
 
         if not po:
             return ServiceResponse.not_found("Purchase order not found")
@@ -199,13 +240,19 @@ class PurchaseOrderService:
                shipping_cost: Decimal = Decimal("0"),
                discount: Decimal = Decimal("0"),
                notes: str = "",
-               items: List[Dict] = None) -> Tuple[Dict[str, Any], int]:
+               items: List[Dict] = None,
+               branch_id: str = None) -> Tuple[Dict[str, Any], int]:
 
-        supplier = SupplierRepository.first(id=supplier_id, is_active=True)
+        supplier_filters = {'id': supplier_id, 'is_active': True}
+        location_filters = {'id': delivery_location_id, 'is_active': True}
+        if branch_id:
+            supplier_filters['branch_id'] = branch_id
+            location_filters['branch_id'] = branch_id
+        supplier = SupplierRepository.first(**supplier_filters)
         if not supplier:
             return ServiceResponse.not_found("Supplier not found")
 
-        location = StockLocationRepository.first(id=delivery_location_id, is_active=True)
+        location = StockLocationRepository.first(**location_filters)
         if not location:
             return ServiceResponse.not_found("Delivery location not found")
 
@@ -235,6 +282,7 @@ class PurchaseOrderService:
             payment_due_date=payment_due_date,
             created_by_id=created_by_id,
             notes=notes,
+            branch_id=branch_id or supplier.branch_id,
         )
 
         if items:
@@ -248,6 +296,7 @@ class PurchaseOrderService:
                     discount_percent=item_data.get("discount_percent", 0),
                     tax_percent=item_data.get("tax_percent", 0),
                     notes=item_data.get("notes", ""),
+                    branch_id=branch_id,
                 )
                 if status >= 400:
                     return result, status
@@ -312,8 +361,11 @@ class PurchaseOrderService:
 
     @classmethod
     @transaction.atomic
-    def update(cls, po_id: int, **kwargs) -> Tuple[Dict[str, Any], int]:
-        po = PurchaseOrderRepository.get_by_id(po_id)
+    def update(cls, po_id: int, branch_id=None, **kwargs) -> Tuple[Dict[str, Any], int]:
+        queryset = PurchaseOrder.objects.filter(pk=po_id, is_deleted=False)
+        if branch_id:
+            queryset = queryset.filter(branch_id=branch_id)
+        po = queryset.first()
         if not po:
             return ServiceResponse.not_found("Purchase order not found")
 
@@ -323,14 +375,20 @@ class PurchaseOrderService:
         update_fields = ["updated_at"]
 
         if "supplier_id" in kwargs:
-            supplier = SupplierRepository.first(id=kwargs["supplier_id"], is_active=True)
+            filters = {'id': kwargs['supplier_id'], 'is_active': True}
+            if branch_id:
+                filters['branch_id'] = branch_id
+            supplier = SupplierRepository.first(**filters)
             if not supplier:
                 return ServiceResponse.not_found("Supplier not found")
             po.supplier = supplier
             update_fields.append("supplier")
 
         if "delivery_location_id" in kwargs:
-            location = StockLocationRepository.first(id=kwargs["delivery_location_id"], is_active=True)
+            filters = {'id': kwargs['delivery_location_id'], 'is_active': True}
+            if branch_id:
+                filters['branch_id'] = branch_id
+            location = StockLocationRepository.first(**filters)
             if not location:
                 return ServiceResponse.not_found("Delivery location not found")
             po.delivery_location = location
@@ -384,8 +442,11 @@ class PurchaseOrderService:
 
     @classmethod
     @transaction.atomic
-    def send(cls, po_id: int) -> Tuple[Dict[str, Any], int]:
-        po = PurchaseOrderRepository.get_by_id(po_id)
+    def send(cls, po_id: int, branch_id=None) -> Tuple[Dict[str, Any], int]:
+        queryset = PurchaseOrder.objects.filter(pk=po_id, is_deleted=False)
+        if branch_id:
+            queryset = queryset.filter(branch_id=branch_id)
+        po = queryset.first()
         if not po:
             return ServiceResponse.not_found("Purchase order not found")
 
@@ -404,8 +465,12 @@ class PurchaseOrderService:
 
     @classmethod
     @transaction.atomic
-    def confirm(cls, po_id: int, approved_by_id: int = None) -> Tuple[Dict[str, Any], int]:
-        po = PurchaseOrderRepository.get_by_id(po_id)
+    def confirm(cls, po_id: int, approved_by_id: int = None,
+                branch_id=None) -> Tuple[Dict[str, Any], int]:
+        queryset = PurchaseOrder.objects.filter(pk=po_id, is_deleted=False)
+        if branch_id:
+            queryset = queryset.filter(branch_id=branch_id)
+        po = queryset.first()
         if not po:
             return ServiceResponse.not_found("Purchase order not found")
 
@@ -427,8 +492,12 @@ class PurchaseOrderService:
 
     @classmethod
     @transaction.atomic
-    def cancel(cls, po_id: int, reason: str = "") -> Tuple[Dict[str, Any], int]:
-        po = PurchaseOrderRepository.get_by_id(po_id)
+    def cancel(cls, po_id: int, reason: str = "",
+               branch_id=None) -> Tuple[Dict[str, Any], int]:
+        queryset = PurchaseOrder.objects.filter(pk=po_id, is_deleted=False)
+        if branch_id:
+            queryset = queryset.filter(branch_id=branch_id)
+        po = queryset.first()
         if not po:
             return ServiceResponse.not_found("Purchase order not found")
 
@@ -453,62 +522,12 @@ class PurchaseOrderService:
                        amount: Decimal,
                        payment_date: date = None,
                        notes: str = "") -> Tuple[Dict[str, Any], int]:
-        # Lock the PO so concurrent payments accumulate correctly and can't
-        # both over-reduce the supplier balance.
-        try:
-            po = PurchaseOrder.objects.select_for_update().get(pk=po_id)
-        except PurchaseOrder.DoesNotExist:
-            return ServiceResponse.not_found("Purchase order not found")
-
-        amount = to_decimal(amount)
-        if amount <= 0:
-            return ServiceResponse.validation_error(
-                errors={"amount": "Must be greater than 0"},
-                message="Payment amount must be greater than 0",
-            )
-
-        # Track cumulative payments so partial payments settle to PAID and a
-        # PO can't be paid past its total (which would over-credit the supplier).
-        remaining = po.total - po.amount_paid
-        if remaining <= 0:
-            return ServiceResponse.error("Purchase order is already fully paid")
-        if amount > remaining:
-            return ServiceResponse.error(
-                f"Payment {amount} exceeds the remaining balance {remaining}"
-            )
-
-        # The supplier balance is an audited ledger, not a derived PO field.
-        # Posting through the row-locked ledger prevents two payments on
-        # different POs for the same supplier from overwriting one another.
-        # This legacy API has no funding-account argument, so it deliberately
-        # records no guessed SAFE/BANK/DRAWER treasury movement.
-        from .supplier_ledger_service import SupplierLedgerService
-        supplier_txn = SupplierLedgerService.record_purchase_order_payment(
-            po.supplier_id, amount, po.id, note=notes,
+        return ServiceResponse.failure(
+            'UNFUNDED_PAYMENT_ROUTE_RETIRED',
+            'Use the funded supplier-payment endpoint with SAFE or BANK.',
+            410,
+            details={'purchase_order_id': po_id},
         )
-        if supplier_txn is None:
-            transaction.set_rollback(True)
-            return ServiceResponse.not_found("Supplier not found")
-
-        po.amount_paid = po.amount_paid + amount
-        if po.amount_paid >= po.total:
-            po.payment_status = PurchaseOrder.PaymentStatus.PAID
-        elif po.amount_paid > 0:
-            po.payment_status = PurchaseOrder.PaymentStatus.PARTIAL
-        else:
-            po.payment_status = PurchaseOrder.PaymentStatus.UNPAID
-
-        if notes:
-            po.notes = f"{po.notes}\nPayment recorded: {amount} on {payment_date or timezone.localdate()}".strip()
-
-        po.save(update_fields=["amount_paid", "payment_status", "notes", "updated_at"])
-
-        return ServiceResponse.success(data={
-            "payment_status": po.payment_status,
-            "payment_status_display": po.get_payment_status_display(),
-            "amount_paid": str(po.amount_paid),
-            "remaining": str(po.total - po.amount_paid),
-        }, message="Payment recorded")
 
     @classmethod
     def get_stats(cls, date_from: date = None, date_to: date = None) -> Tuple[Dict[str, Any], int]:
@@ -580,16 +599,23 @@ class PurchaseOrderItemService:
             discount_percent: Decimal = Decimal("0"),
             tax_percent: Decimal = Decimal("0"),
             supplier_stock_item_id: int = None,
-            notes: str = "") -> Tuple[Dict[str, Any], int]:
+            notes: str = "",
+            branch_id: str = None) -> Tuple[Dict[str, Any], int]:
 
-        po = PurchaseOrderRepository.get_by_id(purchase_order_id)
+        po_filters = {'id': purchase_order_id}
+        if branch_id:
+            po_filters['branch_id'] = branch_id
+        po = PurchaseOrderRepository.first(**po_filters)
         if not po:
             return ServiceResponse.not_found("Purchase order not found")
 
         if po.status != PurchaseOrder.Status.DRAFT:
             return ServiceResponse.error("Can only add items to DRAFT orders")
 
-        stock_item = StockItemRepository.get_by_id(stock_item_id)
+        item_filters = {'id': stock_item_id}
+        if branch_id:
+            item_filters['branch_id'] = branch_id
+        stock_item = StockItemRepository.first(**item_filters)
         if not stock_item:
             return ServiceResponse.not_found("Stock item not found")
 
@@ -617,6 +643,7 @@ class PurchaseOrderItemService:
             tax_percent=tax_percent,
             total_price=total_price,
             notes=notes,
+            branch_id=po.branch_id,
         )
 
         PurchaseOrderService._recalculate_totals(purchase_order_id)
@@ -628,8 +655,11 @@ class PurchaseOrderItemService:
 
     @classmethod
     @transaction.atomic
-    def update_item(cls, item_id: int, **kwargs) -> Tuple[Dict[str, Any], int]:
-        item = PurchaseOrderItemRepository.first(id=item_id)
+    def update_item(cls, item_id: int, branch_id=None, **kwargs) -> Tuple[Dict[str, Any], int]:
+        filters = {'id': item_id}
+        if branch_id:
+            filters['purchase_order__branch_id'] = branch_id
+        item = PurchaseOrderItemRepository.first(**filters)
         if not item:
             return ServiceResponse.not_found("Order item not found")
 
@@ -660,8 +690,11 @@ class PurchaseOrderItemService:
 
     @classmethod
     @transaction.atomic
-    def remove(cls, item_id: int) -> Tuple[Dict[str, Any], int]:
-        item = PurchaseOrderItemRepository.first(id=item_id)
+    def remove(cls, item_id: int, branch_id=None) -> Tuple[Dict[str, Any], int]:
+        filters = {'id': item_id}
+        if branch_id:
+            filters['purchase_order__branch_id'] = branch_id
+        item = PurchaseOrderItemRepository.first(**filters)
         if not item:
             return ServiceResponse.not_found("Order item not found")
 
@@ -696,7 +729,7 @@ class PurchaseReceivingService:
             "received_by_id": rcv.received_by_id,
             "status": rcv.status,
             "status_display": rcv.get_status_display(),
-            "completed_at": rcv.completed_at.isoformat() if rcv.completed_at else None,
+            "completed_at": local_iso(rcv.completed_at),
             "supplier_balance_before_uzs": (
                 int(rcv.supplier_balance_before)
                 if rcv.supplier_balance_before is not None else None
@@ -705,6 +738,12 @@ class PurchaseReceivingService:
                 int(rcv.supplier_balance_after)
                 if rcv.supplier_balance_after is not None else None
             ),
+            "received_value_uzs": (
+                int(rcv.received_value_uzs)
+                if rcv.received_value_uzs is not None else None
+            ),
+            "supplier_transaction_id": rcv.supplier_transaction_id,
+            "quality_posting_policy": rcv.quality_posting_policy or None,
             "notes": rcv.notes,
             "created_at": rcv.created_at.isoformat(),
         }
@@ -733,18 +772,54 @@ class PurchaseReceivingService:
                received_by_id: int,
                location_id: int = None,
                received_date: date = None,
-               notes: str = "") -> Tuple[Dict[str, Any], int]:
+               notes: str = "",
+               actor=None,
+               branch_id: str = None) -> Tuple[Dict[str, Any], int]:
 
-        po = PurchaseOrderRepository.get_by_id(purchase_order_id)
+        from base.services.branch_scope import resolve_actor_branch
+
+        if actor is None:
+            from base.models import User
+
+            actor = User.objects.filter(
+                pk=received_by_id,
+                is_deleted=False,
+            ).first()
+        actor_branch = str(resolve_actor_branch(actor) or '').strip()
+        requested_branch = str(branch_id or '').strip()
+        if actor is not None and requested_branch and requested_branch != actor_branch:
+            return ServiceResponse.failure(
+                'LOCATION_FORBIDDEN',
+                'Receiving branch is outside the authorized scope.',
+                403,
+            )
+        branch_id = actor_branch if actor is not None else requested_branch
+        if actor is not None:
+            received_by_id = actor.id
+        po_filters = {'id': purchase_order_id}
+        if branch_id:
+            po_filters['branch_id'] = branch_id
+        po = PurchaseOrderRepository.first(**po_filters)
         if not po:
             return ServiceResponse.not_found("Purchase order not found")
+        branch_id = branch_id or po.branch_id
+        if not branch_id:
+            return ServiceResponse.failure(
+                'BRANCH_SCOPE_REQUIRED',
+                'Receiving branch could not be resolved.',
+                403,
+            )
 
         if po.status not in [PurchaseOrder.Status.CONFIRMED, PurchaseOrder.Status.PARTIAL]:
             return ServiceResponse.error(f"Cannot receive order in {po.status} status")
 
         location_id = location_id or po.delivery_location_id
 
-        location = StockLocationRepository.first(id=location_id, is_active=True)
+        location = StockLocationRepository.first(
+            id=location_id,
+            branch_id=branch_id,
+            is_active=True,
+        )
         if not location:
             return ServiceResponse.not_found("Location not found")
 
@@ -758,6 +833,7 @@ class PurchaseReceivingService:
             received_by_id=received_by_id,
             status=PurchaseReceiving.Status.DRAFT,
             notes=notes,
+            branch_id=branch_id,
         )
 
         return ServiceResponse.success(data={
@@ -791,7 +867,8 @@ class PurchaseReceivingService:
 
     @classmethod
     @transaction.atomic
-    def complete(cls, receiving_id: int) -> Tuple[Dict[str, Any], int]:
+    def complete(cls, receiving_id: int, *, actor=None, action_id=None,
+                 idempotency_key='') -> Tuple[Dict[str, Any], int]:
         # Lock the receiving row and re-check status under the lock. Without the
         # lock two concurrent complete() calls both read DRAFT and both run the
         # stock-in + cost-update loop, doubling received stock and corrupting the
@@ -800,6 +877,22 @@ class PurchaseReceivingService:
         rcv = PurchaseReceivingRepository.get_for_update(receiving_id)
         if not rcv:
             return ServiceResponse.not_found("Receiving not found")
+        if actor is not None:
+            from base.services.branch_scope import resolve_actor_branch
+
+            actor_branch = str(resolve_actor_branch(actor) or '').strip()
+            global_admin = (
+                actor.role == 'ADMIN'
+                and str(actor.branch_id or '').strip().lower() in {'', 'cloud'}
+            )
+            if not global_admin and (
+                not actor_branch or actor_branch != rcv.branch_id
+            ):
+                return ServiceResponse.failure(
+                    'LOCATION_FORBIDDEN',
+                    'Receiving is outside the authorized branch.',
+                    403,
+                )
 
         if rcv.status == PurchaseReceiving.Status.COMPLETED:
             return cls._completion_response(rcv)
@@ -810,25 +903,59 @@ class PurchaseReceivingService:
             return ServiceResponse.error("No items in receiving")
 
         settings = StockSettings.load()
+        if not settings.stock_enabled:
+            return ServiceResponse.conflict(
+                'STOCK_SYSTEM_DISABLED',
+                'Receiving cannot complete while stock tracking is disabled.',
+            )
+        supplier = Supplier.objects.select_for_update().get(
+            pk=rcv.purchase_order.supplier_id,
+        )
         po = PurchaseOrder.objects.select_for_update().get(pk=rcv.purchase_order_id)
+        if supplier.currency != 'UZS' or po.currency != 'UZS':
+            return ServiceResponse.failure(
+                'SUPPLIER_CURRENCY_UNSUPPORTED',
+                'Receiving can post supplier debt only in UZS.',
+                422,
+                errors={'currency': ['Only UZS is supported.']},
+            )
         receiving_items = list(
-            rcv.items.select_related("stock_item", "unit", "po_item").order_by('id')
+            rcv.items.select_related(
+                'stock_item__base_unit', 'unit__base_unit', 'po_item',
+            ).order_by('stock_item_id', 'id')
         )
         if any(item.quality_status == PurchaseReceivingItem.QualityStatus.PENDING
                for item in receiving_items):
             return ServiceResponse.validation_error(
                 errors={'quality_status': 'Resolve all PENDING quality results before completion'},
             )
+        item_unit_factors = {
+            (link.stock_item_id, link.unit_id): link.conversion_to_base
+            for link in StockItemUnit.objects.filter(
+                stock_item_id__in={item.stock_item_id for item in receiving_items},
+                unit_id__in={item.unit_id for item in receiving_items},
+                is_deleted=False,
+            ).order_by('stock_item_id', 'unit_id', 'id')
+        }
         errors = {}
+        base_values = {}
         for item in receiving_items:
-            if item.unit_cost != item.unit_cost.to_integral_value() or item.unit_cost < 0:
-                errors[f'items.{item.id}.unit_cost'] = 'Must be a non-negative whole UZS integer'
+            if item.unit_cost < 0:
+                errors[f'items.{item.id}.unit_cost'] = 'Must be non-negative'
             if item.stock_item.track_batches and not item.batch_number.strip():
                 errors[f'items.{item.id}.batch_number'] = 'Required for batch-tracked items'
             if item.stock_item.track_expiry and not item.expiry_date:
                 errors[f'items.{item.id}.expiry_date'] = 'Required for expiry-tracked items'
             if item.quality_status == PurchaseReceivingItem.QualityStatus.FAILED and not item.notes.strip():
                 errors[f'items.{item.id}.notes'] = 'Required for failed quality'
+            if item.quality_status == PurchaseReceivingItem.QualityStatus.PASSED:
+                values = _base_receipt_values(item, item_unit_factors)
+                if values is None:
+                    errors[f'items.{item.id}.unit_id'] = (
+                        'A valid item-specific conversion to the base unit is required'
+                    )
+                else:
+                    base_values[item.id] = values
         received_value = sum(
             (to_decimal(item.unit_cost) * to_decimal(item.quantity_received)
              for item in receiving_items
@@ -869,14 +996,23 @@ class PurchaseReceivingService:
             # usable stock or supplier debt.
             if item.quality_status == PurchaseReceivingItem.QualityStatus.FAILED:
                 continue
+            base_value = base_values[item.id]
+            item.conversion_to_base_snapshot = base_value['factor']
+            item.base_quantity = base_value['quantity']
+            item.base_unit_id = base_value['unit_id']
+            item.base_unit_cost = base_value['unit_cost']
+            item.save(update_fields=[
+                'conversion_to_base_snapshot', 'base_quantity', 'base_unit',
+                'base_unit_cost',
+            ])
             batch = None
             if settings.track_batches or item.stock_item.track_batches:
                 from .batch_service import StockBatchService
                 batch_result, batch_status = StockBatchService.create(
                     stock_item_id=item.stock_item_id,
                     location_id=rcv.location_id,
-                    quantity=item.quantity_received,
-                    unit_cost=item.unit_cost,
+                    quantity=base_value['quantity'],
+                    unit_cost=base_value['unit_cost'],
                     batch_number=item.batch_number or None,
                     expiry_date=item.expiry_date,
                     supplier_id=po.supplier_id,
@@ -899,14 +1035,14 @@ class PurchaseReceivingService:
             level_result, level_status = StockLevelService.adjust(
                 stock_item_id=item.stock_item_id,
                 location_id=rcv.location_id,
-                quantity=item.quantity_received,
+                quantity=base_value['quantity'],
                 movement_type="PURCHASE_IN",
                 user_id=rcv.received_by_id,
-                unit_id=item.unit_id,
+                unit_id=base_value['unit_id'],
                 batch_id=batch.id if batch else None,
                 reference_type="PurchaseReceiving",
                 reference_id=rcv.id,
-                unit_cost=item.unit_cost,
+                unit_cost=base_value['unit_cost'],
                 notes=f"PO: {po.order_number}",
             )
             if level_status >= 400:
@@ -926,8 +1062,8 @@ class PurchaseReceivingService:
 
             from .item_service import StockItemService
             cost_result, cost_status = StockItemService.update_cost(
-                item.stock_item_id, item.unit_cost, "AVG",
-                received_qty=item.quantity_received,
+                item.stock_item_id, base_value['unit_cost'], "AVG",
+                received_qty=base_value['quantity'],
             )
             if cost_status >= 400:
                 transaction.set_rollback(True)
@@ -938,8 +1074,9 @@ class PurchaseReceivingService:
         # Record the supplier debt: receiving goods worth `received_value` means
         # we now owe the supplier that much (a PURCHASE ledger row). Previously
         # the debt was never recorded — the money owed vanished.
-        before = po.supplier.current_balance
+        before = supplier.current_balance
         after = before
+        supplier_txn = None
         if received_value > 0 and po.supplier_id:
             from .supplier_ledger_service import SupplierLedgerService
             supplier_txn = SupplierLedgerService.record_purchase(
@@ -957,22 +1094,53 @@ class PurchaseReceivingService:
         rcv.completed_at = timezone.now()
         rcv.supplier_balance_before = before
         rcv.supplier_balance_after = after
+        rcv.received_value_uzs = received_value
+        rcv.supplier_transaction = supplier_txn if received_value > 0 else None
+        rcv.completion_action_id = action_id
+        rcv.completion_idempotency_key = idempotency_key or ''
+        rcv.quality_posting_policy = 'PASSED_ONLY_PENDING_BLOCKS_COMPLETION'
         rcv.save(update_fields=[
             "status", "completed_at", "supplier_balance_before",
-            "supplier_balance_after", "updated_at",
+            "supplier_balance_after", "received_value_uzs",
+            "supplier_transaction", "completion_action_id",
+            "completion_idempotency_key", "quality_posting_policy", "updated_at",
         ])
 
         return cls._completion_response(rcv)
 
     @classmethod
     def _completion_response(cls, rcv):
+        stock_transaction_ids = list(StockTransaction.objects.filter(
+            branch_id=rcv.branch_id,
+            is_deleted=False,
+            reference_type='PurchaseReceiving',
+            reference_id=rcv.id,
+        ).order_by('id').values_list('id', flat=True))
         return ServiceResponse.success(data={
-            'receiving_id': str(rcv.uuid),
+            'receiving_id': rcv.id,
+            'receiving_uuid': str(rcv.uuid),
             'status': 'COMPLETE',
-            'supplier_id': str(rcv.purchase_order.supplier.uuid),
-            'supplier_balance_before_uzs': int(rcv.supplier_balance_before or 0),
-            'supplier_balance_after_uzs': int(rcv.supplier_balance_after or 0),
-            'posted_at': rcv.completed_at.isoformat() if rcv.completed_at else None,
+            'supplier_id': rcv.purchase_order.supplier_id,
+            'supplier_uuid': str(rcv.purchase_order.supplier.uuid),
+            'supplier_balance_before_uzs': (
+                int(rcv.supplier_balance_before)
+                if rcv.supplier_balance_before is not None else None
+            ),
+            'supplier_balance_after_uzs': (
+                int(rcv.supplier_balance_after)
+                if rcv.supplier_balance_after is not None else None
+            ),
+            'received_value_uzs': (
+                int(rcv.received_value_uzs)
+                if rcv.received_value_uzs is not None else None
+            ),
+            'stock_transaction_ids': stock_transaction_ids,
+            'supplier_transaction_id': rcv.supplier_transaction_id,
+            'quality_posting_policy': (
+                rcv.quality_posting_policy
+                or 'PASSED_ONLY_PENDING_BLOCKS_COMPLETION'
+            ),
+            'posted_at': local_iso(rcv.completed_at),
             'timezone': 'Asia/Tashkent',
             'receiving': cls.serialize(rcv),
         }, message='Receiving completed')
@@ -1005,7 +1173,9 @@ class PurchaseReceivingService:
     @classmethod
     @transaction.atomic
     def review_correction(cls, correction_id, reviewer, approve, note):
-        correction = PurchaseReceivingCorrection.objects.select_for_update().select_related(
+        correction = PurchaseReceivingCorrection.objects.select_for_update(
+            of=('self',),
+        ).select_related(
             'receiving__purchase_order__supplier', 'requested_by', 'reviewed_by',
         ).filter(id=correction_id, is_deleted=False).first()
         if not correction:
@@ -1040,21 +1210,54 @@ class PurchaseReceivingService:
             return ({'success': False, 'message': 'Receiving was already reversed',
                      'errors': {'code': 'receiving_already_reversed'}}, 409)
         po = PurchaseOrder.objects.select_for_update().get(pk=rcv.purchase_order_id)
-        items = list(rcv.items.select_related('stock_item', 'unit', 'po_item', 'batch_created'))
+        items = list(rcv.items.select_related(
+            'stock_item__base_unit', 'unit__base_unit', 'base_unit',
+            'po_item', 'batch_created',
+        ).order_by('stock_item_id', 'id'))
         passed = [item for item in items
                   if item.quality_status == PurchaseReceivingItem.QualityStatus.PASSED]
+        item_unit_factors = {
+            (link.stock_item_id, link.unit_id): link.conversion_to_base
+            for link in StockItemUnit.objects.filter(
+                stock_item_id__in={item.stock_item_id for item in passed},
+                unit_id__in={item.unit_id for item in passed},
+                is_deleted=False,
+            ).order_by('stock_item_id', 'unit_id', 'id')
+        }
+        base_values = {}
+        for item in passed:
+            if (
+                item.base_quantity is not None
+                and item.base_unit_id is not None
+                and item.base_unit_cost is not None
+            ):
+                base_values[item.id] = {
+                    'quantity': item.base_quantity,
+                    'unit_id': item.base_unit_id,
+                    'unit_cost': item.base_unit_cost,
+                }
+            else:
+                base_value = _base_receipt_values(item, item_unit_factors)
+                if base_value is None:
+                    return ServiceResponse.conflict(
+                        'RECEIVING_UNIT_CONVERSION_MISSING',
+                        'The original receiving unit cannot be converted safely.',
+                        details={'receiving_item_id': item.id},
+                    )
+                base_values[item.id] = base_value
         from stock.models import StockBatch
         from .level_service import StockLevelService
         batches = {}
         for item in passed:
+            base_value = base_values[item.id]
             level = StockLevelService.get_level_for_update(item.stock_item_id, rcv.location_id)
-            if level.quantity < item.quantity_received:
+            if level.quantity < base_value['quantity']:
                 return ({'success': False, 'message': 'Received stock has already been consumed',
                          'errors': {'code': 'receiving_reversal_stock_unavailable',
                                     'stock_item_id': item.stock_item_id}}, 409)
             if item.batch_created_id:
                 batch = StockBatch.objects.select_for_update().get(pk=item.batch_created_id)
-                if batch.current_quantity < item.quantity_received:
+                if batch.current_quantity < base_value['quantity']:
                     return ({'success': False, 'message': 'Received batch has already been consumed',
                              'errors': {'code': 'receiving_reversal_batch_unavailable',
                                         'batch_id': batch.id}}, 409)
@@ -1064,20 +1267,31 @@ class PurchaseReceivingService:
                  .filter(id__in=line_ids).order_by('id')}
         reversed_value = Decimal('0')
         for item in passed:
+            base_value = base_values[item.id]
             result, status = StockLevelService.adjust(
                 stock_item_id=item.stock_item_id, location_id=rcv.location_id,
-                quantity=item.quantity_received, movement_type='RETURN_TO_SUPPLIER',
-                user_id=reviewer.id, unit_id=item.unit_id,
+                quantity=base_value['quantity'], movement_type='RETURN_TO_SUPPLIER',
+                user_id=reviewer.id, unit_id=base_value['unit_id'],
                 batch_id=item.batch_created_id,
                 reference_type='PurchaseReceivingCorrection', reference_id=correction.id,
-                unit_cost=item.unit_cost, notes=note,
+                unit_cost=base_value['unit_cost'], notes=note,
             )
             if status >= 400:
                 transaction.set_rollback(True)
                 return result, status
+            from .item_service import StockItemService
+
+            cost_result, cost_status = StockItemService.reverse_received_cost(
+                item.stock_item_id,
+                base_value['quantity'],
+                base_value['unit_cost'],
+            )
+            if cost_status >= 400:
+                transaction.set_rollback(True)
+                return cost_result, cost_status
             if item.id in batches:
                 batch = batches[item.id]
-                batch.current_quantity -= item.quantity_received
+                batch.current_quantity -= base_value['quantity']
                 batch.save(update_fields=['current_quantity', 'updated_at'])
             line = lines[item.po_item_id]
             line.quantity_received = max(Decimal('0'), line.quantity_received - item.quantity_received)
@@ -1120,15 +1334,17 @@ class PurchaseReceivingService:
             return ServiceResponse.error("Cannot update items in completed receiving")
 
         if quantity_received is not None:
-            quantity_received = to_decimal(quantity_received)
-
-            # Mirror add()'s guard: reject non-positive or over-pending
-            # quantities. Without this an update can drive
-            # PurchaseOrderItem.quantity_received negative on complete() and
-            # poison the moving-average cost.
-            if quantity_received <= 0:
+            try:
+                quantity_received = decimal_value(
+                    quantity_received,
+                    'quantity_received',
+                    places=4,
+                    positive=True,
+                    maximum='99999999999.9999',
+                )
+            except MoneyValueError as exc:
                 return ServiceResponse.validation_error(
-                    errors={"quantity_received": "Must be greater than 0"},
+                    errors={'quantity_received': str(exc)},
                 )
 
             item.quantity_received = quantity_received
@@ -1140,10 +1356,16 @@ class PurchaseReceivingService:
             item.expiry_date = expiry_date
 
         if unit_cost is not None:
-            unit_cost = to_decimal(unit_cost)
-            if unit_cost < 0 or unit_cost != unit_cost.to_integral_value():
+            try:
+                unit_cost = decimal_value(
+                    unit_cost,
+                    'unit_cost',
+                    places=4,
+                    maximum='99999999999.9999',
+                )
+            except MoneyValueError as exc:
                 return ServiceResponse.validation_error(
-                    errors={'unit_cost': 'Must be a non-negative whole UZS integer'},
+                    errors={'unit_cost': str(exc)},
                 )
             item.unit_cost = unit_cost
 
@@ -1225,6 +1447,18 @@ class PurchaseReceivingItemService:
             "stock_item_name": item.stock_item.name,
             "quantity_received": str(item.quantity_received),
             "unit": item.unit.short_name,
+            "conversion_to_base_snapshot": (
+                str(item.conversion_to_base_snapshot)
+                if item.conversion_to_base_snapshot is not None else None
+            ),
+            "base_quantity": (
+                str(item.base_quantity) if item.base_quantity is not None else None
+            ),
+            "base_unit_id": item.base_unit_id,
+            "base_unit_cost_uzs": (
+                str(item.base_unit_cost)
+                if item.base_unit_cost is not None else None
+            ),
             "batch_number": item.batch_number,
             "expiry_date": item.expiry_date.isoformat() if item.expiry_date else None,
             "unit_cost_uzs": int(item.unit_cost),
@@ -1263,14 +1497,17 @@ class PurchaseReceivingItemService:
         # Ensure select_related for stock_item and unit
         po_item = PurchaseOrderItem.objects.select_related("stock_item", "unit").get(id=po_item.id)
 
-        quantity_received = to_decimal(quantity_received)
-
-        # Reject non-positive quantities. Without this, a negative value
-        # corrupts PO totals (quantity_received goes negative) and feeds
-        # negative unit_cost * quantity into the moving-average cost.
-        if quantity_received <= 0:
+        try:
+            quantity_received = decimal_value(
+                quantity_received,
+                'quantity_received',
+                places=4,
+                positive=True,
+                maximum='99999999999.9999',
+            )
+        except MoneyValueError as exc:
             return ServiceResponse.validation_error(
-                errors={"quantity_received": "Must be greater than 0"},
+                errors={'quantity_received': str(exc)},
             )
 
         already_received = po_item.quantity_received
@@ -1278,10 +1515,16 @@ class PurchaseReceivingItemService:
             Decimal('0'), po_item.quantity_ordered - already_received - po_item.quantity_canceled,
         )
 
-        unit_cost = to_decimal(unit_cost if unit_cost is not None else po_item.unit_price)
-        if unit_cost < 0 or unit_cost != unit_cost.to_integral_value():
+        try:
+            unit_cost = decimal_value(
+                unit_cost if unit_cost is not None else po_item.unit_price,
+                'unit_cost',
+                places=4,
+                maximum='99999999999.9999',
+            )
+        except MoneyValueError as exc:
             return ServiceResponse.validation_error(
-                errors={'unit_cost': 'Must be a non-negative whole UZS integer'},
+                errors={'unit_cost': str(exc)},
             )
         if quality_status not in PurchaseReceivingItem.QualityStatus.values:
             return ServiceResponse.validation_error(
@@ -1318,6 +1561,7 @@ class PurchaseReceivingItemService:
             unit_cost=unit_cost,
             quality_status=quality_status,
             notes=notes,
+            branch_id=rcv.branch_id,
         )
 
         return ServiceResponse.success(data={

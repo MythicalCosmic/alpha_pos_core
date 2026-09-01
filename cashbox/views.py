@@ -5,13 +5,27 @@ from django.views.decorators.http import require_http_methods, require_GET
 
 from base.helpers.request import parse_json_body
 from base.helpers.response import json_response
-from base.security.permissions import pos_staff_required
+from base.security.idempotency import idempotent
+from base.security.audit import audit
+from base.security.permissions import (
+    backoffice_permission_required,
+    backoffice_required,
+    permission_denied_response,
+)
+from base.models import AuditLog
+from base.services.branch_scope import resolve_actor_branch
 from cashbox.services.expense_service import CashboxExpenseService, CashboxCategoryService
 
 
 @csrf_exempt
 @require_http_methods(["GET", "POST"])
-@pos_staff_required
+@backoffice_permission_required('expense.direct.pay')
+@idempotent(
+    'cashbox.expense.direct',
+    required=True,
+    expose_action_id=True,
+    recover_inflight_after_seconds=5,
+)
 def cashbox_expenses(request, shift_id):
     if request.method == "GET":
         result, status_code = CashboxExpenseService.list_for_shift(
@@ -30,24 +44,25 @@ def cashbox_expenses(request, shift_id):
         recipient_user_id=data.get("recipient_user_id"),
         recipient_supplier_id=data.get("recipient_supplier_id"),
         actor=request.user,
+        command_id=getattr(request, 'idempotency_action_id', None),
+        idempotency_key=getattr(request, 'idempotency_key', ''),
     )
     return JsonResponse(result, status=status_code)
 
 
 @csrf_exempt
 @require_http_methods(["GET", "POST"])
-@pos_staff_required
+@backoffice_required
 def cashbox_categories(request):
+    permission = (
+        'expense.category.view' if request.method == 'GET'
+        else 'expense.category.manage'
+    )
+    if denied := permission_denied_response(request, permission):
+        return denied
     if request.method == "GET":
         result, status_code = CashboxCategoryService.list()
         return JsonResponse(result, status=status_code)
-    # Reading the configured choices is part of the cashier expense form;
-    # changing that global catalog remains a back-office-only operation.
-    if request.user.role not in {'ADMIN', 'MANAGER'}:
-        return JsonResponse(
-            {"success": False, "message": "Manager access required"},
-            status=403,
-        )
     data, error = parse_json_body(request)
     if error:
         return json_response(error)
@@ -55,18 +70,34 @@ def cashbox_categories(request):
         name=data.get("name", ""),
         sort_order=data.get("sort_order", 0),
         reporting_group=data.get("reporting_group", "REVIEW"),
+        code=data.get('code'),
+        allowed_sources=data.get('allowed_sources'),
+        actor=request.user,
     )
+    if result.get('success'):
+        category = result['data']
+        audit(
+            request,
+            AuditLog.Action.EXPENSE_CATEGORY_CREATE,
+            target_type='ExpenseCategory',
+            target_id=category['id'],
+            metadata={
+                'code': category['code'],
+                'name': category['name'],
+                'compatibility_route': 'cashbox',
+            },
+        )
     return JsonResponse(result, status=status_code)
 
 
 @require_GET
-@pos_staff_required
+@backoffice_permission_required('expense.direct.pay')
 def recipient_search(request):
     """Combined autocomplete over users (staff) and suppliers for the cashbox
     expense recipient field. Returns two grouped lists."""
     from base.models import User
     from stock.models import Supplier
-    branch = str(request.user.branch_id or '').strip()
+    branch = str(resolve_actor_branch(request.user) or '').strip()
     if not branch:
         return JsonResponse(
             {'success': False, 'message': 'User has no branch ownership'},

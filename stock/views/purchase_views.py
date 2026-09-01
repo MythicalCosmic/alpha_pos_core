@@ -5,11 +5,14 @@ from base.helpers.request import parse_json_body, safe_page, safe_per_page, safe
 from base.helpers.response import json_response
 from base.security.idempotency import idempotent
 from base.security.permissions import (
-    admin_required, backoffice_required, permission_denied_response,
+    backoffice_required, permission_denied_response,
 )
 from base.security.audit import audit
 from base.models import User
-from stock.models import PurchaseReceiving, PurchaseReceivingItem
+from base.services.branch_scope import resolve_actor_branch
+from stock.models import (
+    PurchaseReceiving, PurchaseReceivingCorrection, PurchaseReceivingItem,
+)
 from stock.services import PurchaseOrderService, PurchaseOrderItemService, PurchaseReceivingService
 
 
@@ -17,9 +20,23 @@ def _deny(request, permission):
     return permission_denied_response(request, permission)
 
 
+def _branch(request):
+    branch_id = str(resolve_actor_branch(request.user) or '').strip()
+    if branch_id:
+        return branch_id, None
+    return None, JsonResponse({
+        'success': False,
+        'code': 'BRANCH_SCOPE_REQUIRED',
+        'message': 'Operational branch could not be resolved.',
+    }, status=403)
+
+
 def _owned_draft(request, receiving_id):
+    branch_id, error = _branch(request)
+    if error:
+        return None, error
     receiving = PurchaseReceiving.objects.filter(
-        id=receiving_id, is_deleted=False,
+        id=receiving_id, branch_id=branch_id, is_deleted=False,
     ).first()
     if not receiving:
         return None, JsonResponse({'success': False, 'message': 'Receiving not found'}, status=404)
@@ -40,6 +57,9 @@ def _owned_draft(request, receiving_id):
 @require_http_methods(["GET", "POST"])
 @backoffice_required
 def purchase_orders(request):
+    branch_id, branch_error = _branch(request)
+    if branch_error:
+        return branch_error
     if request.method == "GET":
         if denied := _deny(request, 'stock.purchase.view'):
             return denied
@@ -53,6 +73,7 @@ def purchase_orders(request):
             status=request.GET.get("status"),
             date_from=date_from,
             date_to=date_to,
+            branch_id=branch_id,
         )
         return JsonResponse(result, status=status_code)
 
@@ -62,7 +83,12 @@ def purchase_orders(request):
     if error:
         return json_response(error)
 
-    result, status_code = PurchaseOrderService.create(**data, created_by_id=request.user.id)
+    data.pop('branch_id', None)
+    result, status_code = PurchaseOrderService.create(
+        **data,
+        created_by_id=request.user.id,
+        branch_id=branch_id,
+    )
     return JsonResponse(result, status=status_code)
 
 
@@ -70,10 +96,13 @@ def purchase_orders(request):
 @require_http_methods(["GET", "PUT"])
 @backoffice_required
 def purchase_order_detail(request, po_id):
+    branch_id, branch_error = _branch(request)
+    if branch_error:
+        return branch_error
     if request.method == "GET":
         if denied := _deny(request, 'stock.purchase.view'):
             return denied
-        result, status_code = PurchaseOrderService.get(po_id)
+        result, status_code = PurchaseOrderService.get(po_id, branch_id=branch_id)
         return JsonResponse(result, status=status_code)
 
     if denied := _deny(request, 'stock.manage'):
@@ -82,24 +111,40 @@ def purchase_order_detail(request, po_id):
     if error:
         return json_response(error)
 
-    result, status_code = PurchaseOrderService.update(po_id, **data)
+    data.pop('branch_id', None)
+    result, status_code = PurchaseOrderService.update(
+        po_id, branch_id=branch_id, **data,
+    )
     return JsonResponse(result, status=status_code)
 
 
 @csrf_exempt
 @require_POST
-@admin_required
+@backoffice_required
 def purchase_order_action(request, po_id, action):
+    if denied := _deny(request, 'stock.manage'):
+        return denied
+    branch_id, branch_error = _branch(request)
+    if branch_error:
+        return branch_error
     data, error = parse_json_body(request)
     if error:
         return json_response(error)
 
     if action == "send":
-        result, status_code = PurchaseOrderService.send(po_id)
+        result, status_code = PurchaseOrderService.send(po_id, branch_id=branch_id)
     elif action == "confirm":
-        result, status_code = PurchaseOrderService.confirm(po_id, approved_by_id=request.user.id)
+        result, status_code = PurchaseOrderService.confirm(
+            po_id,
+            approved_by_id=request.user.id,
+            branch_id=branch_id,
+        )
     elif action == "cancel":
-        result, status_code = PurchaseOrderService.cancel(po_id, reason=data.get("reason", ""))
+        result, status_code = PurchaseOrderService.cancel(
+            po_id,
+            reason=data.get('reason', ''),
+            branch_id=branch_id,
+        )
     else:
         return JsonResponse(
             {"success": False, "message": f"Unknown action: {action}"},
@@ -111,29 +156,47 @@ def purchase_order_action(request, po_id, action):
 
 @csrf_exempt
 @require_POST
-@admin_required
+@backoffice_required
 def purchase_order_items(request, po_id):
+    if denied := _deny(request, 'stock.manage'):
+        return denied
+    branch_id, branch_error = _branch(request)
+    if branch_error:
+        return branch_error
     data, error = parse_json_body(request)
     if error:
         return json_response(error)
 
-    result, status_code = PurchaseOrderItemService.add(purchase_order_id=po_id, **data)
+    result, status_code = PurchaseOrderItemService.add(
+        purchase_order_id=po_id,
+        branch_id=branch_id,
+        **data,
+    )
     return JsonResponse(result, status=status_code)
 
 
 @csrf_exempt
 @require_http_methods(["PUT", "DELETE"])
-@admin_required
+@backoffice_required
 def purchase_order_item_detail(request, item_id):
+    if denied := _deny(request, 'stock.manage'):
+        return denied
+    branch_id, branch_error = _branch(request)
+    if branch_error:
+        return branch_error
     if request.method == "DELETE":
-        result, status_code = PurchaseOrderItemService.remove_item(item_id)
+        result, status_code = PurchaseOrderItemService.remove(
+            item_id, branch_id=branch_id,
+        )
         return JsonResponse(result, status=status_code)
 
     data, error = parse_json_body(request)
     if error:
         return json_response(error)
 
-    result, status_code = PurchaseOrderItemService.update_item(item_id, **data)
+    result, status_code = PurchaseOrderItemService.update_item(
+        item_id, branch_id=branch_id, **data,
+    )
     return JsonResponse(result, status=status_code)
 
 
@@ -141,11 +204,16 @@ def purchase_order_item_detail(request, item_id):
 @require_http_methods(["GET", "POST"])
 @backoffice_required
 def purchase_receiving(request, po_id):
+    branch_id, branch_error = _branch(request)
+    if branch_error:
+        return branch_error
     if request.method == 'GET':
         if denied := _deny(request, 'stock.purchase.view'):
             return denied
         rows = PurchaseReceiving.objects.filter(
-            purchase_order_id=po_id, is_deleted=False,
+            purchase_order_id=po_id,
+            branch_id=branch_id,
+            is_deleted=False,
         ).select_related('purchase_order__supplier', 'location', 'received_by')
         return JsonResponse({'success': True, 'data': {
             'receivings': [PurchaseReceivingService.serialize(row) for row in rows],
@@ -159,7 +227,10 @@ def purchase_receiving(request, po_id):
     result, status_code = PurchaseReceivingService.create(
         purchase_order_id=po_id,
         received_by_id=request.user.id,
-        **{k: v for k, v in data.items() if k not in ["received_by_id"]},
+        **{
+            key: value for key, value in data.items()
+            if key not in {'received_by_id', 'actor', 'branch_id'}
+        },
     )
     if status_code < 400:
         audit(request, 'RECEIVING_CREATE', target_type='PurchaseReceiving',
@@ -172,12 +243,19 @@ def purchase_receiving(request, po_id):
 @require_http_methods(["GET", "POST"])
 @backoffice_required
 def purchase_receiving_items(request, receiving_id):
+    branch_id, branch_error = _branch(request)
+    if branch_error:
+        return branch_error
     if request.method == 'GET':
         if denied := _deny(request, 'stock.batch.view'):
             return denied
         receiving = PurchaseReceiving.objects.select_related(
             'purchase_order__supplier', 'location', 'received_by',
-        ).filter(id=receiving_id, is_deleted=False).first()
+        ).filter(
+            id=receiving_id,
+            branch_id=branch_id,
+            is_deleted=False,
+        ).first()
         if not receiving:
             return JsonResponse({'success': False, 'message': 'Receiving not found'}, status=404)
         return JsonResponse({'success': True, 'data': {
@@ -202,8 +280,13 @@ def purchase_receiving_items(request, receiving_id):
 def purchase_receiving_item_detail(request, item_id):
     if denied := _deny(request, 'stock.receiving.update_draft'):
         return denied
+    branch_id, branch_error = _branch(request)
+    if branch_error:
+        return branch_error
     item = PurchaseReceivingItem.objects.select_related('receiving').filter(
-        id=item_id, is_deleted=False,
+        id=item_id,
+        receiving__branch_id=branch_id,
+        is_deleted=False,
     ).first()
     if not item:
         return JsonResponse({'success': False, 'message': 'Receiving item not found'}, status=404)
@@ -223,11 +306,23 @@ def purchase_receiving_item_detail(request, item_id):
 @csrf_exempt
 @require_POST
 @backoffice_required
-@idempotent('stock.receiving.complete', fallback_key_from_request=True)
+@idempotent(
+    'stock.receiving.complete',
+    required=True,
+    expose_action_id=True,
+    recover_inflight_after_seconds=5,
+)
 def purchase_receiving_complete(request, receiving_id):
     if denied := _deny(request, 'stock.receiving.complete'):
         return denied
-    receiving = PurchaseReceiving.objects.filter(id=receiving_id, is_deleted=False).first()
+    branch_id, branch_error = _branch(request)
+    if branch_error:
+        return branch_error
+    receiving = PurchaseReceiving.objects.filter(
+        id=receiving_id,
+        branch_id=branch_id,
+        is_deleted=False,
+    ).first()
     if (receiving and receiving.status == PurchaseReceiving.Status.DRAFT
             and request.user.role != User.RoleChoices.ADMIN
             and receiving.received_by_id != request.user.id):
@@ -235,7 +330,12 @@ def purchase_receiving_complete(request, receiving_id):
             'success': False, 'message': 'This receiving is not assigned to you',
             'errors': {'code': 'receiving_not_owned'},
         }, status=403)
-    result, status_code = PurchaseReceivingService.complete(receiving_id)
+    result, status_code = PurchaseReceivingService.complete(
+        receiving_id,
+        actor=request.user,
+        action_id=getattr(request, 'idempotency_action_id', None),
+        idempotency_key=getattr(request, 'idempotency_key', ''),
+    )
     if status_code < 400:
         audit(request, 'RECEIVING_COMPLETE', target_type='PurchaseReceiving',
               target_id=receiving_id,
@@ -256,8 +356,14 @@ def purchase_receiving_approve_over(request, receiving_id):
     if not reason:
         return JsonResponse({'success': False, 'message': 'Reason is required',
                              'errors': {'reason': 'Required'}}, status=422)
+    branch_id, branch_error = _branch(request)
+    if branch_error:
+        return branch_error
     receiving = PurchaseReceiving.objects.filter(
-        id=receiving_id, status=PurchaseReceiving.Status.DRAFT, is_deleted=False,
+        id=receiving_id,
+        branch_id=branch_id,
+        status=PurchaseReceiving.Status.DRAFT,
+        is_deleted=False,
     ).first()
     if not receiving:
         return JsonResponse({'success': False, 'message': 'Draft receiving not found'}, status=409)
@@ -290,6 +396,17 @@ def purchase_receiving_correction_request(request, receiving_id):
     data, error = parse_json_body(request)
     if error:
         return json_response(error)
+    branch_id, branch_error = _branch(request)
+    if branch_error:
+        return branch_error
+    if not PurchaseReceiving.objects.filter(
+        id=receiving_id,
+        branch_id=branch_id,
+        is_deleted=False,
+    ).exists():
+        return JsonResponse({
+            'success': False, 'message': 'Receiving not found',
+        }, status=404)
     result, status = PurchaseReceivingService.request_correction(
         receiving_id, request.user, data.get('reason'),
     )
@@ -311,6 +428,17 @@ def purchase_receiving_correction_review(request, correction_id, action):
     data, error = parse_json_body(request)
     if error:
         return json_response(error)
+    branch_id, branch_error = _branch(request)
+    if branch_error:
+        return branch_error
+    if not PurchaseReceivingCorrection.objects.filter(
+        id=correction_id,
+        receiving__branch_id=branch_id,
+        is_deleted=False,
+    ).exists():
+        return JsonResponse({
+            'success': False, 'message': 'Receiving correction not found',
+        }, status=404)
     note = data.get('review_note') or data.get('reason')
     result, status = PurchaseReceivingService.review_correction(
         correction_id, request.user, action == 'approve', note,

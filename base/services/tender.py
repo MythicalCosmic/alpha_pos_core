@@ -62,17 +62,59 @@ def normalize_method(method):
     return (method or CASH).strip().upper()
 
 
-def bucket_for(method):
+def configured_electronic_methods():
+    """Active provider methods explicitly classified for BANK settlement."""
+    from base.models import PaymentMethodConfig
+
+    return frozenset(
+        str(code).strip().upper()
+        for code in PaymentMethodConfig.objects.filter(
+            is_active=True,
+            treasury_destination=PaymentMethodConfig.TreasuryDestination.BANK,
+        ).values_list('code', flat=True)
+        if str(code).strip().upper() not in {CASH, 'MIXED'}
+    )
+
+
+def concrete_payment_methods(electronic_methods=()):
+    return KNOWN_METHODS | {
+        str(method).strip().upper()
+        for method in electronic_methods
+        if str(method).strip().upper() not in {CASH, 'MIXED'}
+    }
+
+
+def settlement_payment_methods(electronic_methods=None):
+    if electronic_methods is None:
+        electronic_methods = configured_electronic_methods()
+    extras = sorted(concrete_payment_methods(electronic_methods) - KNOWN_METHODS)
+    return (CASH, 'UZCARD', 'HUMO', 'CARD', 'PAYME', *extras)
+
+
+def bucket_for(method, electronic_methods=()):
     """Presentation bucket for a stored tender, or None when unrecognised."""
-    return _BUCKET.get(normalize_method(method))
+    normalized = normalize_method(method)
+    bucket = _BUCKET.get(normalized)
+    if bucket is not None:
+        return bucket
+    return (
+        'card'
+        if normalized in concrete_payment_methods(electronic_methods)
+        else None
+    )
 
 
 def empty_split():
     return {b: ZERO for b in BUCKETS}
 
 
-def empty_detail():
-    return {m: ZERO for m in CARD_METHODS}
+def empty_detail(electronic_methods=()):
+    methods = [*CARD_METHODS]
+    methods.extend(sorted(
+        concrete_payment_methods(electronic_methods)
+        - KNOWN_METHODS
+    ))
+    return {method: ZERO for method in methods}
 
 
 def _dec(v):
@@ -88,12 +130,16 @@ def _finite_dec(value):
     return value if value.is_finite() else None
 
 
-def _concrete_method(method):
+def _concrete_method(method, electronic_methods=()):
     """Strict stored tender for evidence rows; unlike headers, NULL is not CASH."""
     if not isinstance(method, str):
         return None
     normalized = method.strip().upper()
-    return normalized if normalized in KNOWN_METHODS else None
+    return (
+        normalized
+        if normalized in concrete_payment_methods(electronic_methods)
+        else None
+    )
 
 
 def _row_parts(row):
@@ -119,6 +165,7 @@ def split_from_rows(
     *,
     payment_action_id=None,
     require_concrete=False,
+    electronic_methods=(),
 ):
     """Pure ladder over plain data. Returns (split, card_detail).
 
@@ -135,7 +182,8 @@ def split_from_rows(
     only for action-less orders.
     """
     total = _dec(total)
-    split, detail = empty_split(), empty_detail()
+    valid_methods = concrete_payment_methods(electronic_methods)
+    split, detail = empty_split(), empty_detail(electronic_methods)
     if not total.is_finite() or total <= ZERO:
         return split, detail            # nothing to attribute (incl. 100% discount)
 
@@ -150,7 +198,7 @@ def split_from_rows(
         noncash, cash_tendered, per = ZERO, ZERO, {}
         for row in rows:
             method, amount, _action_id, _line_index = _row_parts(row)
-            m = _concrete_method(method)
+            m = _concrete_method(method, electronic_methods)
             if m is None:
                 logger.error('tender: order %s has %s line with unrecognised method '
                              '%r -> unknown', order_id, source, method)
@@ -162,7 +210,7 @@ def split_from_rows(
                     order_id, source, m, amt,
                 )
                 return None
-            if m in NONCASH_METHODS:
+            if m != CASH:
                 noncash += amt
                 per[m] = per.get(m, ZERO) + amt
             elif m == CASH:
@@ -179,9 +227,9 @@ def split_from_rows(
                 order_id, source, cash_tendered, residual_cash,
             )
             return None
-        s, d = empty_split(), empty_detail()
+        s, d = empty_split(), empty_detail(electronic_methods)
         for m, amt in per.items():
-            s[_BUCKET[m]] += amt
+            s[bucket_for(m, electronic_methods)] += amt
             if m in d:
                 d[m] += amt
         s['cash'] = residual_cash       # derived: ignores the customer's change
@@ -205,7 +253,7 @@ def split_from_rows(
         line_indexes = []
         for row in op_rows:
             method, amount, row_action, line_index = _row_parts(row)
-            normalized = _concrete_method(method)
+            normalized = _concrete_method(method, electronic_methods)
             amount = _finite_dec(amount)
             if (
                 normalized is None
@@ -234,7 +282,7 @@ def split_from_rows(
             line_indexes.append(line_index)
         for row in courier_rows:
             method, amount, _row_action, _line_index = _row_parts(row)
-            normalized = _concrete_method(method)
+            normalized = _concrete_method(method, electronic_methods)
             amount = _finite_dec(amount)
             if normalized is None or amount is None or amount <= ZERO:
                 logger.error(
@@ -263,7 +311,7 @@ def split_from_rows(
             or (
                 rolled_up != 'MIXED'
                 and (
-                    rolled_up not in KNOWN_METHODS
+                    rolled_up not in valid_methods
                     or action_methods != {rolled_up}
                 )
             )
@@ -292,7 +340,7 @@ def split_from_rows(
         external_total = ZERO
         for row in courier_rows:
             method, amount, _action_id, _line_index = _row_parts(row)
-            normalized = _concrete_method(method)
+            normalized = _concrete_method(method, electronic_methods)
             amount = _finite_dec(amount)
             if (
                 normalized is None
@@ -311,7 +359,9 @@ def split_from_rows(
             method, amount, _action_id, _line_index = _row_parts(row)
             amount = _finite_dec(amount)
             if (
-                _concrete_method(method) in NONCASH_METHODS
+                _concrete_method(method, electronic_methods) in (
+                    valid_methods - {CASH}
+                )
                 and amount is not None
                 and amount > ZERO
             ):
@@ -331,7 +381,7 @@ def split_from_rows(
         return split, detail
 
     # 2-4. no lines at all: fall back to the rolled-up method
-    bucket = bucket_for(payment_method)
+    bucket = bucket_for(payment_method, electronic_methods)
     if bucket:
         split[bucket] = total
         if bucket == 'card':
@@ -410,18 +460,23 @@ def order_tender_sources(order):
         .values_list('method', 'amount', 'payment_action_id', 'line_index')
     )
     courier = _courier_rows_by_order([order.id]).get(order.id, [])
+    electronic_methods = configured_electronic_methods()
     split, detail = split_from_rows(
         order.total_amount, order.payment_method,
         ops, courier, order_id=order.id,
         payment_action_id=order.payment_action_id,
+        electronic_methods=electronic_methods,
     )
     drawer_cash = _drawer_cash_from_sources(
         order.total_amount, split, ops, courier,
+        electronic_methods=electronic_methods,
     )
     return split, detail, drawer_cash
 
 
-def _drawer_cash_from_sources(total, split, ops, courier):
+def _drawer_cash_from_sources(
+    total, split, ops, courier, *, electronic_methods=(),
+):
     """Physical till cash represented by already-loaded tender evidence."""
     # UNKNOWN means the evidence contract failed. Never let the raw CASH row
     # that caused (or accompanied) that failure leak back into drawer/refund
@@ -437,10 +492,10 @@ def _drawer_cash_from_sources(total, split, ops, courier):
         amount = _finite_dec(amount)
         if amount is None or amount <= ZERO:
             continue
-        normalized = _concrete_method(method)
+        normalized = _concrete_method(method, electronic_methods)
         if normalized == CASH:
             tendered += amount
-        elif normalized in NONCASH_METHODS:
+        elif normalized in concrete_payment_methods(electronic_methods) - {CASH}:
             till_noncash += amount
     courier_collected = ZERO
     for row in courier:
@@ -455,7 +510,7 @@ def _drawer_cash_from_sources(total, split, ops, courier):
     return min(split['cash'], tendered, drawer_bill_residual)
 
 
-def breakdown_sources_for_orders(order_qs):
+def breakdown_sources_for_orders(order_qs, *, electronic_methods=None):
     """Aggregate {cash, card, payme, unknown} + card_detail over an Order queryset.
 
     The caller builds ONE queryset (window / cashier / paid / not-cancelled filters)
@@ -467,11 +522,13 @@ def breakdown_sources_for_orders(order_qs):
     """
     from base.models import OrderPayment
 
+    if electronic_methods is None:
+        electronic_methods = configured_electronic_methods()
     rows = list(order_qs.values(
         'id', 'total_amount', 'payment_method', 'payment_action_id',
     ))
     if not rows:
-        return empty_split(), empty_detail(), ZERO
+        return empty_split(), empty_detail(electronic_methods), ZERO
     ids = [r['id'] for r in rows]
 
     ops = {}
@@ -490,7 +547,9 @@ def breakdown_sources_for_orders(order_qs):
 
     courier = _courier_rows_by_order(ids)
 
-    split, detail, drawer_cash = empty_split(), empty_detail(), ZERO
+    split = empty_split()
+    detail = empty_detail(electronic_methods)
+    drawer_cash = ZERO
     for r in rows:
         oid = r['id']
         order_ops = ops.get(oid, ())
@@ -499,13 +558,15 @@ def breakdown_sources_for_orders(order_qs):
             r['total_amount'], r['payment_method'],
             order_ops, order_courier, order_id=oid,
             payment_action_id=r['payment_action_id'],
+            electronic_methods=electronic_methods,
         )
         for k in BUCKETS:
             split[k] += s[k]
-        for k in CARD_METHODS:
+        for k in detail:
             detail[k] += d[k]
         drawer_cash += _drawer_cash_from_sources(
             r['total_amount'], s, order_ops, order_courier,
+            electronic_methods=electronic_methods,
         )
     return split, detail, drawer_cash
 
@@ -518,7 +579,8 @@ def breakdown_for_orders(order_qs):
 
 def breakdown_for_refunds(refund_qs):
     """Aggregate frozen tender buckets for an OrderRefund event queryset."""
-    split, detail = empty_split(), empty_detail()
+    electronic_methods = configured_electronic_methods()
+    split, detail = empty_split(), empty_detail(electronic_methods)
     for row in refund_qs.values(
         'cash_amount', 'card_amount', 'payme_amount', 'unknown_amount',
         'card_detail',
@@ -528,7 +590,7 @@ def breakdown_for_refunds(refund_qs):
         split['payme'] += _dec(row['payme_amount'])
         split['unknown'] += _dec(row['unknown_amount'])
         frozen_detail = row.get('card_detail') or {}
-        for method in CARD_METHODS:
+        for method in detail:
             detail[method] += _dec(frozen_detail.get(method))
     return split, detail
 
@@ -537,9 +599,13 @@ def net_breakdown(sale_order_qs, refund_qs):
     """Net tender movement = sale events minus dated refund events."""
     sales, sale_detail = breakdown_for_orders(sale_order_qs)
     refunds, refund_detail = breakdown_for_refunds(refund_qs)
+    detail_methods = sorted(set(sale_detail) | set(refund_detail))
     return (
         {key: sales[key] - refunds[key] for key in BUCKETS},
-        {key: sale_detail[key] - refund_detail[key] for key in CARD_METHODS},
+        {
+            key: sale_detail.get(key, ZERO) - refund_detail.get(key, ZERO)
+            for key in detail_methods
+        },
     )
 
 
@@ -593,6 +659,7 @@ def tender_integrity_issues(order_qs, *, require_concrete=False):
     settlement-eligible shift must prove every positive sale with either an
     OrderPayment or a completed CourierPayment before it can be handed over.
     """
+    electronic_methods = configured_electronic_methods()
     rows = list(order_qs.values(
         'id', 'total_amount', 'payment_method', 'payment_action_id',
     ))
@@ -652,6 +719,7 @@ def tender_integrity_issues(order_qs, *, require_concrete=False):
             payment_rows, courier_rows, order_id=order_id,
             payment_action_id=row['payment_action_id'],
             require_concrete=require_concrete,
+            electronic_methods=electronic_methods,
         )
         if split['unknown']:
             issues.append({

@@ -22,8 +22,12 @@ from django.db.models import Sum
 from django.utils import timezone
 
 from base.models import Order, OrderRefund
-from base.services.tender import breakdown_sources_for_orders
-from cashbox.models import CashboxExpense, PAYMENT_METHODS
+from base.services.tender import (
+    breakdown_sources_for_orders,
+    configured_electronic_methods,
+    settlement_payment_methods,
+)
+from cashbox.models import CashboxExpense
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +54,11 @@ def expected_payment_totals(shift):
     HUMO / CARD) so a bank statement can still be reconciled line by line.
     """
     orders = _shift_orders(shift)
-    split, card_detail, sales_drawer_cash = breakdown_sources_for_orders(orders)
+    electronic_methods = configured_electronic_methods()
+    split, card_detail, sales_drawer_cash = breakdown_sources_for_orders(
+        orders,
+        electronic_methods=electronic_methods,
+    )
 
     refunds = OrderRefund.objects.filter(
         is_deleted=False,
@@ -60,7 +68,10 @@ def expected_payment_totals(shift):
     from base.services.order_refund import refund_totals
     refunded = refund_totals(refunds)
 
-    totals = {m: Decimal('0.00') for m in PAYMENT_METHODS}
+    totals = {
+        method: Decimal('0.00')
+        for method in settlement_payment_methods(electronic_methods)
+    }
     for method, amount in card_detail.items():
         if method in totals:
             totals[method] = amount

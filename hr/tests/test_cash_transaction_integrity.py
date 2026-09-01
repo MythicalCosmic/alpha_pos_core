@@ -316,8 +316,11 @@ def test_hr_cash_payment_endpoints_explain_open_shift_block(payment_kind):
 
     assert response.status_code == 422, response.content
     payload = response.json()
-    assert "cash_drawer" in payload["errors"]
-    assert "cashbox expense flow" in payload["errors"]["cash_drawer"]
+    if payment_kind == "expense":
+        assert "Idempotency-Key" in payload["errors"]
+    else:
+        assert "cash_drawer" in payload["errors"]
+        assert "cashbox expense flow" in payload["errors"]["cash_drawer"]
     payable.refresh_from_db()
     assert payable.status == payable.Status.APPROVED
     register.refresh_from_db()

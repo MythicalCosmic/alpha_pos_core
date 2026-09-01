@@ -57,6 +57,9 @@ class StockItem(SyncMixin, models.Model):
 
     class Meta:
         ordering = ["name"]
+        indexes = [
+            models.Index(fields=['branch_id', 'is_active', 'item_type', 'category']),
+        ]
 
     def to_sync_dict(self):
         data = super().to_sync_dict()
