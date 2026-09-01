@@ -395,3 +395,34 @@ def test_expense_creation_rejects_cross_branch_injection():
     assert status == 403
     assert result['code'] == 'LOCATION_FORBIDDEN'
     assert not Expense.objects.exists()
+
+
+def test_treasury_reconciliation_does_not_hide_wrong_branch_ledger_rows():
+    safe = TreasuryAccount.objects.create(
+        kind='SAFE', balance='100', branch_id='branch1',
+    )
+    TreasuryAccount.objects.create(
+        kind='BANK', balance='0', branch_id='branch1',
+    )
+    transaction = TreasuryTransaction.objects.create(
+        account=safe,
+        type=TreasuryTransaction.Type.ADJUSTMENT,
+        delta='100',
+        balance_before='0',
+        balance_after='100',
+        branch_id='cloud',
+    )
+
+    treasury, issues = MoneyControlService._treasury('branch1')
+
+    assert treasury == {'safe_uzs': None, 'bank_uzs': 0}
+    mismatch = next(
+        row for row in issues
+        if row['code'] == 'TREASURY_LEDGER_BRANCH_MISMATCH'
+    )
+    assert mismatch['entity_id'] == transaction.id
+    assert mismatch['details'] == {
+        'account': 'SAFE',
+        'account_branch_id': 'branch1',
+        'transaction_branch_id': 'cloud',
+    }

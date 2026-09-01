@@ -225,15 +225,31 @@ class MoneyControlService:
                 continue
             rows = TreasuryTransaction.objects.filter(
                 account=account,
-                branch_id=branch_id,
                 is_deleted=False,
             ).order_by('created_at', 'id').values(
-                'balance_before', 'balance_after', 'delta', 'fee',
+                'id', 'branch_id', 'balance_before', 'balance_after', 'delta',
+                'fee',
             )
             valid = _is_whole(account.balance)
             running = Decimal('0')
             first = True
             for row in rows:
+                if row['branch_id'] != branch_id:
+                    valid = False
+                    issues.append(issue(
+                        'TREASURY_LEDGER_BRANCH_MISMATCH',
+                        'ERROR',
+                        'Treasury ledger entry belongs to another branch',
+                        'The account balance includes a transaction with '
+                        'inconsistent branch ownership.',
+                        entity_type='TreasuryTransaction',
+                        entity_id=row['id'],
+                        details={
+                            'account': kind,
+                            'account_branch_id': branch_id,
+                            'transaction_branch_id': row['branch_id'],
+                        },
+                    ))
                 if first and row['balance_before'] != 0:
                     valid = False
                 first = False
