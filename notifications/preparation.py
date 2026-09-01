@@ -52,6 +52,10 @@ def preparation_target_for_name(product_name):
         'kora lavash',
     }:
         return PreparationTarget(4 * 60, '4 daqiqa')
+    if name.startswith('hot dog') or name.startswith('xodok'):
+        return PreparationTarget(5 * 60, '5 daqiqa')
+    if 'lavash' in name.split():
+        return PreparationTarget(5 * 60, '5 daqiqa')
 
     if name.startswith('non burger'):
         return PreparationTarget(6 * 60, '6 daqiqa')
@@ -116,4 +120,3 @@ def classify_preparation(elapsed_seconds, target):
     if elapsed_seconds * 2 <= target.maximum_seconds * 3:
         return YELLOW
     return RED
-
