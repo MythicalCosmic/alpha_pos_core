@@ -209,6 +209,9 @@ FK_UUID_MAPPINGS = {
     'reason_code_uuid': ('stock', 'VarianceReasonCode', 'reason_code'),
     'adjustment_transaction_uuid': ('stock', 'StockTransaction', 'adjustment_transaction'),
     'stock_transaction_uuid': ('stock', 'StockTransaction', 'stock_transaction'),
+    'reversal_of_stock_transaction_uuid': (
+        'stock', 'StockTransaction', 'reversal_of'
+    ),
     # HR FK mappings
     'manager_uuid': ('base', 'User', 'manager'),
     'department_uuid': ('hr', 'Department', 'department'),

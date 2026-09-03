@@ -6,13 +6,15 @@ from django.db.models import Sum, F, Count
 from django.utils import timezone
 
 from base.helpers.response import ServiceResponse
+from base.money import MoneyValueError, decimal_value, uzs_int
 from stock.models import (
-    StockLevel, StockTransaction, StockSettings
+    StockBatch, StockItem, StockLevel, StockLocation, StockTransaction,
+    StockSettings,
 )
 from stock.services.base_service import to_decimal, generate_number
 from stock.repositories import (
     StockLevelRepository, StockTransactionRepository,
-    StockItemRepository, StockLocationRepository,
+    StockItemRepository,
     StockUnitRepository,
 )
 
@@ -128,9 +130,12 @@ class StockLevelService:
         return StockLevelRepository.get_or_create_level(stock_item_id, location_id)
 
     @classmethod
-    def get_level_for_update(cls, stock_item_id: int, location_id: int) -> StockLevel:
+    def get_level_for_update(cls, stock_item_id: int, location_id: int,
+                             branch_id: str = None) -> StockLevel:
         # Row-level lock — must be called inside a @transaction.atomic block.
-        return StockLevelRepository.get_or_create_level_for_update(stock_item_id, location_id)
+        return StockLevelRepository.get_or_create_level_for_update(
+            stock_item_id, location_id, branch_id=branch_id,
+        )
 
     @classmethod
     def get_available(cls, stock_item_id: int, location_id: int = None) -> Decimal:
@@ -205,10 +210,28 @@ class StockLevelService:
                production_order_id: int = None,
                transfer_id: int = None,
                unit_cost: Decimal = None,
-               notes: str = "") -> Tuple[Dict[str, Any], int]:
+               notes: str = "",
+               branch_id: str = None,
+               action_id=None,
+               idempotency_key: str = '',
+               reversal_of_id: int = None,
+               allowed_movement_types=None,
+               strict: bool = False) -> Tuple[Dict[str, Any], int]:
+        if action_id:
+            existing = StockTransaction.objects.filter(
+                command_id=action_id,
+                **({'branch_id': branch_id} if branch_id else {}),
+            ).first()
+            if existing:
+                return cls._adjustment_result(existing)
         settings = StockSettings.load()
 
         if not settings.stock_enabled:
+            if strict:
+                return ServiceResponse.conflict(
+                    'STOCK_SYSTEM_DISABLED',
+                    'Stock adjustment is unavailable while stock is disabled.',
+                )
             return ServiceResponse.success(data={
                 "skipped": True,
                 "reason": "Stock system disabled"
@@ -219,23 +242,84 @@ class StockLevelService:
             return ServiceResponse.validation_error(
                 errors={"movement_type": f"Invalid movement type. Valid: {valid_types}"}
             )
+        if allowed_movement_types and movement_type not in allowed_movement_types:
+            return ServiceResponse.failure(
+                'STOCK_ADJUSTMENT_TYPE_FORBIDDEN',
+                'This movement type is not permitted by the adjustment endpoint.',
+                422,
+                errors={'movement_type': ['Use an approved adjustment or waste type.']},
+            )
 
-        stock_item = StockItemRepository.get_by_id(stock_item_id)
+        item_qs = StockItem.objects.select_for_update().filter(
+            pk=stock_item_id, is_deleted=False, is_active=True,
+        )
+        if branch_id:
+            item_qs = item_qs.filter(branch_id=branch_id)
+        stock_item = item_qs.first()
         if not stock_item:
-            return ServiceResponse.not_found(f"Stock item with id {stock_item_id} not found")
+            if branch_id:
+                return ServiceResponse.failure(
+                    'STOCK_SCOPE_FORBIDDEN',
+                    'Stock item is outside the authorized branch.',
+                    403,
+                )
+            return ServiceResponse.not_found(
+                f"Stock item with id {stock_item_id} not found"
+            )
 
-        location = StockLocationRepository.get_by_id(location_id)
+        location_qs = StockLocation.objects.select_for_update().filter(
+            pk=location_id, is_deleted=False, is_active=True,
+        )
+        if branch_id:
+            location_qs = location_qs.filter(branch_id=branch_id)
+        location = location_qs.first()
         if not location:
-            return ServiceResponse.not_found(f"Location with id {location_id} not found")
+            if branch_id:
+                return ServiceResponse.failure(
+                    'STOCK_SCOPE_FORBIDDEN',
+                    'Stock location is outside the authorized branch.',
+                    403,
+                )
+            return ServiceResponse.not_found(
+                f"Location with id {location_id} not found"
+            )
+        if stock_item.branch_id != location.branch_id:
+            return ServiceResponse.failure(
+                'STOCK_SCOPE_FORBIDDEN',
+                'Stock item and location must belong to the same branch.',
+                403,
+            )
 
         if unit_id:
             unit = StockUnitRepository.get_by_id(unit_id)
             if not unit:
                 return ServiceResponse.not_found(f"Unit with id {unit_id} not found")
+            if strict and unit_id != stock_item.base_unit_id:
+                from stock.models import StockItemUnit
+
+                if not StockItemUnit.objects.filter(
+                    stock_item=stock_item,
+                    unit_id=unit_id,
+                    is_deleted=False,
+                ).exists():
+                    return ServiceResponse.validation_error({
+                        'unit_id': ['Unit is not configured for this stock item.'],
+                    })
         else:
             unit = stock_item.base_unit
 
-        quantity = to_decimal(quantity)
+        if strict:
+            try:
+                quantity = decimal_value(
+                    quantity, 'quantity', places=4, positive=True,
+                    maximum=Decimal('99999999999'),
+                )
+            except MoneyValueError as exc:
+                return ServiceResponse.validation_error(
+                    errors={'quantity': [str(exc)]},
+                )
+        else:
+            quantity = to_decimal(quantity)
 
         if unit_id and unit_id != stock_item.base_unit_id:
             from .unit_service import StockItemUnitService
@@ -244,8 +328,39 @@ class StockLevelService:
             )
         else:
             base_quantity = quantity
+        if strict and (
+            not base_quantity.is_finite()
+            or base_quantity <= 0
+            or base_quantity > Decimal('99999999999.9999')
+        ):
+            return ServiceResponse.validation_error({
+                'quantity': ['Converted quantity is outside the supported range.'],
+            })
 
-        level = cls.get_level_for_update(stock_item_id, location_id)
+        batch = None
+        if strict and batch_id:
+            batch = StockBatch.objects.select_for_update().filter(
+                pk=batch_id,
+                stock_item=stock_item,
+                location=location,
+                branch_id=location.branch_id,
+                is_deleted=False,
+            ).first()
+            if batch is None:
+                return ServiceResponse.failure(
+                    'STOCK_BATCH_SCOPE_INVALID',
+                    'Batch must belong to the selected item and location.',
+                    422,
+                    errors={'batch_id': ['Batch does not match this stock scope.']},
+                )
+        elif strict and stock_item.track_batches:
+            return ServiceResponse.validation_error(
+                errors={'batch_id': ['A batch is required for this tracked item.']},
+            )
+
+        level = cls.get_level_for_update(
+            stock_item_id, location_id, branch_id=location.branch_id,
+        )
         quantity_before = level.quantity
 
         signed_movement_types = {"COUNT_ADJUSTMENT", "ADJUSTMENT"}
@@ -262,11 +377,36 @@ class StockLevelService:
             adjustment = abs(base_quantity)
 
         new_quantity = level.quantity + adjustment
-        if new_quantity < 0 and not settings.allow_negative_stock:
+        if new_quantity < 0 and (strict or not settings.allow_negative_stock):
+            if strict:
+                return ServiceResponse.failure(
+                    'INSUFFICIENT_STOCK',
+                    'The selected location has insufficient stock.',
+                    422,
+                    details={
+                        'available_quantity': str(level.quantity),
+                        'required_quantity': str(abs(adjustment)),
+                    },
+                )
             return ServiceResponse.error(
                 f"Insufficient stock for {stock_item.name}: "
                 f"required {abs(adjustment)}, available {level.quantity}"
             )
+
+        if batch is not None:
+            new_batch_quantity = batch.current_quantity + adjustment
+            if new_batch_quantity < 0:
+                return ServiceResponse.failure(
+                    'INSUFFICIENT_STOCK',
+                    'The selected batch has insufficient stock.',
+                    422,
+                    details={
+                        'available_quantity': str(batch.current_quantity),
+                        'required_quantity': str(abs(adjustment)),
+                    },
+                )
+            batch.current_quantity = new_batch_quantity
+            batch.save(update_fields=['current_quantity', 'updated_at'])
 
         level.quantity = new_quantity
         level.last_movement_at = timezone.now()
@@ -302,16 +442,104 @@ class StockLevelService:
             transfer_id=transfer_id,
             user_id=user_id,
             notes=notes,
+            branch_id=location.branch_id,
+            command_id=action_id,
+            idempotency_key=idempotency_key or '',
+            actor_display_snapshot=cls._actor_display(user_id),
+            reversal_of_id=reversal_of_id,
         )
 
+        return cls._adjustment_result(trans)
+
+    @staticmethod
+    def _actor_display(user_id):
+        from base.models import User
+
+        actor = User.objects.filter(pk=user_id).values(
+            'first_name', 'last_name',
+        ).first()
+        if not actor:
+            return ''
+        return f"{actor['first_name']} {actor['last_name']}".strip()
+
+    @classmethod
+    def _adjustment_result(cls, trans):
+        adjustment = trans.quantity_after - trans.quantity_before
         return ServiceResponse.success(data={
             "transaction_id": trans.id,
             "transaction_number": trans.transaction_number,
-            "quantity_before": str(quantity_before),
-            "quantity_after": str(new_quantity),
+            "quantity_before": str(trans.quantity_before),
+            "quantity_after": str(trans.quantity_after),
             "adjustment": str(adjustment),
-            "movement_type": movement_type,
-        }, message=f"Stock adjusted: {adjustment:+} {stock_item.base_unit.short_name}")
+            "movement_type": trans.movement_type,
+            "unit_cost": str(trans.unit_cost),
+            "total_cost_uzs": uzs_int(trans.total_cost),
+            "reversal_of_transaction_id": trans.reversal_of_id,
+        }, message=f"Stock adjusted: {adjustment:+}")
+
+    @classmethod
+    @transaction.atomic
+    def reverse_adjustment(cls, transaction_id, *, actor, branch_id,
+                           reason, action_id=None, idempotency_key=''):
+        if not str(reason or '').strip():
+            return ServiceResponse.validation_error(
+                errors={'reason': ['A reversal reason is required.']},
+            )
+        if action_id:
+            existing = StockTransaction.objects.filter(
+                command_id=action_id, branch_id=branch_id,
+            ).first()
+            if existing:
+                return cls._adjustment_result(existing)
+        original = StockTransaction.objects.select_for_update().filter(
+            pk=transaction_id,
+            branch_id=branch_id,
+            is_deleted=False,
+            reversal_of__isnull=True,
+            reference_type__in=['StockAdjustment', 'StockWaste'],
+        ).first()
+        if original is None:
+            return ServiceResponse.not_found('Stock adjustment not found')
+        existing_reversal = StockTransaction.objects.filter(
+            reversal_of=original,
+        ).first()
+        if existing_reversal:
+            return ServiceResponse.conflict(
+                'STOCK_ADJUSTMENT_ALREADY_REVERSED',
+                'This stock adjustment has already been reversed.',
+                details={'reversal_transaction_id': existing_reversal.id},
+            )
+        outgoing = original.movement_type in {
+            StockTransaction.MovementType.ADJUSTMENT_MINUS,
+            StockTransaction.MovementType.WASTE,
+            StockTransaction.MovementType.SPOILAGE,
+        }
+        reverse_type = (
+            StockTransaction.MovementType.ADJUSTMENT_PLUS
+            if outgoing else StockTransaction.MovementType.ADJUSTMENT_MINUS
+        )
+        return cls.adjust(
+            stock_item_id=original.stock_item_id,
+            location_id=original.location_id,
+            quantity=original.quantity,
+            movement_type=reverse_type,
+            user_id=actor.id,
+            unit_id=original.unit_id,
+            batch_id=original.batch_id,
+            reference_type='StockAdjustmentReversal',
+            reference_id=original.id,
+            unit_cost=original.unit_cost,
+            notes=str(reason).strip(),
+            branch_id=branch_id,
+            action_id=action_id,
+            idempotency_key=idempotency_key,
+            reversal_of_id=original.id,
+            allowed_movement_types={
+                StockTransaction.MovementType.ADJUSTMENT_PLUS,
+                StockTransaction.MovementType.ADJUSTMENT_MINUS,
+            },
+            strict=True,
+        )
 
     @classmethod
     @transaction.atomic

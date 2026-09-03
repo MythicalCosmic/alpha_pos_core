@@ -15,8 +15,8 @@ from stock.models import (
     StockLocation,
     Supplier,
     SupplierStockItem,
-    SupplierTransaction,
 )
+from stock.services.supplier_integrity import validate_supplier_ledgers
 
 
 _QUANTITY_FIELD = DecimalField(max_digits=24, decimal_places=4)
@@ -36,7 +36,7 @@ def issue(code, severity, title, message, *, entity_type=None, entity_id=None,
     }
 
 
-def _supplier_totals(branch_id):
+def _supplier_snapshot(branch_id):
     payable = Decimal('0')
     credit = Decimal('0')
     balances_safe = True
@@ -45,36 +45,10 @@ def _supplier_totals(branch_id):
         branch_id=branch_id,
         is_deleted=False,
     ).order_by('id'))
-    ledger_totals = {
-        row['supplier_id']: row['total'] or Decimal('0')
-        for row in SupplierTransaction.objects.filter(
-            branch_id=branch_id,
-            is_deleted=False,
-        ).values('supplier_id').annotate(
-            total=Coalesce(
-                Sum(
-                    'amount',
-                    filter=Q(type__in=[
-                        SupplierTransaction.Type.PURCHASE,
-                        SupplierTransaction.Type.PAYMENT_REVERSAL,
-                        SupplierTransaction.Type.ADJUSTMENT,
-                    ]),
-                ),
-                Decimal('0'),
-            ) - Coalesce(
-                Sum(
-                    'amount',
-                    filter=Q(type__in=[
-                        SupplierTransaction.Type.PAYMENT,
-                        SupplierTransaction.Type.RETURN,
-                    ]),
-                ),
-                Decimal('0'),
-            ),
-        )
-    }
+    evidence = validate_supplier_ledgers(suppliers)
     for supplier in suppliers:
-        if supplier.currency != 'UZS':
+        supplier_evidence = evidence[supplier.id]
+        if not supplier_evidence.currency_supported:
             balances_safe = False
             issues.append(issue(
                 'SUPPLIER_CURRENCY_UNSUPPORTED',
@@ -86,13 +60,8 @@ def _supplier_totals(branch_id):
                 details={'currency': supplier.currency},
             ))
             continue
-        balance = supplier.current_balance or Decimal('0')
-        if balance > 0:
-            payable += balance
-        elif balance < 0:
-            credit += -balance
-        ledger_balance = ledger_totals.get(supplier.id, Decimal('0'))
-        if ledger_balance != balance:
+        balance = supplier_evidence.stored_balance
+        if not supplier_evidence.valid:
             balances_safe = False
             issues.append(issue(
                 'SUPPLIER_LEDGER_BALANCE_MISMATCH',
@@ -102,15 +71,23 @@ def _supplier_totals(branch_id):
                 entity_type='Supplier',
                 entity_id=supplier.id,
                 details={
-                    'stored_balance_uzs': uzs_int(balance),
-                    'ledger_balance_uzs': uzs_int(ledger_balance),
+                    'stored_balance_uzs': str(balance),
+                    'ledger_balance_uzs': str(supplier_evidence.ledger_balance),
                 },
             ))
-    return (
-        payable if balances_safe else None,
-        credit if balances_safe else None,
-        issues,
-    )
+            continue
+        if balance > 0:
+            payable += balance
+        elif balance < 0:
+            credit += -balance
+    return suppliers, evidence, (
+        payable if balances_safe else None
+    ), (credit if balances_safe else None), issues
+
+
+def _supplier_totals(branch_id):
+    _suppliers, _evidence, payable, credit, issues = _supplier_snapshot(branch_id)
+    return payable, credit, issues
 
 
 class InventoryControlService:
@@ -243,7 +220,11 @@ class InventoryControlService:
             if link.is_preferred:
                 supplier_links[link.stock_item_id].append(link)
 
-        issues = [issue(
+        suppliers, supplier_evidence, payable, credit, supplier_issues = (
+            _supplier_snapshot(branch_id)
+        )
+        issues = list(supplier_issues)
+        issues.extend(issue(
             'SUPPLIER_CURRENCY_UNSUPPORTED',
             'ERROR',
             'Supplier price currency is not supported',
@@ -255,7 +236,7 @@ class InventoryControlService:
                 'price_currency': link.currency,
                 'supplier_currency': link.supplier.currency,
             },
-        ) for link in unsupported_supplier_links]
+        ) for link in unsupported_supplier_links)
         prepared = []
         inventory_total = Decimal('0')
         available_total = Decimal('0')
@@ -345,14 +326,18 @@ class InventoryControlService:
             link = preferred[0] if preferred else None
             preferred_data = None
             if link:
+                balance_evidence = supplier_evidence.get(link.supplier_id)
                 preferred_data = {
                     'supplier_id': link.supplier_id,
                     'supplier_name': link.supplier.name,
                     'price': decimal_string(link.price),
                     'currency': link.currency,
                     'current_balance_uzs': (
-                        uzs_int(link.supplier.current_balance)
-                        if link.supplier.currency == 'UZS' else None
+                        uzs_int(balance_evidence.stored_balance)
+                        if balance_evidence
+                        and balance_evidence.currency_supported
+                        and balance_evidence.valid
+                        else None
                     ),
                     'lead_time_days': (
                         link.lead_time_days
@@ -443,8 +428,6 @@ class InventoryControlService:
                 row['available_value_uzs'] is not None for row in prepared
             )
 
-        payable, credit, supplier_issues = _supplier_totals(branch_id)
-        issues.extend(supplier_issues)
         prepared.sort(key=lambda row: (
             not row['_out'],
             not row['_low'],

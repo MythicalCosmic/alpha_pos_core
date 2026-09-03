@@ -5,7 +5,9 @@ from uuid import uuid4
 import pytest
 from django.utils import timezone
 
-from base.models import TreasuryAccount, TreasuryTransaction, User
+from base.models import (
+    CashReconciliation, Shift, TreasuryAccount, TreasuryTransaction, User,
+)
 from base.services.money_control_service import (
     MoneyControlService,
     WORKING_CAPITAL_FORMULA,
@@ -17,6 +19,7 @@ from hr.services.expense_category_service import ExpenseCategoryService
 from cashbox.services.expense_service import CashboxCategoryService
 from stock.models import (
     StockBatch,
+    StockCategory,
     StockItem,
     StockLevel,
     StockLocation,
@@ -217,6 +220,64 @@ def test_inventory_integrity_issues_are_stable_and_preferred_supplier_is_determi
         if row['stock_item']['id'] == preferred_item.id
     )
     assert preferred_row['preferred_supplier']['supplier_id'] == links[0].supplier_id
+
+
+def test_inventory_filters_work_individually_and_combined():
+    actor = _user('inventory-filters@test.local')
+    unit = StockUnit.objects.create(
+        name='Piece', short_name='pc', unit_type='COUNT', is_base_unit=True,
+    )
+    primary = StockLocation.objects.create(
+        name='Primary', type='WAREHOUSE', branch_id='branch1',
+    )
+    secondary = StockLocation.objects.create(
+        name='Secondary', type='WAREHOUSE', branch_id='branch1',
+    )
+    parent = StockCategory.objects.create(
+        name='Food', type=StockCategory.CategoryType.RAW_MATERIAL,
+    )
+    child = StockCategory.objects.create(
+        name='Dry food', type=StockCategory.CategoryType.RAW_MATERIAL,
+        parent=parent,
+    )
+    other = StockCategory.objects.create(
+        name='Packaging', type=StockCategory.CategoryType.PACKAGING,
+    )
+
+    def create_item(name, sku, category, location, quantity, reorder):
+        item = StockItem.objects.create(
+            name=name, sku=sku, category=category, base_unit=unit,
+            item_type='RAW', avg_cost_price='10', reorder_point=reorder,
+            branch_id='branch1',
+        )
+        StockLevel.objects.create(
+            stock_item=item, location=location, quantity=quantity,
+            branch_id='branch1',
+        )
+        return item
+
+    flour = create_item('Flour', 'FILTER-FLOUR', child, primary, '1', '2')
+    rice = create_item('Rice', 'FILTER-RICE', parent, primary, '10', '2')
+    box = create_item('Box', 'FILTER-BOX', other, secondary, '0', '1')
+
+    def ids(**filters):
+        result, status = InventoryControlService.get(
+            actor=actor, per_page=100, **filters,
+        )
+        assert status == 200, result
+        return {row['stock_item']['id'] for row in result['data']['items']}
+
+    assert ids(location_id=primary.id) == {flour.id, rice.id}
+    assert ids(category_id=child.id) == {flour.id}
+    assert ids(search='filter-rice') == {rice.id}
+    assert ids(low_stock=True) == {flour.id, box.id}
+    assert ids(
+        location_id=primary.id,
+        category_id=parent.id,
+        include_descendants=True,
+        search='flour',
+        low_stock=True,
+    ) == {flour.id}
 
 
 def test_money_control_complete_snapshot_counts_paid_expense_once(monkeypatch):
@@ -426,3 +487,137 @@ def test_treasury_reconciliation_does_not_hide_wrong_branch_ledger_rows():
         'account_branch_id': 'branch1',
         'transaction_branch_id': 'cloud',
     }
+
+
+def test_corrupted_supplier_ledger_nulls_overview_and_inventory_values():
+    actor = _user('supplier-corruption@test.local')
+    item, _location = _raw_stock()
+    supplier = Supplier.objects.create(
+        name='Corrupted supplier', current_balance='500', branch_id='branch1',
+    )
+    SupplierStockItem.objects.create(
+        supplier=supplier,
+        stock_item=item,
+        unit=item.base_unit,
+        price='100',
+        is_preferred=True,
+        branch_id='branch1',
+    )
+
+    suppliers, issues = MoneyControlService._suppliers(
+        'branch1', timezone.now(),
+    )
+    inventory, status = InventoryControlService.get(actor=actor)
+
+    assert suppliers['payable_uzs'] is None
+    assert suppliers['credit_uzs'] is None
+    assert suppliers['overdue_payable_uzs'] is None
+    affected = next(
+        row for row in suppliers['top_balances']
+        if row['supplier_id'] == supplier.id
+    )
+    assert affected['balance_uzs'] is None
+    assert affected['payable_uzs'] is None
+    assert affected['credit_uzs'] is None
+    assert affected['overdue_payable_uzs'] is None
+    assert any(row['code'] == 'SUPPLIER_LEDGER_BALANCE_MISMATCH' for row in issues)
+    assert status == 200
+    assert inventory['data']['summary']['supplier_payable_uzs'] is None
+    assert inventory['data']['summary']['supplier_credit_uzs'] is None
+    preferred = inventory['data']['items'][0]['preferred_supplier']
+    assert preferred['current_balance_uzs'] is None
+
+
+def test_completed_shift_without_posted_reconciliation_nulls_drawer_and_capital():
+    actor = _user('unreconciled-completed@test.local')
+    Shift.objects.create(
+        user=actor,
+        start_time=timezone.now(),
+        end_time=timezone.now(),
+        status=Shift.Status.COMPLETED,
+        branch_id='branch1',
+    )
+    _credit_treasury('branch1', '100', '100', actor)
+
+    result, status = MoneyControlService.overview(
+        actor=actor,
+        date_from=timezone.localdate(),
+        date_to=timezone.localdate(),
+    )
+
+    assert status == 200
+    data = result['data']
+    assert data['treasury']['drawer_unreconciled_uzs'] is None
+    assert data['treasury']['liquid_total_uzs'] is None
+    assert data['working_capital']['amount_uzs'] is None
+    assert any(
+        row['code'] == 'UNSETTLED_SHIFT_DATA_INCOMPLETE'
+        for row in data['completeness']['issues']
+    )
+
+
+def test_voided_expense_without_reversal_nulls_paid_total():
+    actor = _user('missing-expense-reversal@test.local')
+    _credit_treasury('branch1', '0', '1000', actor)
+    account = TreasuryAccount.objects.get(branch_id='branch1', kind='BANK')
+    transaction = _apply(
+        account,
+        Decimal('-100'),
+        TreasuryTransaction.Type.EXPENSE,
+        branch_id='branch1',
+        performed_by=actor,
+    )
+    category = ExpenseCategory.objects.create(
+        code='VOID_MISSING_REVERSAL', name='Void missing reversal',
+        allowed_sources=['BANK'],
+    )
+    expense = Expense.objects.create(
+        category=category,
+        category_code_snapshot=category.code,
+        category_name_snapshot=category.name,
+        amount='100',
+        expense_date=timezone.localdate(),
+        status=Expense.Status.VOIDED,
+        requested_source='BANK',
+        treasury_transaction=transaction,
+        paid_at=timezone.now(),
+        voided_at=timezone.now(),
+        created_by=actor,
+        branch_id='branch1',
+    )
+
+    expenses, issues = MoneyControlService._expenses(
+        'branch1', timezone.localdate(), timezone.localdate(),
+    )
+
+    assert expenses['paid_uzs'] is None
+    assert any(
+        row['code'] == 'EXPENSE_PAYMENT_LINK_MISSING'
+        and row['entity_id'] == expense.id
+        for row in issues
+    )
+
+
+def test_posted_reconciliation_requires_manifest_and_matching_ledger_rows():
+    actor = _user('invalid-posting-manifest@test.local')
+    shift = Shift.objects.create(
+        user=actor,
+        start_time=timezone.now(),
+        end_time=timezone.now(),
+        status=Shift.Status.COMPLETED,
+        branch_id='branch1',
+    )
+    CashReconciliation.objects.create(
+        shift=shift,
+        expected_cash='0',
+        actual_cash='0',
+        reconciled_by=actor,
+        treasury_posted_at=timezone.now(),
+        treasury_posting_manifest={},
+        branch_id='branch1',
+    )
+
+    drawer, issues = MoneyControlService._drawer('branch1')
+
+    assert drawer is None
+    assert [row['code'] for row in issues] == ['UNSETTLED_SHIFT_DATA_INCOMPLETE']

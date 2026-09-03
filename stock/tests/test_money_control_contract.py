@@ -305,3 +305,41 @@ def test_history_totals_cover_filtered_rows_before_pagination():
         'total_fee_uzs': 0,
         'row_count': 2,
     }
+
+
+def test_treasury_history_counts_transfer_fee_once_with_and_without_account_filter():
+    actor = _user('transfer-fee-history@test.local')
+    accounts = _lock_accounts(['SAFE', 'BANK'], 'branch1')
+    safe = accounts['SAFE']
+    _apply(
+        safe, Decimal('1000'), TreasuryTransaction.Type.ADJUSTMENT,
+        branch_id='branch1', performed_by=actor,
+    )
+    result, status = TreasuryService.transfer(
+        'SAFE', 'BANK', '400', fee='25', performed_by=actor,
+        branch_id='branch1', command_id=uuid4(),
+        idempotency_key='transfer-fee-history',
+    )
+    assert status == 200, result
+
+    unfiltered, status = TreasuryService.history(actor=actor, per_page=100)
+    assert status == 200
+    assert unfiltered['data']['totals']['total_fee_uzs'] == 25
+    assert unfiltered['data']['totals']['row_count'] == 3
+
+    safe_history, status = TreasuryService.history(
+        actor=actor, account_kind='SAFE', per_page=100,
+    )
+    assert status == 200
+    assert safe_history['data']['totals']['total_fee_uzs'] == 25
+    bank_history, status = TreasuryService.history(
+        actor=actor, account_kind='BANK', per_page=100,
+    )
+    assert status == 200
+    assert bank_history['data']['totals']['total_fee_uzs'] == 25
+
+    incoming, status = TreasuryService.history(
+        actor=actor, txn_type=TreasuryTransaction.Type.TRANSFER_IN,
+    )
+    assert status == 200
+    assert incoming['data']['totals']['total_fee_uzs'] == 25

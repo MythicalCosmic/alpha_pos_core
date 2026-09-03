@@ -25,6 +25,7 @@ from stock.models import (
     SupplierTransaction,
 )
 from stock.services.inventory_control_service import InventoryControlService, issue
+from stock.services.supplier_integrity import validate_supplier_ledgers
 
 
 WORKING_CAPITAL_FORMULA = (
@@ -346,36 +347,65 @@ class MoneyControlService:
                 'Existing shifts are branch-owned and cannot be safely filtered by stock location.',
                 details={'location_id': location_id},
             )]
-        reconciled_shift_ids = CashReconciliation.objects.filter(
+        relevant_shifts = list(Shift.objects.filter(
             branch_id=branch_id,
             is_deleted=False,
-            treasury_posted_at__isnull=False,
-        ).values_list('shift_id', flat=True)
-        shifts = list(Shift.objects.filter(
-            branch_id=branch_id,
-            is_deleted=False,
-            status__in=[Shift.Status.ACTIVE, Shift.Status.ENDED],
-        ).exclude(pk__in=reconciled_shift_ids).select_related('user').prefetch_related(
+            status__in=[
+                Shift.Status.ACTIVE,
+                Shift.Status.ENDED,
+                Shift.Status.COMPLETED,
+            ],
+        ).select_related('user').prefetch_related(
             'payment_totals',
         ).order_by('id'))
+        shift_ids = [shift.id for shift in relevant_shifts]
+        reconciliations = {
+            row.shift_id: row
+            for row in CashReconciliation.objects.filter(
+                shift_id__in=shift_ids,
+                is_deleted=False,
+            )
+        }
+        posting_rows = defaultdict(list)
+        for row in TreasuryTransaction.objects.filter(
+            reference_type='ShiftSettlement',
+            reference_id__in=shift_ids,
+            type=TreasuryTransaction.Type.SHIFT_DEPOSIT,
+            is_deleted=False,
+        ).select_related('account').order_by('id'):
+            posting_rows[row.reference_id].append(row)
+
         total = Decimal('0')
         issues = []
-        ambiguous_completed = CashReconciliation.objects.filter(
-            branch_id=branch_id,
-            is_deleted=False,
-            shift__status=Shift.Status.COMPLETED,
-            treasury_posted_at__isnull=True,
-        ).values_list('shift_id', flat=True)
-        for shift_id in ambiguous_completed:
-            issues.append(issue(
-                'UNSETTLED_SHIFT_DATA_INCOMPLETE',
-                'ERROR',
-                'Legacy completed shift has no Treasury posting link',
-                'Drawer cash cannot be classified without risking double counting.',
-                entity_type='Shift',
-                entity_id=shift_id,
-                details={'status': Shift.Status.COMPLETED},
-            ))
+        valid_posted_ids = set()
+        for shift in relevant_shifts:
+            reconciliation = reconciliations.get(shift.id)
+            if MoneyControlService._valid_shift_posting(
+                shift,
+                reconciliation,
+                posting_rows.get(shift.id, []),
+                branch_id,
+            ):
+                valid_posted_ids.add(shift.id)
+                continue
+            if shift.status == Shift.Status.COMPLETED or (
+                reconciliation and reconciliation.treasury_posted_at
+            ):
+                issues.append(issue(
+                    'UNSETTLED_SHIFT_DATA_INCOMPLETE',
+                    'ERROR',
+                    'Completed shift lacks a valid Treasury reconciliation',
+                    'Drawer cash cannot be classified without risking double counting.',
+                    entity_type='Shift',
+                    entity_id=shift.id,
+                    details={'status': shift.status},
+                ))
+
+        shifts = [
+            shift for shift in relevant_shifts
+            if shift.status in [Shift.Status.ACTIVE, Shift.Status.ENDED]
+            and shift.id not in valid_posted_ids
+        ]
         for shift in shifts:
             try:
                 if (
@@ -410,26 +440,86 @@ class MoneyControlService:
                 ))
         return (None if issues else uzs_int(total)), issues
 
+    @staticmethod
+    def _valid_shift_posting(shift, reconciliation, posting_rows, branch_id):
+        if (
+            reconciliation is None
+            or reconciliation.branch_id != branch_id
+            or reconciliation.treasury_posted_at is None
+        ):
+            return False
+        manifest = reconciliation.treasury_posting_manifest
+        if (
+            not isinstance(manifest, dict)
+            or manifest.get('version') != 1
+            or manifest.get('shift_id') != shift.id
+            or manifest.get('branch_id') != branch_id
+            or not isinstance(manifest.get('tenders'), list)
+        ):
+            return False
+        tenders = {}
+        for tender in manifest['tenders']:
+            if not isinstance(tender, dict):
+                return False
+            method = tender.get('method')
+            destination = tender.get('destination')
+            amount = tender.get('amount_uzs')
+            if (
+                not isinstance(method, str)
+                or not method
+                or method != method.strip().upper()
+                or method in tenders
+                or destination not in TreasuryAccount.Kind.values
+                or isinstance(amount, bool)
+            ):
+                return False
+            try:
+                amount = Decimal(str(amount))
+            except Exception:
+                return False
+            if not amount.is_finite() or not _is_whole(amount):
+                return False
+            tenders[method] = (destination, amount)
+
+        rows_by_method = defaultdict(list)
+        for row in posting_rows:
+            rows_by_method[str(row.category or '').strip().upper()].append(row)
+        if set(rows_by_method) - set(tenders):
+            return False
+        for method, (destination, amount) in tenders.items():
+            rows = rows_by_method.get(method, [])
+            if amount == 0:
+                if rows:
+                    return False
+                continue
+            if len(rows) != 1:
+                return False
+            row = rows[0]
+            if (
+                row.branch_id != branch_id
+                or row.account.branch_id != branch_id
+                or row.account.kind != destination
+                or row.delta != amount
+            ):
+                return False
+        return True
+
     @classmethod
     def _suppliers(cls, branch_id, as_of):
         suppliers = list(Supplier.objects.filter(
             branch_id=branch_id,
             is_deleted=False,
         ).order_by('id'))
-        ledger_rows = defaultdict(list)
-        for row in SupplierTransaction.objects.filter(
-            branch_id=branch_id,
-            is_deleted=False,
-        ).select_related('supplier').order_by('supplier_id', 'created_at', 'id'):
-            ledger_rows[row.supplier_id].append(row)
+        evidence = validate_supplier_ledgers(suppliers)
         payable = Decimal('0')
         credit = Decimal('0')
         balances_safe = True
         issues = []
         top = []
         for supplier in suppliers:
-            balance = supplier.current_balance or Decimal('0')
-            if supplier.currency != 'UZS':
+            supplier_evidence = evidence[supplier.id]
+            balance = supplier_evidence.stored_balance
+            if not supplier_evidence.currency_supported:
                 balances_safe = False
                 issues.append(issue(
                     'SUPPLIER_CURRENCY_UNSUPPORTED',
@@ -450,33 +540,7 @@ class MoneyControlService:
                     'currency': supplier.currency,
                 })
                 continue
-            running = Decimal('0')
-            valid = _is_whole(balance)
-            rows = ledger_rows.get(supplier.id, [])
-            if rows and rows[0].balance_before != 0:
-                valid = False
-            for row in rows:
-                expected = (
-                    row.balance_before - row.amount
-                    if row.type in {
-                        SupplierTransaction.Type.PAYMENT,
-                        SupplierTransaction.Type.RETURN,
-                    }
-                    else row.balance_before + row.amount
-                )
-                if row.balance_before != running or row.balance_after != expected:
-                    valid = False
-                running = row.balance_after
-                if not all(_is_whole(value) for value in (
-                    row.amount,
-                    row.fee,
-                    row.balance_before,
-                    row.balance_after,
-                )):
-                    valid = False
-            if running != balance:
-                valid = False
-            if not valid:
+            if not supplier_evidence.valid:
                 balances_safe = False
                 issues.append(issue(
                     'SUPPLIER_LEDGER_BALANCE_MISMATCH',
@@ -487,9 +551,19 @@ class MoneyControlService:
                     entity_id=supplier.id,
                     details={
                         'stored_balance': str(balance),
-                        'ledger_balance': str(running),
+                        'ledger_balance': str(supplier_evidence.ledger_balance),
                     },
                 ))
+                top.append({
+                    'supplier_id': supplier.id,
+                    'supplier_name': supplier.name,
+                    'balance_uzs': None,
+                    'payable_uzs': None,
+                    'credit_uzs': None,
+                    'overdue_payable_uzs': None,
+                    'currency': 'UZS',
+                })
+                continue
             supplier_payable = max(balance, Decimal('0'))
             supplier_credit = max(-balance, Decimal('0'))
             payable += supplier_payable
@@ -504,9 +578,14 @@ class MoneyControlService:
                 'currency': 'UZS',
             })
 
+        valid_suppliers = [
+            supplier for supplier in suppliers
+            if evidence[supplier.id].currency_supported
+            and evidence[supplier.id].valid
+        ]
         overdue, overdue_by_supplier, overdue_issues = cls._overdue(
             branch_id,
-            suppliers,
+            valid_suppliers,
             as_of,
         )
         issues.extend(overdue_issues)
@@ -519,13 +598,15 @@ class MoneyControlService:
             row for row in top if row['balance_uzs'] is None
         ]
         top.sort(key=lambda row: (
-            -(abs(row['balance_uzs']) if row['balance_uzs'] is not None else -1),
+            row['balance_uzs'] is not None,
+            -(abs(row['balance_uzs']) if row['balance_uzs'] is not None else 0),
             row['supplier_id'],
         ))
-        legacy = SupplierPayment.objects.filter(
+        legacy = list(SupplierPayment.objects.filter(
             branch_id=branch_id,
             status=SupplierPayment.Status.LEGACY_UNFUNDED,
-        )
+        ))
+        legacy_supplier_ids = {payment.supplier_id for payment in legacy}
         for payment in legacy:
             issues.append(issue(
                 'PURCHASE_PAYMENT_WITHOUT_FUNDING_SOURCE',
@@ -536,16 +617,24 @@ class MoneyControlService:
                 entity_id=payment.id,
                 amount_uzs=uzs_int(payment.principal_uzs),
             ))
-        if legacy.exists():
+        if legacy:
             balances_safe = False
+            for row in top:
+                if row['supplier_id'] in legacy_supplier_ids:
+                    row.update({
+                        'balance_uzs': None,
+                        'payable_uzs': None,
+                        'credit_uzs': None,
+                        'overdue_payable_uzs': None,
+                    })
         return {
             'payable_uzs': uzs_int(payable) if balances_safe else None,
             'credit_uzs': uzs_int(credit) if balances_safe else None,
-            'overdue_payable_uzs': overdue,
+            'overdue_payable_uzs': overdue if balances_safe else None,
             'count_with_balance': sum(
                 1 for supplier in suppliers
                 if (supplier.current_balance or Decimal('0')) != 0
-            ),
+            ) if balances_safe else None,
             'top_balances': top[:10],
         }, issues
 
@@ -721,6 +810,7 @@ class MoneyControlService:
                     not expense['treasury_transaction_id'] and not cashbox_id
                 )
                 if missing_reversal:
+                    paid_safe = False
                     issues.append(issue(
                         'EXPENSE_PAYMENT_LINK_MISSING',
                         'ERROR',
@@ -810,14 +900,17 @@ class MoneyControlService:
         by_category = [{
             'category_id': category_id,
             'category_name': values['name'] or 'Unmapped',
-            'paid_uzs': uzs_int(values['amount']),
+            'paid_uzs': uzs_int(values['amount']) if paid_safe else None,
+            '_sort_amount': values['amount'],
             'transaction_count': values['count'],
         } for category_id, values in category_rows.items()]
         by_category.sort(key=lambda row: (
-            -row['paid_uzs'],
+            -row['_sort_amount'],
             row['category_id'] is None,
             row['category_id'] or 0,
         ))
+        for row in by_category:
+            row.pop('_sort_amount')
         return {
             'paid_uzs': uzs_int(paid) if paid_safe else None,
             'pending_uzs': uzs_int(pending),

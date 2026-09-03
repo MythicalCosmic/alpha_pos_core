@@ -261,6 +261,13 @@ class StockTransaction(SyncMixin, models.Model):
         blank=True,
         related_name="stock_transactions",
     )
+    reversal_of = models.OneToOneField(
+        'self', on_delete=models.PROTECT, null=True, blank=True,
+        related_name='reversal',
+    )
+    command_id = models.UUIDField(null=True, blank=True, unique=True)
+    idempotency_key = models.CharField(max_length=128, blank=True, default='')
+    actor_display_snapshot = models.CharField(max_length=200, blank=True, default='')
 
     user = models.ForeignKey(
         'base.User',
@@ -292,6 +299,9 @@ class StockTransaction(SyncMixin, models.Model):
         )
         data['production_order_uuid'] = str(self.production_order.uuid) if self.production_order else None
         data['transfer_uuid'] = str(self.transfer.uuid) if self.transfer else None
+        data['reversal_of_stock_transaction_uuid'] = (
+            str(self.reversal_of.uuid) if self.reversal_of else None
+        )
         data['user_uuid'] = str(self.user.uuid) if self.user else None
         return data
 

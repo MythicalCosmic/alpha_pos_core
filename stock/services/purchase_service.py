@@ -10,7 +10,7 @@ from base.money import MoneyValueError, decimal_value, local_iso
 from stock.models import (
     PurchaseOrder, PurchaseOrderItem, PurchaseReceiving, PurchaseReceivingItem,
     PurchaseReceivingCorrection,
-    Supplier, SupplierStockItem, StockBatch, StockItemUnit, StockSettings,
+    Supplier, SupplierStockItem, StockBatch, StockItem, StockItemUnit, StockSettings,
     StockTransaction,
 )
 from stock.services.base_service import generate_number, round_decimal, to_decimal
@@ -869,14 +869,27 @@ class PurchaseReceivingService:
     @transaction.atomic
     def complete(cls, receiving_id: int, *, actor=None, action_id=None,
                  idempotency_key='') -> Tuple[Dict[str, Any], int]:
-        # Lock the receiving row and re-check status under the lock. Without the
-        # lock two concurrent complete() calls both read DRAFT and both run the
-        # stock-in + cost-update loop, doubling received stock and corrupting the
-        # average cost. select_for_update serializes them; the loser sees the
-        # status already flipped to COMPLETED and bails out below.
-        rcv = PurchaseReceivingRepository.get_for_update(receiving_id)
-        if not rcv:
+        identity = PurchaseReceiving.objects.filter(
+            pk=receiving_id, is_deleted=False,
+        ).values(
+            'purchase_order_id', 'purchase_order__supplier_id',
+        ).first()
+        if not identity:
             return ServiceResponse.not_found("Receiving not found")
+        supplier = Supplier.objects.select_for_update().get(
+            pk=identity['purchase_order__supplier_id'],
+        )
+        po = PurchaseOrder.objects.select_for_update().get(
+            pk=identity['purchase_order_id'],
+        )
+        rcv = PurchaseReceiving.objects.select_for_update().select_related(
+            'purchase_order', 'location', 'received_by',
+        ).get(pk=receiving_id, is_deleted=False)
+        if rcv.purchase_order_id != po.id or po.supplier_id != supplier.id:
+            return ServiceResponse.conflict(
+                'RECEIVING_RELATIONSHIP_CHANGED',
+                'Receiving ownership changed while it was being locked; retry safely.',
+            )
         if actor is not None:
             from base.services.branch_scope import resolve_actor_branch
 
@@ -908,10 +921,6 @@ class PurchaseReceivingService:
                 'STOCK_SYSTEM_DISABLED',
                 'Receiving cannot complete while stock tracking is disabled.',
             )
-        supplier = Supplier.objects.select_for_update().get(
-            pk=rcv.purchase_order.supplier_id,
-        )
-        po = PurchaseOrder.objects.select_for_update().get(pk=rcv.purchase_order_id)
         if supplier.currency != 'UZS' or po.currency != 'UZS':
             return ServiceResponse.failure(
                 'SUPPLIER_CURRENCY_UNSUPPORTED',
@@ -1173,6 +1182,26 @@ class PurchaseReceivingService:
     @classmethod
     @transaction.atomic
     def review_correction(cls, correction_id, reviewer, approve, note):
+        identity = PurchaseReceivingCorrection.objects.filter(
+            id=correction_id, is_deleted=False,
+        ).values(
+            'receiving_id', 'receiving__purchase_order_id',
+            'receiving__purchase_order__supplier_id',
+        ).first()
+        if not identity:
+            return ServiceResponse.not_found('Receiving correction not found')
+        po = None
+        rcv = None
+        if approve:
+            _supplier = Supplier.objects.select_for_update().get(
+                pk=identity['receiving__purchase_order__supplier_id'],
+            )
+            po = PurchaseOrder.objects.select_for_update().get(
+                pk=identity['receiving__purchase_order_id'],
+            )
+            rcv = PurchaseReceiving.objects.select_for_update().get(
+                pk=identity['receiving_id'],
+            )
         correction = PurchaseReceivingCorrection.objects.select_for_update(
             of=('self',),
         ).select_related(
@@ -1204,12 +1233,20 @@ class PurchaseReceivingService:
             return ServiceResponse.success(data={'correction_id': correction.id,
                                                  'status': correction.status})
 
-        rcv = PurchaseReceiving.objects.select_for_update().get(pk=correction.receiving_id)
+        if (
+            correction.receiving_id != rcv.id
+            or rcv.purchase_order_id != po.id
+            or po.supplier_id != _supplier.id
+        ):
+            return ServiceResponse.conflict(
+                'RECEIVING_RELATIONSHIP_CHANGED',
+                'Receiving ownership changed while it was being locked; retry safely.',
+            )
+
         if rcv.corrections.filter(status=PurchaseReceivingCorrection.Status.APPROVED,
                                   is_deleted=False).exclude(pk=correction.pk).exists():
             return ({'success': False, 'message': 'Receiving was already reversed',
                      'errors': {'code': 'receiving_already_reversed'}}, 409)
-        po = PurchaseOrder.objects.select_for_update().get(pk=rcv.purchase_order_id)
         items = list(rcv.items.select_related(
             'stock_item__base_unit', 'unit__base_unit', 'base_unit',
             'po_item', 'batch_created',
@@ -1247,7 +1284,19 @@ class PurchaseReceivingService:
                 base_values[item.id] = base_value
         from stock.models import StockBatch
         from .level_service import StockLevelService
+        list(StockItem.objects.select_for_update().filter(
+            pk__in=sorted({item.stock_item_id for item in passed}),
+        ).order_by('pk'))
         batches = {}
+        locked_batches = {
+            batch.id: batch
+            for batch in StockBatch.objects.select_for_update().filter(
+                pk__in=sorted({
+                    item.batch_created_id for item in passed
+                    if item.batch_created_id
+                }),
+            ).order_by('pk')
+        }
         for item in passed:
             base_value = base_values[item.id]
             level = StockLevelService.get_level_for_update(item.stock_item_id, rcv.location_id)
@@ -1256,7 +1305,7 @@ class PurchaseReceivingService:
                          'errors': {'code': 'receiving_reversal_stock_unavailable',
                                     'stock_item_id': item.stock_item_id}}, 409)
             if item.batch_created_id:
-                batch = StockBatch.objects.select_for_update().get(pk=item.batch_created_id)
+                batch = locked_batches[item.batch_created_id]
                 if batch.current_quantity < base_value['quantity']:
                     return ({'success': False, 'message': 'Received batch has already been consumed',
                              'errors': {'code': 'receiving_reversal_batch_unavailable',

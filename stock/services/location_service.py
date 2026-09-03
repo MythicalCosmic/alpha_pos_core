@@ -11,7 +11,7 @@ class StockLocationService:
 
     @classmethod
     def serialize(cls, location: StockLocation, include_children: bool = False,
-                  include_stats: bool = False) -> Dict[str, Any]:
+                  include_stats: bool = False, branch_id: str = None) -> Dict[str, Any]:
         data = {
             "id": location.id,
             "uuid": str(location.uuid),
@@ -27,9 +27,12 @@ class StockLocationService:
         }
 
         if include_children:
+            children = location.children.filter(is_active=True)
+            if branch_id:
+                children = children.filter(branch_id=branch_id)
             data["children"] = [
-                cls.serialize(child, include_children=False)
-                for child in location.children.filter(is_active=True).order_by("sort_order", "name")
+                cls.serialize(child, include_children=False, branch_id=branch_id)
+                for child in children.order_by("sort_order", "name")
             ]
 
         if include_stats:
@@ -53,9 +56,12 @@ class StockLocationService:
              parent_id: int = None,
              production_only: bool = False,
              include_children: bool = False,
-             include_stats: bool = False) -> Tuple[Dict[str, Any], int]:
+             include_stats: bool = False,
+             branch_id: str = None) -> Tuple[Dict[str, Any], int]:
 
         queryset = StockLocationRepository.get_all()
+        if branch_id:
+            queryset = queryset.filter(branch_id=branch_id)
 
         if not include_inactive:
             queryset = queryset.filter(is_active=True)
@@ -75,7 +81,10 @@ class StockLocationService:
         queryset = queryset.order_by("sort_order", "name")
 
         locations = [
-            cls.serialize(loc, include_children=include_children, include_stats=include_stats)
+            cls.serialize(
+                loc, include_children=include_children,
+                include_stats=include_stats, branch_id=branch_id,
+            )
             for loc in queryset
         ]
 
@@ -89,8 +98,9 @@ class StockLocationService:
         })
 
     @classmethod
-    def get_tree(cls, include_inactive: bool = False) -> Tuple[Dict[str, Any], int]:
-        queryset = StockLocationRepository.get_root_locations()
+    def get_tree(cls, include_inactive: bool = False,
+                 branch_id: str = None) -> Tuple[Dict[str, Any], int]:
+        queryset = StockLocationRepository.get_root_locations(branch_id=branch_id)
 
         if not include_inactive:
             queryset = queryset.filter(is_active=True)
@@ -98,14 +108,20 @@ class StockLocationService:
         queryset = queryset.order_by("sort_order", "name")
 
         tree = [
-            cls.serialize(loc, include_children=True)
+            cls.serialize(loc, include_children=True, branch_id=branch_id)
             for loc in queryset
         ]
 
         total_count = (
-            StockLocationRepository.count(is_active=True)
+            queryset.model.objects.filter(
+                is_deleted=False, is_active=True,
+                **({'branch_id': branch_id} if branch_id else {}),
+            ).count()
             if not include_inactive
-            else StockLocationRepository.count()
+            else queryset.model.objects.filter(
+                is_deleted=False,
+                **({'branch_id': branch_id} if branch_id else {}),
+            ).count()
         )
 
         return ServiceResponse.success(data={
@@ -114,8 +130,9 @@ class StockLocationService:
         })
 
     @classmethod
-    def search(cls, query: str, limit: int = 20) -> Tuple[Dict[str, Any], int]:
-        queryset = StockLocationRepository.get_active()
+    def search(cls, query: str, limit: int = 20,
+               branch_id: str = None) -> Tuple[Dict[str, Any], int]:
+        queryset = StockLocationRepository.get_active(branch_id=branch_id)
         queryset = StockLocationRepository.search(queryset, query)
         locations = queryset.order_by("name")[:limit]
 
@@ -126,26 +143,35 @@ class StockLocationService:
 
     @classmethod
     def get(cls, location_id: int, include_children: bool = True,
-            include_stats: bool = True) -> Tuple[Dict[str, Any], int]:
-        location = StockLocationRepository.get_by_id(location_id)
+            include_stats: bool = True,
+            branch_id: str = None) -> Tuple[Dict[str, Any], int]:
+        queryset = StockLocation.objects.filter(pk=location_id, is_deleted=False)
+        if branch_id:
+            queryset = queryset.filter(branch_id=branch_id)
+        location = queryset.first()
         if not location:
             return ServiceResponse.not_found("Location not found")
 
         return ServiceResponse.success(data={
-            "location": cls.serialize(location, include_children=include_children,
-                                      include_stats=include_stats)
+            "location": cls.serialize(
+                location, include_children=include_children,
+                include_stats=include_stats, branch_id=branch_id,
+            )
         })
 
     @classmethod
-    def get_default(cls) -> Optional[StockLocation]:
-        location = StockLocationRepository.get_default()
+    def get_default(cls, branch_id: str = None) -> Optional[StockLocation]:
+        location = StockLocationRepository.get_default(branch_id=branch_id)
         if location:
             return location
-        return StockLocationRepository.first(is_active=True)
+        filters = {'is_active': True}
+        if branch_id:
+            filters['branch_id'] = branch_id
+        return StockLocationRepository.first(**filters)
 
     @classmethod
-    def get_production_locations(cls) -> List[StockLocation]:
-        return list(StockLocationRepository.get_production_areas())
+    def get_production_locations(cls, branch_id: str = None) -> List[StockLocation]:
+        return list(StockLocationRepository.get_production_areas(branch_id=branch_id))
 
     @classmethod
     @transaction.atomic
@@ -155,7 +181,8 @@ class StockLocationService:
                parent_id: int = None,
                is_default: bool = False,
                is_production_area: bool = False,
-               sort_order: int = 0) -> Tuple[Dict[str, Any], int]:
+               sort_order: int = 0,
+               branch_id: str = None) -> Tuple[Dict[str, Any], int]:
 
         valid_types = [c[0] for c in StockLocation.LocationType.choices]
         if type not in valid_types:
@@ -163,21 +190,24 @@ class StockLocationService:
                 errors={"type": f"Invalid type. Valid: {valid_types}"},
             )
 
-        if StockLocationRepository.name_exists(name):
+        if StockLocationRepository.name_exists(name, branch_id=branch_id):
             return ServiceResponse.validation_error(
                 errors={"name": f"Location with name '{name}' already exists"},
             )
 
         parent = None
         if parent_id:
-            parent = StockLocationRepository.get_by_id(parent_id)
+            parent_qs = StockLocation.objects.filter(pk=parent_id, is_deleted=False)
+            if branch_id:
+                parent_qs = parent_qs.filter(branch_id=branch_id)
+            parent = parent_qs.first()
             if not parent:
                 return ServiceResponse.not_found("Parent location not found")
             if not parent.is_active:
                 return ServiceResponse.error("Cannot add child to inactive location")
 
         if is_default:
-            StockLocationRepository.clear_default()
+            StockLocationRepository.clear_default(branch_id=branch_id)
 
         location = StockLocationRepository.create(
             name=name,
@@ -186,6 +216,7 @@ class StockLocationService:
             is_default=is_default,
             is_production_area=is_production_area,
             sort_order=sort_order,
+            **({'branch_id': branch_id} if branch_id else {}),
         )
 
         return ServiceResponse.success(data={
@@ -196,8 +227,12 @@ class StockLocationService:
 
     @classmethod
     @transaction.atomic
-    def update(cls, location_id: int, **kwargs) -> Tuple[Dict[str, Any], int]:
-        location = StockLocationRepository.get_by_id(location_id)
+    def update(cls, location_id: int, branch_id: str = None,
+               **kwargs) -> Tuple[Dict[str, Any], int]:
+        location_qs = StockLocation.objects.filter(pk=location_id, is_deleted=False)
+        if branch_id:
+            location_qs = location_qs.filter(branch_id=branch_id)
+        location = location_qs.first()
         if not location:
             return ServiceResponse.not_found("Location not found")
 
@@ -209,14 +244,21 @@ class StockLocationService:
                 )
 
         if "name" in kwargs and kwargs["name"] != location.name:
-            if StockLocationRepository.name_exists(kwargs["name"], exclude_id=location_id):
+            if StockLocationRepository.name_exists(
+                kwargs["name"], exclude_id=location_id, branch_id=branch_id,
+            ):
                 return ServiceResponse.validation_error(
                     errors={"name": f"Location with name '{kwargs['name']}' already exists"},
                 )
 
         if "parent_id" in kwargs:
             if kwargs["parent_id"]:
-                parent = StockLocationRepository.get_by_id(kwargs["parent_id"])
+                parent_qs = StockLocation.objects.filter(
+                    pk=kwargs["parent_id"], is_deleted=False,
+                )
+                if branch_id:
+                    parent_qs = parent_qs.filter(branch_id=branch_id)
+                parent = parent_qs.first()
                 if not parent:
                     return ServiceResponse.not_found("Parent location not found")
                 if parent.id == location_id:
@@ -228,7 +270,9 @@ class StockLocationService:
                 location.parent_location = None
 
         if kwargs.get("is_default"):
-            StockLocationRepository.clear_default(exclude_id=location_id)
+            StockLocationRepository.clear_default(
+                exclude_id=location_id, branch_id=branch_id,
+            )
 
         update_fields = ["updated_at"]
         for field in ["name", "type", "is_default", "is_production_area", "sort_order"]:
@@ -256,8 +300,12 @@ class StockLocationService:
 
     @classmethod
     @transaction.atomic
-    def deactivate(cls, location_id: int) -> Tuple[Dict[str, Any], int]:
-        location = StockLocationRepository.get_by_id(location_id)
+    def deactivate(cls, location_id: int,
+                   branch_id: str = None) -> Tuple[Dict[str, Any], int]:
+        location_qs = StockLocation.objects.filter(pk=location_id, is_deleted=False)
+        if branch_id:
+            location_qs = location_qs.filter(branch_id=branch_id)
+        location = location_qs.first()
         if not location:
             return ServiceResponse.not_found("Location not found")
 
@@ -284,8 +332,12 @@ class StockLocationService:
 
     @classmethod
     @transaction.atomic
-    def activate(cls, location_id: int) -> Tuple[Dict[str, Any], int]:
-        location = StockLocationRepository.get_by_id(location_id)
+    def activate(cls, location_id: int,
+                 branch_id: str = None) -> Tuple[Dict[str, Any], int]:
+        location_qs = StockLocation.objects.filter(pk=location_id, is_deleted=False)
+        if branch_id:
+            location_qs = location_qs.filter(branch_id=branch_id)
+        location = location_qs.first()
         if not location:
             return ServiceResponse.not_found("Location not found")
 
@@ -301,15 +353,19 @@ class StockLocationService:
 
     @classmethod
     @transaction.atomic
-    def set_default(cls, location_id: int) -> Tuple[Dict[str, Any], int]:
-        location = StockLocationRepository.get_by_id(location_id)
+    def set_default(cls, location_id: int,
+                    branch_id: str = None) -> Tuple[Dict[str, Any], int]:
+        location_qs = StockLocation.objects.filter(pk=location_id, is_deleted=False)
+        if branch_id:
+            location_qs = location_qs.filter(branch_id=branch_id)
+        location = location_qs.first()
         if not location:
             return ServiceResponse.not_found("Location not found")
 
         if not location.is_active:
             return ServiceResponse.error("Cannot set inactive location as default")
 
-        StockLocationRepository.clear_default()
+        StockLocationRepository.clear_default(branch_id=branch_id)
 
         location.is_default = True
         location.save(update_fields=["is_default", "updated_at"])

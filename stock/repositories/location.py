@@ -7,32 +7,39 @@ class StockLocationRepository(BaseSyncRepository):
     model = StockLocation
 
     @classmethod
-    def get_active(cls):
-        return cls.model.objects.filter(is_deleted=False, is_active=True)
+    def get_active(cls, branch_id=None):
+        qs = cls.model.objects.filter(is_deleted=False, is_active=True)
+        return qs.filter(branch_id=branch_id) if branch_id else qs
 
     @classmethod
-    def get_default(cls):
-        return cls.model.objects.filter(
+    def get_default(cls, branch_id=None):
+        qs = cls.model.objects.filter(
             is_default=True, is_active=True, is_deleted=False
-        ).first()
+        )
+        if branch_id:
+            qs = qs.filter(branch_id=branch_id)
+        return qs.first()
 
     @classmethod
-    def get_root_locations(cls):
-        return cls.model.objects.filter(
+    def get_root_locations(cls, branch_id=None):
+        qs = cls.model.objects.filter(
             parent_location__isnull=True, is_deleted=False
         )
+        return qs.filter(branch_id=branch_id) if branch_id else qs
 
     @classmethod
-    def get_production_areas(cls):
-        return cls.model.objects.filter(
+    def get_production_areas(cls, branch_id=None):
+        qs = cls.model.objects.filter(
             is_production_area=True, is_active=True, is_deleted=False
         )
+        return qs.filter(branch_id=branch_id) if branch_id else qs
 
     @classmethod
-    def get_children(cls, location_id):
-        return cls.model.objects.filter(
+    def get_children(cls, location_id, branch_id=None):
+        qs = cls.model.objects.filter(
             parent_location_id=location_id, is_deleted=False
         )
+        return qs.filter(branch_id=branch_id) if branch_id else qs
 
     @classmethod
     def search(cls, queryset, query):
@@ -41,15 +48,19 @@ class StockLocationRepository(BaseSyncRepository):
         )
 
     @classmethod
-    def name_exists(cls, name, exclude_id=None):
+    def name_exists(cls, name, exclude_id=None, branch_id=None):
         qs = cls.model.objects.filter(name__iexact=name, is_deleted=False)
+        if branch_id:
+            qs = qs.filter(branch_id=branch_id)
         if exclude_id:
             qs = qs.exclude(id=exclude_id)
         return qs.exists()
 
     @classmethod
-    def clear_default(cls, exclude_id=None):
+    def clear_default(cls, exclude_id=None, branch_id=None):
         qs = cls.model.objects.filter(is_default=True)
+        if branch_id:
+            qs = qs.filter(branch_id=branch_id)
         if exclude_id:
             qs = qs.exclude(id=exclude_id)
         return cls.sync_update_queryset(qs, is_default=False)

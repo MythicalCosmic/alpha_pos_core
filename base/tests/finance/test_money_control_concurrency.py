@@ -23,6 +23,7 @@ from hr.services.expense_service import ExpenseService
 from stock.models import (
     PurchaseOrder,
     PurchaseOrderItem,
+    PurchaseReceivingCorrection,
     StockItem,
     StockLevel,
     StockLocation,
@@ -75,6 +76,38 @@ def _parallel(operation):
             close_old_connections()
 
     threads = [Thread(target=runner) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert all(not thread.is_alive() for thread in threads)
+    assert failures == []
+    return results
+
+
+def _parallel_operations(operations):
+    barrier = Barrier(len(operations))
+    lock = Lock()
+    results = {}
+    failures = []
+
+    def runner(name, operation):
+        close_old_connections()
+        try:
+            barrier.wait(timeout=10)
+            value = operation()
+            with lock:
+                results[name] = value
+        except Exception as exc:
+            with lock:
+                failures.append(exc)
+        finally:
+            close_old_connections()
+
+    threads = [
+        Thread(target=runner, args=(name, operation))
+        for name, operation in operations.items()
+    ]
     for thread in threads:
         thread.start()
     for thread in threads:
@@ -270,3 +303,122 @@ def test_concurrent_receiving_and_supplier_payment_post_once():
     ).count() == 1
     supplier.refresh_from_db()
     assert supplier.current_balance == Decimal('0')
+
+
+@pytest.mark.django_db(transaction=True)
+def test_supplier_payment_and_receiving_correction_share_lock_order():
+    _postgres_only()
+    receiver = _user('rcv-owner@test.local')
+    reviewer = _user('rcv-reviewer@test.local')
+    unit = StockUnit.objects.create(
+        name='Correction piece', short_name='cpc', unit_type='COUNT',
+        is_base_unit=True,
+    )
+    location = StockLocation.objects.create(
+        name='Correction warehouse', type='WAREHOUSE', branch_id='branch1',
+    )
+    item = StockItem.objects.create(
+        name='Correction box', sku='CORRECTION-CONCURRENT-BOX', base_unit=unit,
+        item_type='RAW', branch_id='branch1',
+    )
+    supplier = Supplier.objects.create(
+        name='Correction Concurrent Supplier', branch_id='branch1',
+    )
+    po = PurchaseOrder.objects.create(
+        order_number='PO-CORRECTION-CONCURRENT',
+        supplier=supplier,
+        delivery_location=location,
+        status=PurchaseOrder.Status.CONFIRMED,
+        order_date=timezone.localdate(),
+        payment_due_date=timezone.now(),
+        total='500',
+        created_by=receiver,
+        branch_id='branch1',
+    )
+    line = PurchaseOrderItem.objects.create(
+        purchase_order=po,
+        stock_item=item,
+        quantity_ordered='5',
+        unit=unit,
+        unit_price='100',
+        total_price='500',
+        branch_id='branch1',
+    )
+    settings = StockSettings.load()
+    settings.stock_enabled = True
+    settings.save(update_fields=['stock_enabled', 'updated_at'])
+    created, _ = PurchaseReceivingService.create(
+        po.id, receiver.id, location.id,
+    )
+    receiving_id = created['data']['id']
+    PurchaseReceivingService.add_item(
+        receiving_id, line.id, '5', unit_cost='100',
+    )
+    completed, status = PurchaseReceivingService.complete(
+        receiving_id,
+        actor=receiver,
+        action_id=uuid4(),
+        idempotency_key='correction-race-receiving',
+    )
+    assert status == 200, completed
+    requested, status = PurchaseReceivingService.request_correction(
+        receiving_id, receiver, 'Return all received stock',
+    )
+    assert status == 201, requested
+    correction_id = requested['data']['correction_id']
+    with transaction.atomic():
+        bank = _lock_accounts(['BANK'], 'branch1')['BANK']
+        _apply(
+            bank, Decimal('1000'), TreasuryTransaction.Type.ADJUSTMENT,
+            branch_id='branch1', performed_by=receiver,
+        )
+
+    def correct_receiving():
+        worker = User.objects.get(pk=reviewer.pk)
+        return PurchaseReceivingService.review_correction(
+            correction_id, worker, True, 'Approved concurrent return',
+        )
+
+    def pay_supplier():
+        worker = User.objects.get(pk=receiver.pk)
+        return SupplierPaymentService.pay(
+            supplier.id,
+            '500',
+            'BANK',
+            allocation_mode='EXPLICIT',
+            allocations=[{'purchase_order_id': po.id, 'amount_uzs': 500}],
+            actor=worker,
+            action_id=uuid4(),
+            idempotency_key='payment-correction-race',
+        )
+
+    results = _parallel_operations({
+        'correction': correct_receiving,
+        'payment': pay_supplier,
+    })
+
+    assert results['correction'][1] == 200
+    assert results['payment'][1] in {201, 422}
+    assert PurchaseReceivingCorrection.objects.get(
+        pk=correction_id,
+    ).status == PurchaseReceivingCorrection.Status.APPROVED
+    assert StockLevel.objects.get(stock_item=item).quantity == Decimal('0')
+    assert StockTransaction.objects.filter(
+        reference_type='PurchaseReceivingCorrection',
+    ).count() == 1
+    supplier.refresh_from_db()
+    running = Decimal('0')
+    for row in SupplierTransaction.objects.filter(
+        supplier=supplier,
+    ).order_by('created_at', 'id'):
+        assert row.balance_before == running
+        running = row.balance_after
+    assert supplier.current_balance == running
+    payment_count = SupplierPayment.objects.filter(supplier=supplier).count()
+    assert payment_count in {0, 1}
+    assert TreasuryTransaction.objects.filter(
+        type=TreasuryTransaction.Type.SUPPLIER_PAYMENT,
+    ).count() == payment_count
+    assert TreasuryAccount.objects.get(kind='BANK').balance == (
+        Decimal('1000') - Decimal('500') * payment_count
+    )

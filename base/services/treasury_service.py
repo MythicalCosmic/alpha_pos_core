@@ -1,6 +1,7 @@
 """Branch-scoped SAFE/BANK balances backed by an append-only ledger."""
 
 from decimal import Decimal, InvalidOperation
+from collections import defaultdict
 
 from django.conf import settings
 from django.db import IntegrityError, transaction
@@ -53,6 +54,45 @@ def _actor_name(actor):
     if actor is None:
         return ''
     return f'{actor.first_name} {actor.last_name}'.strip()
+
+
+def _economic_fee_total(queryset):
+    rows = queryset.exclude(fee=0).values(
+        'id', 'type', 'fee', 'command_id', 'idempotency_key',
+        'account_id', 'counterparty_id',
+    ).order_by('id')
+    total = Decimal('0')
+    transfers = defaultdict(list)
+    legacy = defaultdict(lambda: {'out': 0, 'in': 0})
+    for row in rows:
+        if row['type'] not in {
+            TreasuryTransaction.Type.TRANSFER_OUT,
+            TreasuryTransaction.Type.TRANSFER_IN,
+        }:
+            total += Decimal(row['fee'])
+            continue
+        identity = row['command_id'] or row['idempotency_key'] or None
+        if identity:
+            transfers[str(identity)].append(row)
+            continue
+        account_pair = tuple(sorted(filter(None, (
+            row['account_id'], row['counterparty_id'],
+        ))))
+        key = (account_pair, Decimal(row['fee']))
+        direction = (
+            'out' if row['type'] == TreasuryTransaction.Type.TRANSFER_OUT
+            else 'in'
+        )
+        legacy[key][direction] += 1
+    for group in transfers.values():
+        preferred = next((
+            row for row in group
+            if row['type'] == TreasuryTransaction.Type.TRANSFER_OUT
+        ), group[0])
+        total += Decimal(preferred['fee'])
+    for (_accounts, fee), counts in legacy.items():
+        total += fee * max(counts['out'], counts['in'])
+    return total
 
 
 def _branch(branch_id=None, actor=None):
@@ -968,8 +1008,8 @@ class TreasuryService:
         totals = queryset.aggregate(
             inflow=Sum('delta', filter=Q(delta__gt=0)),
             outflow=Sum('delta', filter=Q(delta__lt=0)),
-            fee=Sum('fee'),
         )
+        total_fee = _economic_fee_total(queryset)
         total = queryset.count()
         rows = queryset.order_by('-created_at', '-id')[
             (page - 1) * per_page:page * per_page
@@ -980,7 +1020,7 @@ class TreasuryService:
             'totals': {
                 'total_inflow_uzs': uzs_int(totals['inflow'] or 0),
                 'total_outflow_uzs': uzs_int(-(totals['outflow'] or 0)),
-                'total_fee_uzs': uzs_int(totals['fee'] or 0),
+                'total_fee_uzs': uzs_int(total_fee),
                 'row_count': total,
             },
             'pagination': {

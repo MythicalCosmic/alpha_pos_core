@@ -49,6 +49,8 @@ urlpatterns = [
 
     # Stock Adjustments & Reservations
     path('adjust/', level_views.stock_adjust, name='adjust'),
+    path('adjust/<int:transaction_id>/reverse/',
+         level_views.stock_adjust_reverse, name='adjust-reverse'),
     path('adjustment-requests/', adjustment_request_views.adjustment_requests, name='adjustment-request-list'),
     path('adjustment-requests/<int:request_id>/<str:action>/', adjustment_request_views.adjustment_review, name='adjustment-request-review'),
     path('reserve/', level_views.stock_reserve, name='reserve'),
