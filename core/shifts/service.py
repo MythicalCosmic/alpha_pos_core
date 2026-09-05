@@ -1103,9 +1103,11 @@ class ShiftService:
     ):
         # The user row is the serialization point for concurrent starts. The
         # partial unique constraint remains the definitive cross-process guard
-        # (and protects writers that bypass this service).
+        # (and protects writers that bypass this service). Allow foreign-key
+        # references from a concurrently closing shift while still preventing
+        # user changes and concurrent starts from passing this mutex.
         user = (
-            User.objects.select_for_update()
+            User.objects.select_for_update(no_key=True)
             .filter(pk=user_id, is_deleted=False)
             .first()
         )

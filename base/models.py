@@ -1764,7 +1764,7 @@ class Order(SyncMixin, models.Model):
         ]
 
     def save(self, *args, **kwargs):
-        """Stamp the first paid accounting cursor under the branch owner lock."""
+        """Publish order changes and stamp the first paid accounting cursor."""
         from base.services.phone import normalize_uz_phone
 
         normalized_phone = normalize_uz_phone(self.phone_number)
@@ -1775,6 +1775,19 @@ class Order(SyncMixin, models.Model):
             kwargs['update_fields'] = list(
                 set(kwargs['update_fields']) | {'phone_number'}
             )
+        update_fields = kwargs.get('update_fields')
+        if (
+            update_fields is not None
+            and not kwargs.get('_syncing', False)
+            and set(update_fields) - {'synced_at', 'sync_version'}
+        ):
+            # Cashier reports use updated_at to discover payments and edits.
+            # Django excludes auto_now fields from a restricted save unless
+            # they are explicitly named. Without this, a cached unpaid order
+            # can stay unpaid forever even after a successful checkout.
+            # Transport acknowledgements and incoming sync retain their own
+            # timestamp semantics; they are not new local order mutations.
+            kwargs['update_fields'] = list(set(update_fields) | {'updated_at'})
         if not (
             self.is_paid
             and self.paid_at is not None

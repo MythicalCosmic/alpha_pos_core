@@ -31,9 +31,12 @@ def lock_active_cashier_shift(cashier_id, *, branch_id=''):
 
     # Lock both ownership records.  Dispatch and settlement may race shift
     # closure/user reassignment; the lock keeps the validation true until the
-    # surrounding transaction commits.
+    # surrounding transaction commits. A no-key lock still excludes user
+    # changes but permits the foreign-key checks of a concurrent shift close.
+    # A full UPDATE lock would deadlock if we wait for its Shift row while its
+    # closing evidence waits to reference this User at commit.
     cashier = (
-        User.objects.select_for_update()
+        User.objects.select_for_update(no_key=True)
         .filter(
             pk=cashier_id,
             is_deleted=False,
