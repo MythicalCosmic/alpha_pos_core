@@ -5,6 +5,7 @@ from functools import wraps
 from uuid import UUID, uuid5
 
 from django.db import IntegrityError, transaction
+from django.db.models import JSONField, Value
 from django.http import JsonResponse
 from django.utils import timezone
 
@@ -355,7 +356,9 @@ def idempotent(
                 try:
                     IdempotencyKey.objects.filter(pk=record.pk).update(
                         response_status=response.status_code,
-                        response_body=body,
+                        # Python None means SQL NULL unless explicitly typed
+                        # as JSON. A successful JSON null must remain replayable.
+                        response_body=Value(None, JSONField()) if body is None else body,
                     )
                 except Exception:
                     logger.exception(

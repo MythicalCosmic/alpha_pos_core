@@ -275,6 +275,14 @@ class DiscountService:
         if not discount:
             return ServiceResponse.not_found("Discount code not found")
 
+        error = DiscountService._validate_eligibility(discount, order_subtotal, user_id)
+        if error:
+            return error
+        return ServiceResponse.success(data={'discount': _serialize_discount(discount)})
+
+    @staticmethod
+    def _validate_eligibility(discount, order_subtotal, user_id):
+        """Check one coupon snapshot; application must hold its row lock."""
         if not discount.is_active:
             return ServiceResponse.error("This discount is not active")
 
@@ -302,9 +310,7 @@ class DiscountService:
                 f"Minimum order amount of {discount.min_order_amount} is required"
             )
 
-        return ServiceResponse.success(data={
-            'discount': _serialize_discount(discount),
-        })
+        return None
 
     @staticmethod
     def calculate_discount(discount, order_items, already_applied_discount=Decimal('0')):
@@ -344,12 +350,15 @@ class DiscountService:
                 if total_qty >= discount.buy_quantity:
                     sets = total_qty // (discount.buy_quantity + discount.get_quantity)
                     free_qty = sets * discount.get_quantity
-                    # Calculate value of cheapest items as free
-                    prices = []
-                    for item in applicable_items:
-                        prices.extend([item.price] * item.quantity)
-                    prices.sort()
-                    discount_amount = sum(prices[:free_qty])
+                    # Consume cheapest units in line-sized chunks. Quantities
+                    # can be large; expanding one list entry per unit can
+                    # exhaust memory. Keep Decimal zero for incomplete sets.
+                    for item in sorted(applicable_items, key=lambda item: item.price):
+                        if free_qty <= 0:
+                            break
+                        taken = min(free_qty, item.quantity)
+                        discount_amount += item.price * taken
+                        free_qty -= taken
 
         elif method == DiscountType.Method.FREE_ITEM:
             if discount.free_product_id:
@@ -403,15 +412,6 @@ class DiscountService:
     @staticmethod
     @transaction.atomic
     def apply_to_order(order_id, discount_code, user_id=None):
-        # Validate the discount code
-        result, status = DiscountService.validate_code(
-            discount_code,
-            order_subtotal=Decimal('0'),
-            user_id=user_id,
-        )
-        if not result.get('success'):
-            return result, status
-
         # Row-lock the order so a concurrent mark_as_paid can't read the
         # pre-discount total_amount while this transaction rewrites it.
         order = OrderRepository.get_for_update(order_id)
@@ -431,21 +431,11 @@ class DiscountService:
             return ServiceResponse.not_found("Discount code not found")
         discount = locked
 
-        # Re-check usage limits under the row lock — validate_code's earlier
-        # read was unlocked, so two concurrent applies could both have passed.
-        if discount.usage_limit and discount.usage_count >= discount.usage_limit:
-            return ServiceResponse.error("This discount has reached its usage limit")
-
-        if discount.usage_per_user and user_id:
-            user_usage = DiscountUsageRepository.count_for_user_discount(user_id, discount.id)
-            if user_usage >= discount.usage_per_user:
-                return ServiceResponse.error("You have reached the usage limit for this discount")
-
-        # Re-validate with actual order subtotal
-        if discount.min_order_amount and order.subtotal < discount.min_order_amount:
-            return ServiceResponse.error(
-                f"Minimum order amount of {discount.min_order_amount} is required"
-            )
+        # All eligibility rules use the locked coupon and real order subtotal.
+        # An earlier unlocked check can go stale while waiting for these locks.
+        error = DiscountService._validate_eligibility(discount, order.subtotal, user_id)
+        if error:
+            return error
 
         # Staff-only discount: only an order attributed to an is_staff customer
         # qualifies (employee personal orders). Open discounts skip this.
