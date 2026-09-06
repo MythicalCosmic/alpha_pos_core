@@ -10,16 +10,24 @@ pytestmark = pytest.mark.django_db
 def test_legacy_sync_flags_explain_behavior_and_cannot_disable_durable_writes(flag, settings):
     from base.models import Category, SyncQueueRecord
     from base.services.sync.config import SyncConfig
+    from base.services.sync.cache import safe_get, safe_set, safe_delete
 
     settings.DEPLOYMENT_MODE = 'local'
     settings.BRANCH_ID = 'audit-branch'
     settings.SYNC_ON_SAVE = False
-    SyncConfig.enable()
-    out = StringIO()
-    call_command('sync', flag, stdout=out)
-    assert 'deprecated and has no effect' in out.getvalue()
-    item = Category.objects.create(name='Legacy flag check', slug='legacy-flag-check')
-    assert SyncQueueRecord.objects.filter(model_name='category', record_uuid=item.uuid).exists()
-    out = StringIO()
-    call_command('sync', '--config', stdout=out)
-    assert 'durable queueing whenever local sync is enabled' in out.getvalue()
+    previous = safe_get('sync:config:enabled')
+    try:
+        SyncConfig.enable()
+        out = StringIO()
+        call_command('sync', flag, stdout=out)
+        assert 'deprecated and has no effect' in out.getvalue()
+        item = Category.objects.create(name='Legacy flag check', slug='legacy-flag-check')
+        assert SyncQueueRecord.objects.filter(model_name='category', record_uuid=item.uuid).exists()
+        out = StringIO()
+        call_command('sync', '--config', stdout=out)
+        assert 'durable queueing whenever local sync is enabled' in out.getvalue()
+    finally:
+        if previous is None:
+            safe_delete('sync:config:enabled')
+        else:
+            safe_set('sync:config:enabled', previous, None)
