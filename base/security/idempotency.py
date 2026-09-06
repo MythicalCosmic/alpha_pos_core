@@ -28,6 +28,14 @@ INFLIGHT_TTL_SECONDS = 90
 _ACTION_ID_NAMESPACE = UUID('2ef9bc68-2b34-5db1-92e0-fcad5fcf2f7e')
 
 
+def _stored_json_response(body, status):
+    # PostgreSQL JSONB does not retain object insertion order. Use the same
+    # serialization before the first response and after a persisted replay.
+    return JsonResponse(
+        body, status=status, safe=False, json_dumps_params={'sort_keys': True},
+    )
+
+
 def _in_progress_response(retry_after_seconds=None):
     response = JsonResponse(
         {
@@ -258,9 +266,8 @@ def idempotent(
                     )
 
                 if record.response_status:
-                    return JsonResponse(
-                        record.response_body,
-                        status=record.response_status,
+                    return _stored_json_response(
+                        record.response_body, record.response_status,
                     )
 
                 age = (timezone.now() - record.created_at).total_seconds()
@@ -290,9 +297,8 @@ def idempotent(
                             pk=record.pk
                         ).first()
                         if current and current.response_status:
-                            return JsonResponse(
-                                current.response_body,
-                                status=current.response_status,
+                            return _stored_json_response(
+                                current.response_body, current.response_status,
                             )
                         return _in_progress_response(1)
 
@@ -347,6 +353,14 @@ def idempotent(
                     body = json.loads(response.content)
             except (ValueError, TypeError):
                 body = {}
+            else:
+                # Keep the original response object, including cookies and
+                # headers, while making its JSON ordering stable across DBs.
+                response.content = _stored_json_response(
+                    body, response.status_code,
+                ).content
+                if 'Content-Length' in response:
+                    response['Content-Length'] = str(len(response.content))
 
             # A fallback key exists to protect old clients, not to make a
             # precondition/validation failure permanent. For example, a
