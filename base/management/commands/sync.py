@@ -1,7 +1,6 @@
 import signal
 import logging
 from time import sleep
-from django.conf import settings
 from django.core.management.base import BaseCommand
 
 logger = logging.getLogger(__name__)
@@ -23,8 +22,8 @@ class Command(BaseCommand):
         parser.add_argument('--interval', type=int, help='Worker push interval in seconds')
         parser.add_argument('--enable', action='store_true', help='Enable sync')
         parser.add_argument('--disable', action='store_true', help='Disable sync')
-        parser.add_argument('--on-save', action='store_true', help='Enable SYNC_ON_SAVE (auto-queue on save)')
-        parser.add_argument('--off-save', action='store_true', help='Disable SYNC_ON_SAVE')
+        parser.add_argument('--on-save', action='store_true', help='Deprecated compatibility flag; queueing follows sync enablement')
+        parser.add_argument('--off-save', action='store_true', help='Deprecated compatibility flag; does not disable durable queueing')
         parser.add_argument('--queue', action='store_true', help='Show queue contents')
         parser.add_argument('--clear', action='store_true', help='Clear sync queue')
         parser.add_argument('--pull', action='store_true', help='Pull changes from cloud')
@@ -65,16 +64,13 @@ class Command(BaseCommand):
 
     def _show_status(self):
         from base.services.sync.service import SyncService
-        from base.services.sync.cache import safe_get
 
         status = SyncService.get_status()
-        on_save_override = safe_get('sync:config:on_save')
-        on_save = on_save_override if on_save_override is not None else getattr(settings, 'SYNC_ON_SAVE', False)
 
         self.stdout.write('\n  Sync Status')
         self.stdout.write('  ' + '=' * 35)
         self.stdout.write(f'  Enabled: {"YES" if status["enabled"] else "NO"}')
-        self.stdout.write(f'  On save: {"YES" if on_save else "NO"}')
+        self.stdout.write('  On save: durable queueing whenever local sync is enabled')
         self.stdout.write(f'  Branch: {status["mode"]}')
         self.stdout.write(f'  Online: {"YES" if status["is_online"] else "NO"}')
         self.stdout.write(f'  Last push: {status["last_sync"] or "Never"}')
@@ -249,13 +245,12 @@ class Command(BaseCommand):
             self.stdout.write(self.style.WARNING('  Sync disabled'))
 
     def _toggle_on_save(self, enable):
-        from base.services.sync.cache import safe_set
-
-        safe_set('sync:config:on_save', enable, None)
-        if enable:
-            self.stdout.write(self.style.SUCCESS('  SYNC_ON_SAVE enabled (auto-queue on model save)'))
-        else:
-            self.stdout.write(self.style.WARNING('  SYNC_ON_SAVE disabled'))
+        flag = '--on-save' if enable else '--off-save'
+        self.stdout.write(self.style.WARNING(
+            f'  {flag} is deprecated and has no effect. Local writes queue '
+            'durably whenever sync is enabled; use --enable/--disable to '
+            'control sync.'
+        ))
 
     def _show_queue(self):
         from base.services.sync.queue import SyncQueue
@@ -308,16 +303,13 @@ class Command(BaseCommand):
 
     def _show_config(self):
         from base.services.sync.config import SyncConfig
-        from base.services.sync.cache import safe_get
 
         config = SyncConfig.get_status()
-        on_save_override = safe_get('sync:config:on_save')
-        on_save = on_save_override if on_save_override is not None else getattr(settings, 'SYNC_ON_SAVE', False)
 
         self.stdout.write('\n  Sync Configuration')
         self.stdout.write('  ' + '=' * 35)
         self.stdout.write(f'  Enabled: {"YES" if config["enabled"] else "NO"}')
-        self.stdout.write(f'  On save: {"YES" if on_save else "NO"}')
+        self.stdout.write('  On save: durable queueing whenever local sync is enabled')
         self.stdout.write(f'  Mode: {config["mode"]}')
         self.stdout.write(f'  Branch: {config["branch_id"]}')
         self.stdout.write(f'  Cloud URL: {config["cloud_url"] or "NOT SET"}')
@@ -338,8 +330,8 @@ class Command(BaseCommand):
         self.stdout.write('    --interval N   Worker push interval in seconds')
         self.stdout.write('    --enable       Enable sync')
         self.stdout.write('    --disable      Disable sync')
-        self.stdout.write('    --on-save      Enable auto-queue on model save')
-        self.stdout.write('    --off-save     Disable auto-queue on model save')
+        self.stdout.write('    --on-save      Deprecated; queueing follows sync enablement')
+        self.stdout.write('    --off-save     Deprecated; does not disable durable queueing')
         self.stdout.write('    --queue        Show queue contents')
         self.stdout.write('    --clear        Clear sync queue')
         self.stdout.write('    --health       Check cloud server health')

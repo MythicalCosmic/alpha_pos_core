@@ -24,23 +24,40 @@ class SessionCredentialConflict(ValueError):
         super().__init__(self.public_message)
 
 
-def coerce_quantity(value, default=None):
-    """Return a positive integer quantity, or ``None`` for invalid input."""
-    if value is None:
-        value = default
+MAX_QUANTITY = 2**31 - 1
+MAX_MODEL_ID = 2**63 - 1
+
+
+def _positive_integer(value, maximum):
     if isinstance(value, bool):
         return None
-    if isinstance(value, int):
-        return value if value > 0 else None
-    if isinstance(value, float):
-        return int(value) if value.is_integer() and value > 0 else None
     if isinstance(value, str):
-        s = value.strip()
-        if s.isascii() and s.isdecimal():
-            n = int(s)
-            return n if n > 0 else None
-        return None
+        value = value.strip()
+        if not value.isascii() or not value.isdecimal():
+            return None
+        # Bound text before int(): Python rejects excessively long digit
+        # strings, and database integer columns have a much smaller limit.
+        value = value.lstrip('0') or '0'
+        if len(value) > len(str(maximum)):
+            return None
+        value = int(value)
+    if isinstance(value, int) and 0 < value <= maximum:
+        return value
     return None
+
+
+def coerce_positive_id(value):
+    """Parse a positive database ID; never truncate floats or accept booleans."""
+    return _positive_integer(value, MAX_MODEL_ID)
+
+
+def coerce_quantity(value, default=None):
+    """Return a positive quantity within the database column's capacity."""
+    if value is None:
+        value = default
+    if isinstance(value, float):
+        return int(value) if value.is_integer() and 0 < value <= MAX_QUANTITY else None
+    return _positive_integer(value, MAX_QUANTITY)
 
 
 def get_client_ip(request):

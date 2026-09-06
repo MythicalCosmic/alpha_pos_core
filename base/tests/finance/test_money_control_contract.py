@@ -557,6 +557,7 @@ def test_completed_shift_without_posted_reconciliation_nulls_drawer_and_capital(
 
 
 def test_voided_expense_without_reversal_nulls_paid_total():
+    paid_at = timezone.localtime().replace(hour=12, minute=0, second=0, microsecond=0)
     actor = _user('missing-expense-reversal@test.local')
     _credit_treasury('branch1', '0', '1000', actor)
     account = TreasuryAccount.objects.get(branch_id='branch1', kind='BANK')
@@ -576,18 +577,18 @@ def test_voided_expense_without_reversal_nulls_paid_total():
         category_code_snapshot=category.code,
         category_name_snapshot=category.name,
         amount='100',
-        expense_date=timezone.localdate(),
+        expense_date=paid_at.date(),
         status=Expense.Status.VOIDED,
         requested_source='BANK',
         treasury_transaction=transaction,
-        paid_at=timezone.now(),
-        voided_at=timezone.now(),
+        paid_at=paid_at,
+        voided_at=paid_at,
         created_by=actor,
         branch_id='branch1',
     )
 
     expenses, issues = MoneyControlService._expenses(
-        'branch1', timezone.localdate(), timezone.localdate(),
+        'branch1', paid_at.date(), paid_at.date(),
     )
 
     assert expenses['paid_uzs'] is None

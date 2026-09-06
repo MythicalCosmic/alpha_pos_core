@@ -13,13 +13,10 @@ from base.models import Session, User
 
 @receiver(post_save, sender=User)
 def _invalidate_user_session_cache(sender, instance, **kwargs):
-    """Flush a user's cached sessions whenever the user row changes.
+    """Evict joined identities left in the cache by older builds.
 
-    Sessions are cached with their joined user for SESSION_CACHE_TTL, so a
-    suspend / role-change / deactivate would keep granting the old access for
-    up to the TTL. We invalidate on every user save (rare events) rather than
-    diffing fields — correctness over a negligible cache miss. The session
-    rows are untouched; only the cache entries are dropped.
+    Current authentication queries the session and user directly. Retain this
+    cleanup for compatibility; access revocation no longer depends on eviction.
     """
     from base.repositories.session import SessionRepository
     SessionRepository.invalidate_user_cache(instance)
@@ -27,14 +24,10 @@ def _invalidate_user_session_cache(sender, instance, **kwargs):
 
 @receiver(post_delete, sender=Session)
 def _invalidate_session_cache(sender, instance, **kwargs):
-    """Drop the cached Session row when its DB row is deleted.
+    """Remove a deleted session's legacy cache entry on every ORM route.
 
-    `SessionRepository.get_by_session_key` caches sessions for
-    SESSION_CACHE_TTL (5 min by default), and the explicit `logout` /
-    `delete_by_user` paths call `invalidate_cache` directly. But any other
-    deletion route — django admin, a management command, a raw ORM delete —
-    would leave the cached row valid for up to TTL seconds, so a revoked
-    token kept working. The signal closes that window deterministically.
+    Current authentication never trusts these entries, including entries a
+    concurrent legacy reader might refill after this signal runs.
     """
     payload = getattr(instance, 'payload', None)
     if payload:
