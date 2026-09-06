@@ -227,14 +227,6 @@ class SyncMixin(models.Model):
         # the change feed's NULL safety lane will keep serving that version.
         transaction.on_commit(publish, using=db_alias, robust=True)
 
-    @staticmethod
-    def _is_sync_on_save():
-        from base.services.sync.cache import safe_get
-        override = safe_get('sync:config:on_save')
-        if override is not None:
-            return override
-        return getattr(settings, 'SYNC_ON_SAVE', False)
-
     def delete(self, *args, **kwargs):
         hard_delete = kwargs.pop('hard_delete', False)
         if hard_delete:
@@ -320,17 +312,6 @@ class SyncMixin(models.Model):
                 service, model_name, uuid_val, tombstone = pending_tombstone
                 service.queue_tombstone(model_name, uuid_val, tombstone)
             return result
-
-    def _queue_for_sync(self):
-        try:
-            from base.services.sync.service import SyncService
-            SyncService.queue_record(self)
-        except Exception:
-            import logging
-            logging.getLogger(__name__).warning(
-                f"Failed to queue {self.__class__.__name__} pk={self.pk} for sync",
-                exc_info=True,
-            )
 
     def to_sync_dict(self):
         data = {
@@ -1009,12 +990,6 @@ class SyncMixin(models.Model):
         own_branch = getattr(settings, 'BRANCH_ID', '') or ''
         local_branch = instance.branch_id or ''
         return local_branch != own_branch
-
-    @classmethod
-    def _is_sync_denylisted(cls, field_name):
-        denied = getattr(cls, 'SYNC_WRITE_DENYLIST', frozenset())
-        return field_name in denied
-
 
 class User(SyncMixin, models.Model):
     # Cloud-managed staff identities are shared configuration. In production

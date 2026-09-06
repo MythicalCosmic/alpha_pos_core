@@ -1,7 +1,6 @@
 import hashlib
 
 from django.core.cache import cache
-from django.conf import settings
 from base.repositories.base import BaseRepository
 from base.models import Session
 
@@ -30,15 +29,11 @@ class SessionRepository(BaseRepository):
         token_hash = cls.hash_token(session_key)
         if not token_hash:
             return None
-        cache_key = f"session:{token_hash}"
-        ttl = getattr(settings, 'SESSION_CACHE_TTL', 300)
-        cached = cache.get(cache_key)
-        if cached is not None:
-            return cached
-        session = cls.model.objects.select_related('user_id').filter(payload=token_hash).first()
-        if session:
-            cache.set(cache_key, session, ttl)
-        return session
+        # Authorization must reflect the current committed session and user.
+        # Eviction alone cannot prevent a concurrent reader from caching an
+        # old row after revocation commits. One indexed, joined lookup also
+        # works across processes and does not publish uncommitted identities.
+        return cls.model.objects.select_related('user_id').filter(payload=token_hash).first()
 
     @classmethod
     def invalidate_cache(cls, session_key):
@@ -48,13 +43,10 @@ class SessionRepository(BaseRepository):
 
     @classmethod
     def invalidate_user_cache(cls, user):
-        """Drop the cached Session rows for a user *without* deleting them.
+        """Evict legacy session entries without deleting valid sessions.
 
-        get_by_session_key caches the session together with its joined user
-        for SESSION_CACHE_TTL (5 min). When an admin suspends a user or
-        changes their role, that stale joined user keeps granting the old
-        access until the entry expires. Clearing the cache forces the next
-        request to re-read the user fresh; the sessions themselves stay valid.
+        Authentication reads the database directly. Keep this compatibility
+        cleanup for callers and entries written by earlier application builds.
         """
         payloads = cls.model.objects.filter(user_id=user).values_list('payload', flat=True)
         for payload in payloads:

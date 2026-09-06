@@ -89,12 +89,9 @@ class SyncService:
 
             SyncStatus.set_online(True)
 
-            # Self-heal rows whose transaction.on_commit enqueue silently failed
-            # (DB hiccup / queue-table lock): SyncMixin.save() leaves synced_at
-            # NULL and relies on on_commit to enqueue, but _queue_for_sync
-            # swallows exceptions — such a row is live locally yet never pushed.
-            # The queue is a cache, not the source of truth; reconcile any
-            # unsynced row that isn't already queued before building the batch.
+            # Recover unsynced rows left by older builds, imports or explicit
+            # queue cleanup. Current model saves queue in the same transaction;
+            # reconciling remains a backstop for historical missing/stale slots.
             cls._reconcile_unsynced()
 
             grouped = SyncQueue.get_grouped()
@@ -857,12 +854,10 @@ class SyncService:
     def _reconcile_unsynced(cls):
         """Make every unsynced row's latest payload present in the queue.
 
-        Backstop for the on_commit enqueue path: if _queue_for_sync ever fails
-        (and it swallows the exception), the row is saved with synced_at=NULL
-        but never enqueued. It also refreshes a pre-existing slot whose payload
-        became stale while SYNC_ON_SAVE was disabled. SyncQueue.add preserves an
-        identical slot's retry state, so this cannot accidentally revive poison
-        content every cycle. Bounded work after confirmed rows are stamped.
+        Recover missing/stale queue slots from older builds, imports or queue
+        cleanup. Current saves queue transactionally. SyncQueue.add preserves
+        an identical slot's retry state, so this cannot revive poison content
+        every cycle. Bounded work after confirmed rows are stamped.
         """
         branch = get_branch_id()
         models = get_all_models()

@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "alpha_pos_core"
 version = "0.1.0"
 description = "Shared spine for Alpha POS: core models, auth, the sync engine, and the business apps used by BOTH the server and local (desktop) editions."
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 
 dependencies = [
     "Django==6.0.3",
