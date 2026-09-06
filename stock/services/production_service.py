@@ -14,7 +14,7 @@ from stock.services.base_service import to_decimal, round_decimal, generate_numb
 from stock.repositories import (
     ProductionOrderRepository, ProductionOrderIngredientRepository,
     ProductionOrderOutputRepository, ProductionOrderStepRepository,
-    RecipeRepository, StockItemRepository, StockLocationRepository,
+    RecipeRepository, StockLocationRepository,
 )
 
 
@@ -200,31 +200,6 @@ class ProductionOrderService:
             "count": orders.count()
         })
 
-    @classmethod
-    def get_schedule(cls,
-                     date_from: datetime,
-                     date_to: datetime,
-                     location_id: int = None) -> Tuple[Dict[str, Any], int]:
-        queryset = ProductionOrderRepository.get_all().filter(
-            planned_start__gte=date_from,
-            planned_start__lte=date_to,
-            status__in=["DRAFT", "PLANNED", "IN_PROGRESS"]
-        ).select_related("recipe", "output_unit", "output_location")
-
-        if location_id:
-            queryset = queryset.filter(output_location_id=location_id)
-
-        orders = queryset.order_by("planned_start")
-
-        return ServiceResponse.success(data={
-            "schedule": [cls.serialize_brief(po) for po in orders],
-            "count": orders.count(),
-            "date_range": {
-                "from": date_from.isoformat(),
-                "to": date_to.isoformat(),
-            }
-        })
-
 
     @classmethod
     def get(cls, po_id: int) -> Tuple[Dict[str, Any], int]:
@@ -355,39 +330,6 @@ class ProductionOrderService:
             "order": cls.serialize(po)
         }, message=f"Production order {order_number} created")
 
-    @classmethod
-    @transaction.atomic
-    def create_from_low_stock(cls,
-                              output_item_id: int,
-                              created_by_id: int,
-                              target_quantity: Decimal = None) -> Tuple[Dict[str, Any], int]:
-
-        from .recipe_service import RecipeService
-        recipe = RecipeService.get_active_for_item(output_item_id)
-
-        if not recipe:
-            return ServiceResponse.error("No active recipe found for this item")
-
-        if not target_quantity:
-            from .level_service import StockLevelService
-            item = StockItemRepository.get_by_id(output_item_id)
-            if not item:
-                return ServiceResponse.not_found(f"Stock item with id {output_item_id} not found")
-            current = StockLevelService.get_available(output_item_id)
-            shortage = item.reorder_point - current
-            target_quantity = max(shortage, recipe.output_quantity)
-
-        batch_multiplier = to_decimal(target_quantity) / recipe.output_quantity
-
-        if recipe.min_batch_size and batch_multiplier < recipe.min_batch_size:
-            batch_multiplier = recipe.min_batch_size
-
-        return cls.create(
-            recipe_id=recipe.id,
-            created_by_id=created_by_id,
-            batch_multiplier=batch_multiplier,
-            notes="Auto-generated from low stock"
-        )
 
     @classmethod
     @transaction.atomic
@@ -827,36 +769,6 @@ class ProductionOrderIngredientService:
             "status": ing.status,
             "status_display": ing.get_status_display(),
         }
-
-    @classmethod
-    @transaction.atomic
-    def record_actual(cls,
-                      ingredient_id: int,
-                      actual_quantity: Decimal,
-                      batch_id: int = None,
-                      variance_reason: str = "") -> Tuple[Dict[str, Any], int]:
-        ing = ProductionOrderIngredientRepository.get_by_id(ingredient_id)
-        if not ing:
-            return ServiceResponse.not_found(f"Ingredient with id {ingredient_id} not found")
-
-        # Need the production_order relation
-        ing = ProductionOrderIngredient.objects.select_related("production_order").get(id=ingredient_id)
-
-        if ing.production_order.status != ProductionOrder.Status.IN_PROGRESS:
-            return ServiceResponse.error("Can only record actuals for in-progress orders")
-
-        ing.actual_quantity = to_decimal(actual_quantity)
-        ing.variance = ing.actual_quantity - ing.planned_quantity
-        ing.variance_reason = variance_reason
-
-        if batch_id:
-            ing.batch_used_id = batch_id
-
-        ing.save(update_fields=["actual_quantity", "variance", "variance_reason", "batch_used"])
-
-        return ServiceResponse.success(data={
-            "ingredient": cls.serialize(ing)
-        }, message="Actual quantity recorded")
 
 
 class ProductionOrderOutputService:

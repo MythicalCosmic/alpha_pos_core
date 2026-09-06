@@ -1,4 +1,6 @@
+from decimal import Decimal
 from django.db.models import Q, Sum, Count, F
+from django.db.models.functions import Coalesce
 from base.repositories.base import BaseSyncRepository
 from stock.models import StockItem
 
@@ -77,14 +79,17 @@ class StockItemRepository(BaseSyncRepository):
         )
 
     @classmethod
+    def with_stock_totals(cls, queryset, location_id=None):
+        live_levels = Q(stock_levels__is_deleted=False)
+        if location_id is not None:
+            live_levels &= Q(stock_levels__location_id=location_id)
+        return queryset.annotate(total_qty=Coalesce(
+            Sum('stock_levels__quantity', filter=live_levels), Decimal('0'),
+        ))
+
+    @classmethod
     def get_low_stock(cls):
-        return cls.model.objects.filter(
-            is_active=True, is_deleted=False
-        ).annotate(
-            total_qty=Sum('stock_levels__quantity')
-        ).filter(
-            Q(total_qty__lt=F('reorder_point')) | Q(total_qty__isnull=True)
-        )
+        return cls.with_stock_totals(cls.get_active()).filter(total_qty__lt=F('reorder_point'))
 
     @classmethod
     def get_stats(cls):

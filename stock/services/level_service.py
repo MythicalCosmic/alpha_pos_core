@@ -2,7 +2,7 @@ from typing import Dict, Any, Tuple
 from decimal import Decimal
 from datetime import date
 from django.db import transaction
-from django.db.models import Sum, F, Count
+from django.db.models import Sum, F, Count, Q
 from django.utils import timezone
 
 from base.helpers.response import ServiceResponse
@@ -70,6 +70,12 @@ class StockLevelService:
         queryset = StockLevelRepository.get_all().select_related(
             "stock_item", "stock_item__base_unit", "stock_item__category", "location"
         ).filter(stock_item__is_active=True)
+
+        if search:
+            queryset = queryset.filter(
+                Q(stock_item__name__icontains=search) | Q(stock_item__sku__icontains=search)
+                | Q(location__name__icontains=search)
+            )
 
         if location_id:
             queryset = queryset.filter(location_id=location_id)

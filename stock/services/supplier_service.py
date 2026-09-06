@@ -308,31 +308,6 @@ class SupplierService:
             "supplier": cls.serialize(supplier)
         }, message="Supplier activated")
 
-    @classmethod
-    @transaction.atomic
-    def update_balance(cls, supplier_id: int, amount: Decimal, operation: str = "add") -> Tuple[Dict[str, Any], int]:
-        supplier = SupplierRepository.get_by_id(supplier_id)
-        if not supplier:
-            return ServiceResponse.not_found(f"Supplier with id {supplier_id} not found")
-
-        amount = to_decimal(amount)
-
-        if operation == "add":
-            supplier.current_balance += amount
-        elif operation == "subtract":
-            supplier.current_balance -= amount
-        elif operation == "set":
-            supplier.current_balance = amount
-        else:
-            return ServiceResponse.validation_error(
-                errors={"operation": "Invalid operation. Valid: add, subtract, set"}
-            )
-
-        supplier.save(update_fields=["current_balance", "updated_at"])
-
-        return ServiceResponse.success(data={
-            "current_balance": str(supplier.current_balance)
-        }, message="Balance updated")
 
 
 class SupplierStockItemService:

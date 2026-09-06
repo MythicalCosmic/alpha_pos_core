@@ -2,13 +2,32 @@ import logging
 from typing import Dict, Any, Optional, Tuple
 from decimal import Decimal
 from django.db import transaction
+from django.core.exceptions import ValidationError
 
 from base.helpers.response import ServiceResponse
 from stock.models import StockUnit, StockItemUnit
 from stock.services.base_service import to_decimal, round_decimal
 from stock.repositories import StockUnitRepository, StockItemUnitRepository
 
+from stock.services.conversions import convert_units
+
 logger = logging.getLogger(__name__)
+
+
+def _valid_conversion_factor(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        factor = StockUnit._meta.get_field('conversion_factor').clean(value, None)
+    except (ValidationError, TypeError, ValueError):
+        return None
+    return factor if factor.is_finite() and factor > 0 else None
+
+
+def _factor_error():
+    return ServiceResponse.validation_error(
+        errors={'conversion_factor': 'Must be a positive finite number within 9 integer and 6 decimal digits'},
+    )
 
 
 class StockUnitService:
@@ -180,6 +199,10 @@ class StockUnitService:
                     f"No base unit exists for {unit_type}. Create base unit first."
                 )
 
+        conversion_factor = _valid_conversion_factor(conversion_factor)
+        if conversion_factor is None:
+            return _factor_error()
+
         unit = StockUnitRepository.create(
             name=name,
             short_name=short_name,
@@ -212,6 +235,12 @@ class StockUnitService:
         if "unit_type" in kwargs and kwargs["unit_type"] != unit.unit_type:
             if unit.is_base_unit and StockUnitRepository.has_derived_units(unit):
                 return ServiceResponse.error("Cannot change type of base unit with derived units")
+
+        if 'conversion_factor' in kwargs:
+            factor = _valid_conversion_factor(kwargs['conversion_factor'])
+            if factor is None:
+                return _factor_error()
+            kwargs['conversion_factor'] = factor
 
         update_fields = []
         for field in ["name", "short_name", "conversion_factor", "decimal_places"]:
@@ -260,34 +289,7 @@ class StockUnitService:
         if not to_unit:
             return ServiceResponse.not_found(f"To unit with id {to_unit_id} not found")
 
-        if from_unit.unit_type != to_unit.unit_type:
-            return ServiceResponse.error(
-                f"Cannot convert between different types: {from_unit.unit_type} -> {to_unit.unit_type}"
-            )
-
-        quantity = to_decimal(quantity)
-
-        if from_unit.is_base_unit:
-            base_quantity = quantity
-        else:
-            base_quantity = quantity * from_unit.conversion_factor
-
-        if to_unit.is_base_unit:
-            result = base_quantity
-        else:
-            result = base_quantity / to_unit.conversion_factor
-
-        result = round_decimal(result, to_unit.decimal_places)
-
-        details = {
-            "from_quantity": str(quantity),
-            "from_unit": from_unit.short_name,
-            "to_quantity": str(result),
-            "to_unit": to_unit.short_name,
-            "base_quantity": str(round_decimal(base_quantity, 4)),
-        }
-
-        return result, details
+        return convert_units(quantity, from_unit, to_unit)
 
     @classmethod
     def to_base(cls, quantity: Decimal, unit_id: int):
@@ -350,55 +352,6 @@ class StockItemUnitService:
             "count": item_units.count()
         })
 
-    @classmethod
-    @transaction.atomic
-    def add_unit(cls,
-                 stock_item_id: int,
-                 unit_id: int,
-                 conversion_to_base: Decimal,
-                 is_default: bool = False,
-                 barcode: str = None) -> Tuple[Dict[str, Any], int]:
-        from stock.repositories import StockItemRepository
-
-        stock_item = StockItemRepository.get_by_id(stock_item_id)
-        if not stock_item:
-            return ServiceResponse.not_found(f"Stock item with id {stock_item_id} not found")
-
-        unit = StockUnitRepository.get_by_id(unit_id)
-        if not unit:
-            return ServiceResponse.not_found(f"Unit with id {unit_id} not found")
-
-        if StockItemUnitRepository.unit_exists_for_item(stock_item_id, unit_id):
-            return ServiceResponse.validation_error(
-                errors={"unit_id": "This unit is already added to the item"}
-            )
-
-        if is_default:
-            StockItemUnitRepository.clear_default(stock_item_id)
-
-        item_unit = StockItemUnitRepository.create(
-            stock_item_id=stock_item_id,
-            unit_id=unit_id,
-            conversion_to_base=to_decimal(conversion_to_base),
-            is_default=is_default,
-            barcode=barcode or "",
-        )
-
-        return ServiceResponse.success(data={
-            "id": item_unit.id,
-            "item_unit": cls.serialize(item_unit)
-        }, message="Unit added to item")
-
-    @classmethod
-    @transaction.atomic
-    def remove_unit(cls, item_unit_id: int) -> Tuple[Dict[str, Any], int]:
-        item_unit = StockItemUnitRepository.get_by_id(item_unit_id)
-        if not item_unit:
-            return ServiceResponse.not_found(f"Item unit with id {item_unit_id} not found")
-
-        item_unit.delete()
-
-        return ServiceResponse.success(message="Unit removed from item")
 
     @classmethod
     def convert_for_item(cls,

@@ -8,8 +8,7 @@ from django.utils import timezone
 
 from base.models import Session
 from base.repositories import SessionRepository
-from stock.models import StockLocation, StockUnit, VarianceReasonCode
-
+from stock.models import StockLevel, StockLocation, StockUnit, VarianceReasonCode
 
 pytestmark = pytest.mark.django_db
 
@@ -37,12 +36,14 @@ def admin_client(admin_user):
 def test_variance_code_detail_supports_edit_toggle_and_soft_delete(admin_client):
     created = admin_client.post(
         "/api/admins/stock/variance-codes/",
-        data=json.dumps({
-            "code": "damage_ui",
-            "name": "Damage from UI",
-            "requires_approval": False,
-            "is_active": False,
-        }),
+        data=json.dumps(
+            {
+                "code": "damage_ui",
+                "name": "Damage from UI",
+                "requires_approval": False,
+                "is_active": False,
+            }
+        ),
         content_type="application/json",
     )
     assert created.status_code == 201, created.content
@@ -53,40 +54,43 @@ def test_variance_code_detail_supports_edit_toggle_and_soft_delete(admin_client)
 
     updated = admin_client.put(
         f"/api/admins/stock/variance-codes/{code_id}/",
-        data=json.dumps({
-            "code": "damage_edit",
-            "name": "Edited damage",
-            "requires_approval": True,
-            "is_active": True,
-        }),
+        data=json.dumps(
+            {
+                "code": "damage_edit",
+                "name": "Edited damage",
+                "requires_approval": True,
+                "is_active": True,
+            }
+        ),
         content_type="application/json",
     )
     assert updated.status_code == 200, updated.content
     assert updated.json()["data"]["code"]["code"] == "DAMAGE_EDIT"
     assert updated.json()["data"]["code"]["is_active"] is True
 
-    deleted = admin_client.delete(
-        f"/api/admins/stock/variance-codes/{code_id}/"
-    )
+    deleted = admin_client.delete(f"/api/admins/stock/variance-codes/{code_id}/")
     assert deleted.status_code == 200, deleted.content
     reason.refresh_from_db()
     assert reason.is_deleted is True
     assert reason.is_active is False
-    assert admin_client.get(
-        f"/api/admins/stock/variance-codes/{code_id}/"
-    ).status_code == 404
+    assert (
+        admin_client.get(f"/api/admins/stock/variance-codes/{code_id}/").status_code
+        == 404
+    )
 
 
 def test_unit_create_safely_ignores_frontend_is_active(admin_client):
     response = admin_client.post(
         "/api/admins/stock/units/",
-        data=json.dumps({
-            "name": "Contract gram",
-            "short_name": "ct-g",
-            "unit_type": "WEIGHT",
-            "is_base_unit": True,
-            "is_active": False,
-        }),
+        data=json.dumps(
+            {
+                "name": "Contract gram",
+                "short_name": "ct-g",
+                "unit_type": "WEIGHT",
+                "is_base_unit": True,
+                "is_active": False,
+            }
+        ),
         content_type="application/json",
     )
 
@@ -118,18 +122,22 @@ def test_location_activate_route_restores_inactive_location(admin_client):
 
 
 def test_existing_purchase_order_receiving_route_calls_service(
-    admin_client, admin_user, monkeypatch,
+    admin_client,
+    admin_user,
+    monkeypatch,
 ):
     from stock.views import purchase_views
 
     captured = {}
 
     def fake_create(*, purchase_order_id, received_by_id, **payload):
-        captured.update({
-            "purchase_order_id": purchase_order_id,
-            "received_by_id": received_by_id,
-            "payload": payload,
-        })
+        captured.update(
+            {
+                "purchase_order_id": purchase_order_id,
+                "received_by_id": received_by_id,
+                "payload": payload,
+            }
+        )
         return {"success": True, "data": {"id": 99}}, 201
 
     monkeypatch.setattr(purchase_views.PurchaseReceivingService, "create", fake_create)
@@ -146,3 +154,49 @@ def test_existing_purchase_order_receiving_route_calls_service(
         "received_by_id": admin_user.id,
         "payload": {"notes": "received"},
     }
+
+
+def test_recipe_availability_endpoint_honors_location(admin_client, inventory_catalog):
+    c = inventory_catalog
+    StockLevel.objects.create(stock_item=c.ingredient, location=c.other, quantity=10000)
+    response = admin_client.get(
+        f"/api/admins/stock/recipes/{c.recipe.id}/availability/",
+        {"location_id": c.location.id},
+    )
+    assert response.status_code == 200, response.content
+    assert response.json()["data"]["ingredients"][0]["is_available"] is False
+
+
+@pytest.mark.parametrize("endpoint", ["cost", "availability"])
+@pytest.mark.parametrize("multiplier", ["abc", "NaN", "Infinity", "0", "-1", "1e9999"])
+def test_recipe_reads_reject_invalid_batch_multiplier(
+    admin_client, inventory_catalog, endpoint, multiplier
+):
+    response = admin_client.get(
+        f"/api/admins/stock/recipes/{inventory_catalog.recipe.id}/{endpoint}/",
+        {"batch_multiplier": multiplier},
+    )
+    assert response.status_code == 422, response.content
+    assert response.json()["success"] is False
+
+
+@pytest.mark.parametrize("location", ["abc", "0", str(2**63)])
+def test_recipe_availability_rejects_invalid_location(
+    admin_client, inventory_catalog, location
+):
+    response = admin_client.get(
+        f"/api/admins/stock/recipes/{inventory_catalog.recipe.id}/availability/",
+        {"location_id": location},
+    )
+    assert response.status_code == 422, response.content
+
+
+def test_recipe_cost_endpoint_preserves_fractional_batches(
+    admin_client, inventory_catalog
+):
+    response = admin_client.get(
+        f"/api/admins/stock/recipes/{inventory_catalog.recipe.id}/cost/",
+        {"batch_multiplier": "0.25"},
+    )
+    assert response.status_code == 200, response.content
+    assert float(response.json()["data"]["total_cost"]) == 500
