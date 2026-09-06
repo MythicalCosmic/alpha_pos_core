@@ -7,13 +7,14 @@ from django.test import RequestFactory
 
 from base.security.idempotency import idempotent
 
-pytestmark = pytest.mark.django_db
+pytestmark = pytest.mark.django_db(transaction=True)
 
 
 @pytest.mark.parametrize('body', [
     {'success': True, 'data': {'zz': 1, 'a': 2, 'amount': '10000.25'}},
     [{'zz': 1, 'a': 2}, {'total': '10000.25'}],
-], ids=['nested-object', 'array'])
+    None, False, 0, 'complete',
+], ids=['nested-object', 'array', 'null', 'false', 'zero', 'string'])
 def test_json_replay_preserves_body_bytes_after_database_round_trip(body):
     calls = []
 
