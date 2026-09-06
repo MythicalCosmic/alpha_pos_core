@@ -36,3 +36,6 @@ pytest
 Tests for each application live under that application's `tests` package.
 Financial, synchronization, authorization, and migration tests are regression
 contracts and must pass before either edition updates its submodule pointer.
+
+Stock module boundaries, quantity rules, and query budgets are documented in
+[stock/README.md](stock/README.md).

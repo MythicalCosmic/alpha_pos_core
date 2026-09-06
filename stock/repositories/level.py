@@ -7,6 +7,15 @@ class StockLevelRepository(BaseSyncRepository):
     model = StockLevel
 
     @classmethod
+    def available_quantities(cls, stock_item_ids, location_id=None):
+        levels = cls.model.objects.filter(stock_item_id__in=stock_item_ids, is_deleted=False)
+        if location_id is not None:
+            levels = levels.filter(location_id=location_id)
+        return dict(levels.order_by().values('stock_item_id').annotate(
+            available=Sum(F('quantity') - F('reserved_quantity')),
+        ).values_list('stock_item_id', 'available'))
+
+    @classmethod
     def get_for_item(cls, stock_item_id):
         return cls.model.objects.filter(
             stock_item_id=stock_item_id, is_deleted=False

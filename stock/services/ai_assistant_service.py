@@ -1,9 +1,10 @@
 from typing import Dict, Any, List
 from datetime import timedelta
+from decimal import Decimal
 import math
 import logging
 import time
-from django.db.models import Sum, Count, F, Q, Avg, Max
+from django.db.models import Sum, Count, F, Q, Avg, Max, Prefetch
 from django.db.models.functions import Abs, TruncHour, TruncWeek
 from django.utils import timezone
 import json
@@ -25,6 +26,8 @@ from base.services.refund_lines import (
     REFUND_EVENT_ALIAS, refund_item_events, refund_item_events_in_window,
     refund_line_quantity, refund_line_revenue,
 )
+from stock.services.base_service import round_decimal
+from stock.services.recipes.loading import load_recipe_children
 from stock.services.ai_context import (
     current_cash_register, resolve_ai_context, scope_branch,
     scope_location_owned, scope_optional_location_owned,
@@ -742,12 +745,16 @@ class AIStockAssistant:
         levels = scope_location_owned(levels, context)
 
         stock_items = []
+        available_by_item = {}
         total_value = 0
         low_stock = []
         out_of_stock = []
 
         for level in levels:
             item = level.stock_item
+            available_by_item[item.id] = available_by_item.get(item.id, Decimal('0')) + (
+                level.quantity - level.reserved_quantity
+            )
             qty = float(level.quantity)
             value = qty * float(item.avg_cost_price)
             total_value += value
@@ -850,13 +857,14 @@ class AIStockAssistant:
                 })
         forecasts.sort(key=lambda x: x["days_until_stockout"])
 
-        suppliers = Supplier.objects.filter(is_active=True, is_deleted=False)[:20]
+        suppliers = Supplier.objects.filter(is_active=True, is_deleted=False).prefetch_related(
+            Prefetch('stock_items', to_attr='_listed_items', queryset=SupplierStockItem.objects.filter(
+                is_deleted=False, stock_item__is_deleted=False, stock_item__is_active=True,
+            ).select_related('stock_item', 'unit').order_by('pk')[:10]),
+        )[:20]
         supplier_data = []
         for s in suppliers:
-            items = SupplierStockItem.objects.filter(
-                supplier=s, is_deleted=False,
-                stock_item__is_deleted=False, stock_item__is_active=True,
-            ).select_related("stock_item", "unit")[:10]
+            items = s._listed_items
             supplier_data.append({
                 "name": s.name,
                 "contact": s.contact_person,
@@ -890,26 +898,29 @@ class AIStockAssistant:
             is_deleted=False, is_active=True, is_active_version=True,
             output_item__is_deleted=False, output_item__is_active=True,
         ).select_related(
-            "output_item", "output_unit", "production_location",
+            "output_item__base_unit", "output_unit", "production_location",
         )
         recipes = scope_optional_location_owned(
             recipes, context, field='production_location',
         )[:15]
         from stock.services.recipe_service import RecipeService
         recipe_data = []
-        for r in recipes:
+        for r in load_recipe_children(recipes, include_cost=True):
             ingredients = []
             breakdown = RecipeService.ingredient_cost_breakdown(r)
-            total_cost = RecipeService.calculate_recipe_cost(r)
+            raw_cost = sum((row['cost'] for row in breakdown), Decimal('0'))
+            total_cost = round_decimal(raw_cost, 2)
+            required_by_item = {}
             for row in breakdown:
                 ing = row['ingredient']
-                available_levels = StockLevel.objects.filter(
-                    is_deleted=False, stock_item=ing.stock_item,
-                )
-                available_levels = scope_location_owned(available_levels, context)
-                avail = available_levels.aggregate(
-                    t=Sum(F("quantity") - F("reserved_quantity")),
-                )["t"] or 0
+                if not ing.is_optional:
+                    required_by_item[ing.stock_item_id] = required_by_item.get(
+                        ing.stock_item_id, Decimal('0'),
+                    ) + row['base_quantity']
+            for row in breakdown:
+                ing = row['ingredient']
+                avail = available_by_item.get(ing.stock_item_id, Decimal('0'))
+                required = row['base_quantity'] if ing.is_optional else required_by_item[ing.stock_item_id]
                 ingredients.append({
                     "item": ing.stock_item.name,
                     "qty": float(row['quantity_with_waste']),
@@ -920,11 +931,11 @@ class AIStockAssistant:
                     "optional": ing.is_optional,
                     "cost_uzs": float(row['cost']),
                     "available": float(avail),
-                    "enough": avail >= row['base_quantity'],
+                    "enough": avail >= required,
                 })
             effective_output = RecipeService.effective_output_quantity(r)
-            portion_cost = RecipeService.calculate_portion_cost(
-                r, quantity=1, unit_id=r.output_unit_id,
+            portion_cost = round_decimal(
+                raw_cost * RecipeService.output_portion_ratio(r, quantity=1, unit_id=r.output_unit_id), 2,
             )
             recipe_data.append({
                 "name": r.name,

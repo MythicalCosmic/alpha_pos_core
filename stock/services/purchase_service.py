@@ -10,7 +10,7 @@ from base.money import MoneyValueError, decimal_value, local_iso
 from stock.models import (
     PurchaseOrder, PurchaseOrderItem, PurchaseReceiving, PurchaseReceivingItem,
     PurchaseReceivingCorrection,
-    Supplier, SupplierStockItem, StockBatch, StockItem, StockItemUnit, StockSettings,
+    Supplier, StockBatch, StockItem, StockItemUnit, StockSettings,
     StockTransaction,
 )
 from stock.services.base_service import generate_number, round_decimal, to_decimal
@@ -310,54 +310,6 @@ class PurchaseOrderService:
             "order": cls.serialize(po)
         }, message=f"Purchase order {order_number} created")
 
-    @classmethod
-    @transaction.atomic
-    def create_from_low_stock(cls,
-                              supplier_id: int,
-                              delivery_location_id: int,
-                              created_by_id: int,
-                              reorder_quantity_multiplier: Decimal = Decimal("1")) -> Tuple[Dict[str, Any], int]:
-
-        supplier_items = SupplierStockItem.objects.filter(
-            supplier_id=supplier_id,
-            supplier__is_active=True
-        ).select_related("stock_item", "unit")
-
-        items_to_order = []
-
-        for si in supplier_items:
-            from .level_service import StockLevelService
-            available = StockLevelService.get_available(si.stock_item_id)
-
-            if available < si.stock_item.reorder_point:
-                shortage = si.stock_item.reorder_point - available
-                order_qty = max(shortage * reorder_quantity_multiplier, si.min_order_qty)
-
-                if si.pack_size > 1:
-                    packs_needed = (order_qty / si.pack_size).quantize(Decimal("1"), rounding="ROUND_UP")
-                    order_qty = packs_needed * si.pack_size
-
-                items_to_order.append({
-                    "stock_item_id": si.stock_item_id,
-                    "quantity": order_qty,
-                    "unit_id": si.unit_id,
-                    "unit_price": si.price,
-                })
-
-        if not items_to_order:
-            return ServiceResponse.success(data={
-                "created": False,
-                "reason": "No items below reorder point for this supplier"
-            })
-
-        return cls.create(
-            supplier_id=supplier_id,
-            delivery_location_id=delivery_location_id,
-            order_date=timezone.localdate(),
-            created_by_id=created_by_id,
-            items=items_to_order,
-            notes="Auto-generated from low stock"
-        )
 
     @classmethod
     @transaction.atomic
@@ -1617,34 +1569,3 @@ class PurchaseReceivingItemService:
             "id": item.id,
             "item": cls.serialize(item)
         }, message="Item added to receiving")
-
-    @classmethod
-    @transaction.atomic
-    def add_all_pending(cls, receiving_id: int) -> Tuple[Dict[str, Any], int]:
-        rcv = PurchaseReceivingRepository.get_by_id(receiving_id)
-        if not rcv:
-            return ServiceResponse.not_found("Receiving not found")
-
-        if rcv.status != PurchaseReceiving.Status.DRAFT:
-            return ServiceResponse.error("Cannot add items to completed receiving")
-
-        # Need purchase_order for items access
-        rcv = PurchaseReceiving.objects.select_related("purchase_order").get(id=rcv.id)
-
-        added = 0
-        for po_item in rcv.purchase_order.items.all():
-            pending = po_item.quantity_ordered - po_item.quantity_received
-            if pending > 0:
-                result, status = cls.add(
-                    receiving_id=receiving_id,
-                    po_item_id=po_item.id,
-                    quantity_received=pending,
-                    unit_cost=po_item.unit_price,
-                )
-                if status >= 400:
-                    return result, status
-                added += 1
-
-        return ServiceResponse.success(data={
-            "items_added": added
-        }, message=f"{added} items added to receiving")

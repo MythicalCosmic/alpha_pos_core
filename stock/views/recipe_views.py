@@ -1,10 +1,39 @@
+from decimal import Decimal, InvalidOperation
+
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
-from django.views.decorators.http import require_http_methods, require_GET, require_POST
-from base.helpers.request import parse_json_body, safe_page, safe_per_page, safe_int
-from base.helpers.response import json_response
+from django.views.decorators.http import require_GET, require_http_methods, require_POST
+
+from base.helpers.request import (
+    MAX_QUANTITY,
+    coerce_positive_id,
+    parse_json_body,
+    safe_int,
+    safe_page,
+    safe_per_page,
+)
+from base.helpers.response import ServiceResponse, json_response
 from base.security.permissions import admin_required
-from stock.services import RecipeService, RecipeIngredientService
+from stock.services import RecipeIngredientService, RecipeService
+
+
+def _batch_multiplier(request):
+    raw = request.GET.get("batch_multiplier", "1")
+    try:
+        multiplier = Decimal(raw) if len(raw) <= 64 else None
+    except InvalidOperation:
+        multiplier = None
+    if (
+        multiplier is None
+        or not multiplier.is_finite()
+        or not 0 < multiplier <= MAX_QUANTITY
+    ):
+        return None, ServiceResponse.validation_error(
+            errors={
+                "batch_multiplier": f"Must be positive, finite, and at most {MAX_QUANTITY}",
+            }
+        )
+    return multiplier, None
 
 
 @csrf_exempt
@@ -19,7 +48,8 @@ def recipes(request):
             recipe_type=request.GET.get("recipe_type"),
             output_item_id=safe_int(request, "output_item_id"),
             active_only=request.GET.get("active_only", "true").lower() == "true",
-            active_version_only=request.GET.get("active_version_only", "true").lower() == "true",
+            active_version_only=request.GET.get("active_version_only", "true").lower()
+            == "true",
             production_location_id=safe_int(request, "production_location_id"),
         )
         return JsonResponse(result, status=status)
@@ -60,9 +90,9 @@ def recipe_detail(request, recipe_id):
 @require_GET
 @admin_required
 def recipe_cost(request, recipe_id):
-    from decimal import Decimal
-
-    batch_multiplier = Decimal(request.GET.get("batch_multiplier", "1"))
+    batch_multiplier, error = _batch_multiplier(request)
+    if error:
+        return json_response(error)
     total_cost = RecipeService.calculate_cost(recipe_id, batch_multiplier)
     return JsonResponse(
         {"success": True, "data": {"total_cost": str(total_cost)}},
@@ -74,10 +104,25 @@ def recipe_cost(request, recipe_id):
 @require_GET
 @admin_required
 def recipe_availability(request, recipe_id):
-    from decimal import Decimal
-
-    batch_multiplier = Decimal(request.GET.get("batch_multiplier", "1"))
-    result, status = RecipeService.check_availability(recipe_id, batch_multiplier=batch_multiplier)
+    batch_multiplier, error = _batch_multiplier(request)
+    if error:
+        return json_response(error)
+    location_id = None
+    if "location_id" in request.GET:
+        location_id = coerce_positive_id(request.GET["location_id"])
+        if location_id is None:
+            return json_response(
+                ServiceResponse.validation_error(
+                    errors={
+                        "location_id": "Must be a positive integer ID",
+                    }
+                )
+            )
+    result, status = RecipeService.check_availability(
+        recipe_id,
+        batch_multiplier=batch_multiplier,
+        location_id=location_id,
+    )
     return JsonResponse(result, status=status)
 
 

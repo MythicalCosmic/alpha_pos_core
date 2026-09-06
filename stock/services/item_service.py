@@ -1,7 +1,7 @@
 from typing import Dict, Any, Tuple
 from decimal import Decimal
 from django.db import transaction
-from django.db.models import Q, Sum, F
+from django.db.models import F, Prefetch
 
 from base.helpers.response import ServiceResponse
 from stock.models import StockItem
@@ -65,9 +65,12 @@ class StockItemService:
         }
 
         if include_levels:
-            levels_query = StockLevelRepository.filter(stock_item=item)
-            if location_id:
-                levels_query = levels_query.filter(location_id=location_id)
+            levels = getattr(item, '_listed_stock_levels', None)
+            if levels is None:
+                levels_query = StockLevelRepository.filter(stock_item=item)
+                if location_id is not None:
+                    levels_query = levels_query.filter(location_id=location_id)
+                levels = list(levels_query.select_related('location'))
 
             data["stock_levels"] = [
                 {
@@ -79,15 +82,11 @@ class StockItemService:
                     "pending_in": str(lvl.pending_in_quantity),
                     "pending_out": str(lvl.pending_out_quantity),
                 }
-                for lvl in levels_query.select_related("location")
+                for lvl in levels
             ]
 
-            totals = levels_query.aggregate(
-                total=Sum("quantity"),
-                reserved=Sum("reserved_quantity")
-            )
-            data["total_stock"] = str(totals["total"] or 0)
-            data["total_reserved"] = str(totals["reserved"] or 0)
+            data['total_stock'] = str(sum((lvl.quantity for lvl in levels), Decimal('0')) or 0)
+            data['total_reserved'] = str(sum((lvl.reserved_quantity for lvl in levels), Decimal('0')) or 0)
 
         if include_units:
             data["alternative_units"] = [
@@ -173,22 +172,27 @@ class StockItemService:
                 )
             queryset = queryset.filter(item_type=item_type)
 
-        if purchasable_only:
+        if purchasable_only or is_purchasable:
             queryset = queryset.filter(is_purchasable=True)
 
-        if sellable_only:
+        if sellable_only or is_sellable:
             queryset = queryset.filter(is_sellable=True)
 
-        if producible_only:
+        if producible_only or is_producible:
             queryset = queryset.filter(is_producible=True)
 
-        if low_stock:
-            queryset = queryset.annotate(
-                total_qty=Sum("stock_levels__quantity")
-            ).filter(
-                Q(total_qty__lt=F("reorder_point")) |
-                Q(total_qty__isnull=True)
+        if low_stock or low_stock_only:
+            queryset = StockItemRepository.with_stock_totals(queryset, location_id).filter(
+                total_qty__lt=F('reorder_point'),
             )
+
+        if include_levels:
+            levels = StockLevelRepository.get_all().select_related('location')
+            if location_id is not None:
+                levels = levels.filter(location_id=location_id)
+            queryset = queryset.prefetch_related(Prefetch(
+                'stock_levels', queryset=levels, to_attr='_listed_stock_levels',
+            ))
 
         queryset = queryset.order_by("name")
 

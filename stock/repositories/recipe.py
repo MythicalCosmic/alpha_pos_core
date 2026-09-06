@@ -37,13 +37,6 @@ class RecipeRepository(BaseSyncRepository):
             qs = qs.exclude(id=exclude_id)
         return qs.exists()
 
-    @classmethod
-    def get_versions(cls, recipe):
-        root = recipe.parent_recipe or recipe
-        return cls.model.objects.filter(
-            Q(id=root.id) | Q(parent_recipe=root),
-            is_deleted=False,
-        ).order_by('-version')
 
     @classmethod
     def deactivate_other_versions(cls, recipe):
@@ -54,17 +47,6 @@ class RecipeRepository(BaseSyncRepository):
         ).exclude(id=recipe.id)
         return cls.sync_update_queryset(qs, is_active_version=False)
 
-    @classmethod
-    def get_next_code_seq(cls, prefix):
-        last = cls.model.objects.filter(
-            code__startswith=prefix, is_deleted=False
-        ).order_by('-code').first()
-        if last and last.code:
-            try:
-                return int(last.code.split('-')[-1]) + 1
-            except (ValueError, IndexError):
-                pass
-        return 1
 
     @classmethod
     def search(cls, queryset, query):
@@ -82,7 +64,7 @@ class RecipeIngredientRepository(BaseSyncRepository):
     def get_for_recipe(cls, recipe_id):
         return cls.model.objects.filter(
             recipe_id=recipe_id, is_deleted=False
-        ).select_related('stock_item', 'unit').order_by('sort_order')
+        ).select_related('stock_item__base_unit', 'unit').order_by('sort_order')
 
     @classmethod
     def reorder(cls, recipe_id, ordered_ids):

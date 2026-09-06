@@ -6,10 +6,11 @@ from base.helpers.response import ServiceResponse
 from stock.services.base_service import to_decimal
 from stock.repositories import (
     StockTransactionRepository,
-    StockSettingsRepository,
+    StockSettingsRepository, StockLevelRepository,
 )
 from .level_service import StockLevelService
 from .product_link_service import ProductStockLinkService
+from .conversions import UnitConversions
 
 
 class OrderStockService:
@@ -233,67 +234,63 @@ class OrderStockService:
         }, message=f"Reversed {len(reversals)} stock deduction(s)")
 
     @classmethod
-    def check_availability(cls,
-                           order_items: List[Dict],
-                           location_id: int) -> Tuple[Dict[str, Any], int]:
-        settings = StockSettingsRepository.load()
-
-        if not settings.stock_enabled:
-            return ServiceResponse.success(data={
-                "all_available": True,
-                "stock_disabled": True
-            })
-
-        results = []
-        all_available = True
-
+    def _base_requirements(cls, order_items):
+        plans = []
         for order_item in order_items:
-            product_id = order_item["product_id"]
-            quantity = to_decimal(order_item.get("quantity", 1))
-
-            deduction_items = ProductStockLinkService.get_deduction_items(
-                product_id, quantity, modifiers=order_item.get("modifiers", []),
+            deductions = ProductStockLinkService.get_deduction_items(
+                order_item['product_id'], to_decimal(order_item.get('quantity', 1)),
+                modifiers=order_item.get('modifiers', []),
             )
+            plans.append((order_item['product_id'], [dict(row) for row in deductions]))
+        rows = [row for _, requirements in plans for row in requirements]
+        conversions = UnitConversions.for_requirements(rows)
+        for row in rows:
+            item_id = row['stock_item_id']
+            row['quantity'] = conversions.convert(item_id, row['quantity'], row.get('unit_id'))
+            item = conversions.items.get(item_id)
+            row['unit_id'] = item.base_unit_id if item else None
+        return plans
 
-            if not deduction_items:
-                results.append({
-                    "product_id": product_id,
-                    "available": True,
-                    "not_linked": True
-                })
+    @classmethod
+    def check_availability(cls, order_items: List[Dict], location_id: int) -> Tuple[Dict[str, Any], int]:
+        settings = StockSettingsRepository.load()
+        if not settings.stock_enabled:
+            return ServiceResponse.success(data={'all_available': True, 'stock_disabled': True})
+
+        plans = cls._base_requirements(order_items)
+        totals = {}
+        for _, requirements in plans:
+            for row in requirements:
+                item_id = row['stock_item_id']
+                totals[item_id] = totals.get(item_id, Decimal('0')) + row['quantity']
+        available = StockLevelRepository.available_quantities(totals, location_id)
+        results = []
+        for product_id, requirements in plans:
+            if not requirements:
+                results.append({'product_id': product_id, 'available': True, 'not_linked': True})
                 continue
-
-            product_available = True
             shortages = []
-
-            for item in deduction_items:
-                available = StockLevelService.get_available(
-                    stock_item_id=item["stock_item_id"],
-                    location_id=location_id
-                )
-
-                required = item["quantity"]
-
-                if required > available:
-                    product_available = False
-                    all_available = False
+            seen = set()
+            for row in requirements:
+                item_id = row['stock_item_id']
+                if item_id in seen:
+                    continue
+                seen.add(item_id)
+                required = totals[item_id]
+                on_hand = available.get(item_id, Decimal('0'))
+                if required > on_hand:
                     shortages.append({
-                        "stock_item_id": item["stock_item_id"],
-                        "required": str(required),
-                        "available": str(available),
-                        "shortage": str(required - available)
+                        'stock_item_id': item_id, 'unit_id': row['unit_id'],
+                        'required': str(required), 'available': str(on_hand),
+                        'shortage': str(required - on_hand),
                     })
-
             results.append({
-                "product_id": product_id,
-                "available": product_available,
-                "shortages": shortages if shortages else None
+                'product_id': product_id, 'available': not shortages,
+                'shortages': shortages or None,
             })
-
         return ServiceResponse.success(data={
-            "all_available": all_available,
-            "allow_negative": settings.allow_negative_stock,
-            "items": results
+            'all_available': all(row['available'] for row in results),
+            'allow_negative': settings.allow_negative_stock, 'items': results,
         })
 
     @classmethod
@@ -312,40 +309,22 @@ class OrderStockService:
                 "reason": "Reservation not enabled"
             })
 
+        totals = {}
+        for _, requirements in cls._base_requirements(order_items):
+            for row in requirements:
+                item_id = row['stock_item_id']
+                totals[item_id] = totals.get(item_id, Decimal('0')) + row['quantity']
         reservations = []
-
-        for order_item in order_items:
-            product_id = order_item["product_id"]
-            quantity = to_decimal(order_item.get("quantity", 1))
-
-            deduction_items = ProductStockLinkService.get_deduction_items(
-                product_id, quantity, modifiers=order_item.get("modifiers", []),
+        # Use one reservation per item and a stable lock order across orders.
+        for stock_item_id, quantity in sorted(totals.items()):
+            result, status = StockLevelService.reserve(
+                stock_item_id=stock_item_id, location_id=location_id, quantity=quantity,
+                user_id=user_id, reference_type='Order', reference_id=order_id,
             )
-
-            for item in deduction_items:
-                result, status = StockLevelService.reserve(
-                    stock_item_id=item["stock_item_id"],
-                    location_id=location_id,
-                    quantity=item["quantity"],
-                    user_id=user_id,
-                    reference_type="Order",
-                    reference_id=order_id
-                )
-
-                # Previously the (result, status) was discarded and every item
-                # was appended as if reserved — so an insufficient-stock failure
-                # was reported as success and the order proceeded against stock
-                # that was never actually held (oversell). Mirror
-                # deduct_for_order: roll the whole reservation back and surface
-                # the error so the caller can refuse the order.
-                if status >= 400:
-                    transaction.set_rollback(True)
-                    return result, status
-
-                reservations.append({
-                    "stock_item_id": item["stock_item_id"],
-                    "quantity": str(item["quantity"])
-                })
+            if status >= 400:
+                transaction.set_rollback(True)
+                return result, status
+            reservations.append({'stock_item_id': stock_item_id, 'quantity': str(quantity)})
 
         return ServiceResponse.success(data={
             "order_id": order_id,

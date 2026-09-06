@@ -57,18 +57,6 @@ class StockItemUnitRepository(BaseSyncRepository):
             stock_item_id=stock_item_id, is_deleted=False
         ).select_related('unit')
 
-    @classmethod
-    def unit_exists_for_item(cls, stock_item_id, unit_id):
-        return cls.model.objects.filter(
-            stock_item_id=stock_item_id, unit_id=unit_id, is_deleted=False
-        ).exists()
-
-    @classmethod
-    def clear_default(cls, stock_item_id):
-        qs = cls.model.objects.filter(
-            stock_item_id=stock_item_id, is_default=True
-        )
-        return cls.sync_update_queryset(qs, is_default=False)
 
     @classmethod
     def get_by_item_and_unit(cls, stock_item_id, unit_id):

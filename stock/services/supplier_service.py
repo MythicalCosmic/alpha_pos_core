@@ -329,15 +329,6 @@ class SupplierService:
             "supplier": cls.serialize(supplier)
         }, message="Supplier activated")
 
-    @classmethod
-    @transaction.atomic
-    def update_balance(cls, supplier_id: int, amount: Decimal, operation: str = "add") -> Tuple[Dict[str, Any], int]:
-        return ServiceResponse.failure(
-            'UNFUNDED_PAYMENT_ROUTE_RETIRED',
-            'Supplier balances may change only through the append-only ledger.',
-            410,
-            details={'supplier_id': supplier_id},
-        )
 
 
 class SupplierStockItemService:
