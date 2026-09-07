@@ -22,6 +22,36 @@ from stock.services import SupplierService, SupplierStockItemService
 
 
 @csrf_exempt
+@require_http_methods(['GET', 'POST'])
+@backoffice_required
+def supplier_opening_balance(request, supplier_id):
+    from stock.services.supplier_opening_balance import SupplierOpeningBalanceService
+    if request.method == 'GET':
+        result, status = SupplierOpeningBalanceService.review(supplier_id, actor=request.user)
+        return JsonResponse(result, status=status)
+    return _register_supplier_opening_balance(request, supplier_id)
+
+
+@backoffice_permission_required('stock.supplier.opening.manage')
+@idempotent('stock.supplier.opening', required=True, expose_action_id=True, recover_inflight_after_seconds=5)
+def _register_supplier_opening_balance(request, supplier_id):
+    from base.helpers.response import ServiceResponse
+    from stock.services.purchase_invoices import json_numbers
+    from stock.services.supplier_opening_balance import SupplierOpeningBalanceService
+    try:
+        data = json_numbers.loads(request.body)
+    except json_numbers.InvalidNumbers as exc:
+        return json_response(ServiceResponse.validation_error(exc.errors))
+    except (ValueError, TypeError, UnicodeDecodeError):
+        return json_response(ServiceResponse.validation_error({'body': ['Provide valid JSON using plain, finite numbers.']}))
+    result, status = SupplierOpeningBalanceService.register(
+        supplier_id, actor=request.user, payload=data,
+        action_id=getattr(request, 'idempotency_action_id', None),
+    )
+    return JsonResponse(result, status=status)
+
+
+@csrf_exempt
 @require_http_methods(["GET", "POST"])
 @backoffice_required
 def suppliers(request):

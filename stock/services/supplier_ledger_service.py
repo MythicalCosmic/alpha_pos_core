@@ -284,7 +284,7 @@ class SupplierPaymentService:
             ).select_related(
                 'supplier', 'supplier_transaction', 'treasury_transaction',
                 'performed_by',
-            ).prefetch_related('allocations__purchase_order').first()
+            ).prefetch_related('allocations__purchase_order', 'allocations__opening_balance').first()
             if existing:
                 return ServiceResponse.created(data=cls.serialize(existing))
         try:
@@ -336,7 +336,7 @@ class SupplierPaymentService:
             ).select_related(
                 'supplier', 'supplier_transaction', 'treasury_transaction',
                 'performed_by',
-            ).prefetch_related('allocations__purchase_order').first()
+            ).prefetch_related('allocations__purchase_order', 'allocations__opening_balance').first()
             if existing:
                 return ServiceResponse.created(data=cls.serialize(existing))
         if supplier.currency != 'UZS':
@@ -357,6 +357,16 @@ class SupplierPaymentService:
                     'payable_uzs': uzs_int(max(payable, Decimal('0'))),
                     'requested_uzs': uzs_int(principal),
                 },
+            )
+
+        from .supplier_integrity import validate_supplier_ledgers
+        evidence = validate_supplier_ledgers([supplier])[supplier.id]
+        if not evidence.valid:
+            has_history = SupplierTransaction.objects.filter(supplier=supplier).exists()
+            return ServiceResponse.conflict(
+                'SUPPLIER_LEDGER_RECONCILIATION_REQUIRED' if has_history else 'SUPPLIER_OPENING_BALANCE_REVIEW_REQUIRED',
+                'Supplier ledger history must be reconciled before payment.' if has_history else 'This balance has no recorded debt history. Review and register the opening debt before payment.',
+                details={'supplier_id': supplier.id, 'stored_balance_uzs': uzs_int(payable), 'ledger_balance_uzs': uzs_int(evidence.ledger_balance)},
             )
 
         parsed_allocations, allocation_error = cls._parse_allocations(
@@ -421,28 +431,38 @@ class SupplierPaymentService:
             performed_by=actor,
             actor_display_snapshot=_actor_name(actor),
         )
-        for po, amount in parsed_allocations:
-            SupplierPaymentAllocation.objects.create(
+        from .supplier_opening_balance import opening_remaining
+        for target, amount in parsed_allocations:
+            is_opening = isinstance(target, SupplierTransaction)
+            allocation = SupplierPaymentAllocation.objects.create(
                 payment=payment,
-                purchase_order=po,
+                purchase_order=None if is_opening else target,
+                opening_balance=target if is_opening else None,
                 amount_uzs=amount,
                 payment_status_snapshot=PurchaseOrder.PaymentStatus.UNPAID,
                 remaining_uzs_snapshot=Decimal('0'),
             )
-            cls._refresh_purchase_order(po)
-            allocation = payment.allocations.get(purchase_order=po)
-            allocation.payment_status_snapshot = po.payment_status
-            allocation.remaining_uzs_snapshot = max(
-                cls._received_principal(po) - po.amount_paid,
-                Decimal('0'),
-            )
+            if is_opening:
+                remaining = opening_remaining(target)
+                allocation.remaining_uzs_snapshot = remaining
+                allocation.payment_status_snapshot = (
+                    PurchaseOrder.PaymentStatus.PAID if remaining == 0
+                    else PurchaseOrder.PaymentStatus.PARTIAL
+                )
+            else:
+                cls._refresh_purchase_order(target)
+                allocation.payment_status_snapshot = target.payment_status
+                allocation.remaining_uzs_snapshot = max(
+                    cls._received_principal(target) - target.amount_paid,
+                    Decimal('0'),
+                )
             allocation.save(update_fields=[
                 'payment_status_snapshot', 'remaining_uzs_snapshot',
             ])
         payment = SupplierPayment.objects.select_related(
             'supplier', 'supplier_transaction', 'treasury_transaction',
             'performed_by',
-        ).prefetch_related('allocations__purchase_order').get(pk=payment.pk)
+        ).prefetch_related('allocations__purchase_order', 'allocations__opening_balance').get(pk=payment.pk)
         return ServiceResponse.created(data=cls.serialize(payment))
 
     @classmethod
@@ -502,7 +522,7 @@ class SupplierPaymentService:
             )
 
         purchase_order_ids = list(
-            SupplierPaymentAllocation.objects.filter(payment=payment)
+            SupplierPaymentAllocation.objects.filter(payment=payment, purchase_order__isnull=False)
             .order_by('purchase_order_id')
             .values_list('purchase_order_id', flat=True)
         )
@@ -562,7 +582,7 @@ class SupplierPaymentService:
             'supplier', 'supplier_transaction', 'treasury_transaction',
             'treasury_reversal', 'supplier_reversal', 'performed_by',
             'reversed_by',
-        ).prefetch_related('allocations__purchase_order').get(pk=payment.pk)
+        ).prefetch_related('allocations__purchase_order', 'allocations__opening_balance').get(pk=payment.pk)
         return ServiceResponse.success(data=cls.serialize(payment))
 
     @classmethod
@@ -582,7 +602,7 @@ class SupplierPaymentService:
             'supplier', 'supplier_transaction', 'treasury_transaction',
             'treasury_reversal', 'supplier_reversal', 'performed_by',
             'reversed_by',
-        ).prefetch_related('allocations__purchase_order')
+        ).prefetch_related('allocations__purchase_order', 'allocations__opening_balance')
         if supplier_id is not None:
             queryset = queryset.filter(supplier_id=supplier_id)
         payment = queryset.first()
@@ -590,102 +610,10 @@ class SupplierPaymentService:
             return ServiceResponse.not_found('Supplier payment not found')
         return ServiceResponse.success(data=cls.serialize(payment))
 
-    @classmethod
-    def _parse_allocations(cls, supplier, principal, mode, allocations):
-        if mode == SupplierPayment.AllocationMode.EXPLICIT:
-            if not isinstance(allocations, list) or not allocations:
-                return None, ServiceResponse.validation_error({
-                    'allocations': ['At least one allocation is required.'],
-                })
-            parsed = {}
-            errors = {}
-            for index, value in enumerate(allocations):
-                try:
-                    po_id = int(value.get('purchase_order_id'))
-                    if isinstance(value.get('purchase_order_id'), bool) or po_id <= 0:
-                        raise ValueError
-                except (AttributeError, TypeError, ValueError):
-                    errors[f'allocations.{index}.purchase_order_id'] = [
-                        'Use a positive integer.',
-                    ]
-                    continue
-                if po_id in parsed:
-                    errors[f'allocations.{index}.purchase_order_id'] = [
-                        'Each purchase order may appear once.',
-                    ]
-                    continue
-                try:
-                    amount = whole_uzs(
-                        value.get('amount_uzs'),
-                        f'allocations.{index}.amount_uzs',
-                        positive=True,
-                    )
-                except MoneyValueError as exc:
-                    errors[f'allocations.{index}.amount_uzs'] = [str(exc)]
-                    continue
-                parsed[po_id] = amount
-            if errors:
-                return None, ServiceResponse.validation_error(errors)
-            if sum(parsed.values(), Decimal('0')) != principal:
-                return None, ServiceResponse.validation_error({
-                    'allocations': ['Allocation total must equal amount_uzs.'],
-                })
-            rows = list(PurchaseOrder.objects.select_for_update().filter(
-                pk__in=sorted(parsed),
-                supplier=supplier,
-                branch_id=supplier.branch_id,
-                is_deleted=False,
-            ).order_by('pk'))
-            if len(rows) != len(parsed):
-                return None, ServiceResponse.validation_error({
-                    'allocations': ['A purchase order is missing or belongs elsewhere.'],
-                })
-            output = []
-            for po in rows:
-                error = cls._allocation_error(po, parsed[po.id])
-                if error:
-                    return None, error
-                output.append((po, parsed[po.id]))
-            return output, None
-
-        rows = list(PurchaseOrder.objects.select_for_update().filter(
-            supplier=supplier,
-            branch_id=supplier.branch_id,
-            is_deleted=False,
-        ).exclude(
-            status=PurchaseOrder.Status.CANCELED,
-        ).order_by('pk'))
-        rows.sort(key=lambda po: (
-            po.payment_due_date is None,
-            po.payment_due_date or timezone.now(),
-            po.id,
-        ))
-        remaining = principal
-        output = []
-        for po in rows:
-            canonical_paid = cls._canonical_paid(po)
-            if canonical_paid != po.amount_paid:
-                continue
-            available = max(
-                cls._received_principal(po) - canonical_paid,
-                Decimal('0'),
-            )
-            if available <= 0:
-                continue
-            amount = min(remaining, available)
-            output.append((po, amount))
-            remaining -= amount
-            if remaining == 0:
-                break
-        if remaining:
-            return None, ServiceResponse.failure(
-                'SUPPLIER_PAYMENT_ALLOCATION_INCOMPLETE',
-                'Open purchase orders cannot fully allocate this payment.',
-                422,
-                errors={'allocations': ['Unallocated principal remains.']},
-                details={'unallocated_uzs': uzs_int(remaining)},
-            )
-        return output, None
+    @staticmethod
+    def _parse_allocations(supplier, principal, mode, allocations):
+        from .supplier_allocations import plan_allocations
+        return plan_allocations(supplier, principal, mode, allocations)
 
     @classmethod
     def _allocation_error(cls, po, amount):
@@ -726,18 +654,34 @@ class SupplierPaymentService:
 
     @staticmethod
     def _received_principal(po):
+        from stock.models import PurchaseReceivingCorrection
+
         receiving_ids = PurchaseReceiving.objects.filter(
             purchase_order=po,
             status=PurchaseReceiving.Status.COMPLETED,
             is_deleted=False,
+            branch_id=po.branch_id,
+            reversed_at__isnull=True,
         ).values_list('id', flat=True)
-        return SupplierTransaction.objects.filter(
+        received = SupplierTransaction.objects.filter(
             supplier=po.supplier,
+            branch_id=po.branch_id,
             type=SupplierTransaction.Type.PURCHASE,
             reference_type='PurchaseReceiving',
             reference_id__in=receiving_ids,
             is_deleted=False,
         ).aggregate(total=Sum('amount'))['total'] or Decimal('0')
+        correction_ids = PurchaseReceivingCorrection.objects.filter(
+            receiving_id__in=receiving_ids, status='APPROVED',
+            is_deleted=False, branch_id=po.branch_id,
+        ).values_list('id', flat=True)
+        returned = SupplierTransaction.objects.filter(
+            supplier=po.supplier, branch_id=po.branch_id,
+            type=SupplierTransaction.Type.RETURN,
+            reference_type='PurchaseReceivingCorrection',
+            reference_id__in=correction_ids, is_deleted=False,
+        ).aggregate(total=Sum('amount'))['total'] or Decimal('0')
+        return max(received - returned, Decimal('0'))
 
     @classmethod
     def _refresh_purchase_order(cls, po):
@@ -758,6 +702,8 @@ class SupplierPaymentService:
             'amount_uzs': uzs_int(row.amount_uzs),
             'payment_status': row.payment_status_snapshot,
             'remaining_uzs': uzs_int(row.remaining_uzs_snapshot),
+            **({'allocation_type': 'OPENING_BALANCE', 'opening_balance_id': row.opening_balance_id}
+               if row.opening_balance_id else {}),
         } for row in payment.allocations.all()]
         actions = [{
             'action': 'POSTED',

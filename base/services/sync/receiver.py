@@ -1397,8 +1397,9 @@ class CloudReceiver:
         }
         invoice_existing = model_class._base_manager.filter(uuid=uuid_val).first() if invoice_guarded else None
         if invoice_guarded and branch_write_forbidden(model_class, data, existing=invoice_existing):
-            return _rejected(invoice_existing, 'INVOICE_COMMAND_REQUIRED',
-                             'Direct invoices can only be changed by an authorized invoice command')
+            return _rejected(invoice_existing,
+                             'SUPPLIER_OPENING_COMMAND_REQUIRED' if model_class._meta.label_lower == 'stock.suppliertransaction' and not data.get('invoice_posting_id') else 'INVOICE_COMMAND_REQUIRED',
+                             'Protected debt records require an authorized admin command')
 
         # Models exposed with global pull scope are cloud-owned identities and
         # reference/catalog configuration. A branch token may consume them but
@@ -1573,8 +1574,9 @@ class CloudReceiver:
             try:
                 instance = model_class.objects.select_for_update().get(uuid=uuid_val)
                 if invoice_guarded and branch_write_forbidden(model_class, data, existing=instance):
-                    return _rejected(instance, 'INVOICE_COMMAND_REQUIRED',
-                                     'Direct invoices can only be changed by an authorized invoice command')
+                    return _rejected(instance,
+                                     'SUPPLIER_OPENING_COMMAND_REQUIRED' if model_class._meta.label_lower == 'stock.suppliertransaction' and not data.get('invoice_posting_id') else 'INVOICE_COMMAND_REQUIRED',
+                                     'Protected debt records require an authorized admin command')
                 force_shift_close = False
                 prior_sync_version = instance.sync_version
                 _verify_locked_financial_target(

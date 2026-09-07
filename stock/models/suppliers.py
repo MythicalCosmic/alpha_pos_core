@@ -76,6 +76,8 @@ class SupplierTransaction(SyncMixin, models.Model):
         DRAWER = 'DRAWER', 'Shift drawer'
 
     invoice_posting_id = models.UUIDField(null=True, blank=True, unique=True)
+    opening_balance_date = models.DateField(null=True, blank=True)
+    opening_balance_manifest = models.JSONField(default=dict, blank=True)
     supplier = models.ForeignKey(
         Supplier, on_delete=models.CASCADE, related_name='ledger',
     )
@@ -107,11 +109,26 @@ class SupplierTransaction(SyncMixin, models.Model):
 
     class Meta:
         ordering = ['-created_at']
-        constraints = [models.UniqueConstraint(
-            fields=['branch_id', 'reference_type', 'reference_id', 'type'],
-            condition=models.Q(invoice_posting_id__isnull=False),
-            name='uniq_supplier_invoice_ledger_reference',
-        )]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['branch_id', 'reference_type', 'reference_id', 'type'],
+                condition=models.Q(invoice_posting_id__isnull=False),
+                name='uniq_supplier_invoice_ledger_reference',
+            ),
+            models.UniqueConstraint(
+                fields=['supplier'],
+                condition=models.Q(reference_type='SupplierOpeningBalance'),
+                name='uniq_supplier_opening_balance',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~models.Q(reference_type='SupplierOpeningBalance')
+                    | (models.Q(type='ADJUSTMENT', opening_balance_date__isnull=False)
+                       & ~models.Q(opening_balance_manifest={}))
+                ),
+                name='supplier_opening_balance_has_evidence',
+            ),
+        ]
         indexes = [
             models.Index(fields=['supplier', 'type', 'created_at']),
             models.Index(fields=['branch_id', 'reference_type', 'reference_id']),
@@ -239,7 +256,11 @@ class SupplierPaymentAllocation(models.Model):
     )
     purchase_order = models.ForeignKey(
         'stock.PurchaseOrder', on_delete=models.PROTECT,
-        related_name='payment_allocations',
+        related_name='payment_allocations', null=True, blank=True,
+    )
+    opening_balance = models.ForeignKey(
+        SupplierTransaction, on_delete=models.PROTECT,
+        related_name='opening_payment_allocations', null=True, blank=True,
     )
     amount_uzs = models.DecimalField(max_digits=15, decimal_places=2)
     payment_status_snapshot = models.CharField(max_length=20)
@@ -252,6 +273,17 @@ class SupplierPaymentAllocation(models.Model):
             models.UniqueConstraint(
                 fields=['payment', 'purchase_order'],
                 name='uniq_supplier_payment_purchase_order',
+            ),
+            models.UniqueConstraint(
+                fields=['payment', 'opening_balance'],
+                name='uniq_supplier_payment_opening_balance',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(purchase_order__isnull=False, opening_balance__isnull=True)
+                    | models.Q(purchase_order__isnull=True, opening_balance__isnull=False)
+                ),
+                name='supplier_allocation_one_debt_target',
             ),
         ]
 

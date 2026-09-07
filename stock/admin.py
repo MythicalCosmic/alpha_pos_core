@@ -88,6 +88,7 @@ class ProductComponentStockAdmin(admin.ModelAdmin):
 
 @admin.register(Supplier)
 class SupplierAdmin(admin.ModelAdmin):
+    readonly_fields = ('current_balance',)
     list_display = ('id', 'name', 'contact_person', 'phone', 'is_active')
     list_filter = ('is_active',)
     search_fields = ('name', 'contact_person', 'phone')

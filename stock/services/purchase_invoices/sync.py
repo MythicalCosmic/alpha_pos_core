@@ -23,7 +23,13 @@ def branch_write_forbidden(model, data, *, existing=None):
             or getattr(existing, "source_type", None) == "DIRECT_INVOICE"
         )
     if label == "stock.suppliertransaction":
-        return bool(data.get("invoice_posting_id"))
+        return bool(
+            data.get("invoice_posting_id")
+            or data.get("reference_type") == "SupplierOpeningBalance"
+            or data.get("opening_balance_manifest")
+            or data.get("opening_balance_date")
+            or getattr(existing, "reference_type", None) == "SupplierOpeningBalance"
+        )
     if label not in parents:
         return False
     from stock.models import PurchaseOrder, PurchaseReceiving
