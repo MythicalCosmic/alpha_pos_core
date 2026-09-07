@@ -182,6 +182,8 @@ class StockBatch(SyncMixin, models.Model):
 
 
 class StockTransaction(SyncMixin, models.Model):
+    _sync_append_only = True
+
     class MovementType(models.TextChoices):
         PURCHASE_IN = "PURCHASE_IN", "Purchase In"
         SALE_OUT = "SALE_OUT", "Sale Out"
@@ -307,3 +309,21 @@ class StockTransaction(SyncMixin, models.Model):
 
     def __str__(self):
         return f"{self.transaction_number} | {self.get_movement_type_display()}"
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            raise TypeError('StockTransaction is append-only and cannot be updated')
+        return super().save(*args, **kwargs)
+
+    @classmethod
+    def from_sync_dict(cls, data, branch_id=None):
+        existing = cls.objects.filter(uuid=data.get('uuid')).first()
+        if existing is not None:
+            return existing, 'skipped'
+        return super().from_sync_dict(data, branch_id=branch_id)
+
+    def delete(self, *args, **kwargs):
+        raise TypeError('StockTransaction is append-only and cannot be deleted')
+
+    def hard_delete(self, *args, **kwargs):
+        raise TypeError('StockTransaction is append-only and cannot be deleted')

@@ -236,7 +236,8 @@ class StockBatchService:
                purchase_order_id: int = None,
                production_order_id: int = None,
                quality_status: str = "PASSED",
-               notes: str = "") -> Tuple[Dict[str, Any], int]:
+               notes: str = "",
+               inventory_value: Decimal = None) -> Tuple[Dict[str, Any], int]:
         stock_item = StockItemRepository.get_by_id(stock_item_id)
         if not stock_item:
             return ServiceResponse.not_found(f"Stock item with id {stock_item_id} not found")
@@ -279,7 +280,8 @@ class StockBatchService:
             initial_quantity=quantity,
             current_quantity=quantity,
             unit_cost=to_decimal(unit_cost),
-            total_cost=quantity * to_decimal(unit_cost),
+            total_cost=(inventory_value if inventory_value is not None
+                        else quantity * to_decimal(unit_cost)),
             manufactured_date=manufactured_date,
             expiry_date=expiry_date,
             supplier=supplier,
@@ -289,6 +291,7 @@ class StockBatchService:
             notes=notes,
             status=StockBatch.BatchStatus.AVAILABLE,
             received_at=timezone.now(),
+            branch_id=location.branch_id,
         )
 
         return ServiceResponse.created(data={

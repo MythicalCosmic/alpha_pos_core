@@ -56,7 +56,8 @@ def validate_supplier_ledgers(suppliers):
             if (
                 row.branch_id != supplier.branch_id
                 or row.type not in SupplierTransaction.Type.values
-                or amount <= 0
+                or amount < 0
+                or (amount == 0 and not (row.invoice_posting_id and row.type in ('PURCHASE', 'RETURN')))
                 or (
                     fee > 0
                     and row.type != SupplierTransaction.Type.PAYMENT

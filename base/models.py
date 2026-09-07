@@ -2659,6 +2659,8 @@ class AuditLog(SyncMixin, models.Model):
             "EXPENSE_CATEGORY_DEACTIVATE", "Expense category deactivated"
         )
         SUPPLIER_PAYMENT = "SUPPLIER_PAYMENT", "Supplier payment"
+        SUPPLIER_INVOICE_RECEIVE = 'SUPPLIER_INVOICE_RECEIVE', 'Supplier invoice received'
+        SUPPLIER_INVOICE_REVERSE = 'SUPPLIER_INVOICE_REVERSE', 'Supplier invoice reversed'
         SUPPLIER_PAYMENT_REVERSE = (
             "SUPPLIER_PAYMENT_REVERSE", "Supplier payment reversed"
         )

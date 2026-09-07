@@ -1388,6 +1388,18 @@ class CloudReceiver:
         if not uuid_val:
             raise ValueError('Record missing UUID')
 
+        # Invoice documents are created only by the atomic admin command.
+        # Reject stale terminal copies before resolving new invoice-only FKs.
+        from stock.services.purchase_invoices.sync import branch_write_forbidden
+        invoice_guarded = model_class._meta.label_lower in {
+            'stock.purchaseorder', 'stock.purchaseorderitem', 'stock.purchasereceiving',
+            'stock.purchasereceivingitem', 'stock.purchasereceivingcorrection', 'stock.suppliertransaction',
+        }
+        invoice_existing = model_class._base_manager.filter(uuid=uuid_val).first() if invoice_guarded else None
+        if invoice_guarded and branch_write_forbidden(model_class, data, existing=invoice_existing):
+            return _rejected(invoice_existing, 'INVOICE_COMMAND_REQUIRED',
+                             'Direct invoices can only be changed by an authorized invoice command')
+
         # Models exposed with global pull scope are cloud-owned identities and
         # reference/catalog configuration. A branch token may consume them but
         # must never create, mutate, re-parent, rename-by-natural-key, or delete
@@ -1560,6 +1572,9 @@ class CloudReceiver:
             )
             try:
                 instance = model_class.objects.select_for_update().get(uuid=uuid_val)
+                if invoice_guarded and branch_write_forbidden(model_class, data, existing=instance):
+                    return _rejected(instance, 'INVOICE_COMMAND_REQUIRED',
+                                     'Direct invoices can only be changed by an authorized invoice command')
                 force_shift_close = False
                 prior_sync_version = instance.sync_version
                 _verify_locked_financial_target(

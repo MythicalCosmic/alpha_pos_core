@@ -222,7 +222,14 @@ class StockLevelService:
                idempotency_key: str = '',
                reversal_of_id: int = None,
                allowed_movement_types=None,
-               strict: bool = False) -> Tuple[Dict[str, Any], int]:
+               strict: bool = False,
+               inventory_value: Decimal = None) -> Tuple[Dict[str, Any], int]:
+        if inventory_value is not None:
+            try:
+                inventory_value = decimal_value(inventory_value, 'inventory_value', places=4,
+                                                 maximum='99999999999.9999')
+            except MoneyValueError as exc:
+                return ServiceResponse.validation_error({'inventory_value': [str(exc)]})
         if action_id:
             existing = StockTransaction.objects.filter(
                 command_id=action_id,
@@ -439,7 +446,8 @@ class StockLevelService:
             quantity_before=quantity_before,
             quantity_after=new_quantity,
             unit_cost=to_decimal(unit_cost),
-            total_cost=abs(base_quantity) * to_decimal(unit_cost),
+            total_cost=(inventory_value if inventory_value is not None
+                        else abs(base_quantity) * to_decimal(unit_cost)),
             reference_type=reference_type or "",
             reference_id=reference_id,
             order_id=order_id,

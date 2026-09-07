@@ -64,7 +64,7 @@ class SupplierLedgerService:
     @classmethod
     def _post_locked(cls, supplier, txn_type, amount, *, source_account='', fee=0,
                      reference_type='', reference_id=None, note='',
-                     performed_by=None):
+                     performed_by=None, invoice_posting_id=None):
         amount = Decimal(amount)
         fee = Decimal(fee)
         before = supplier.current_balance or Decimal('0')
@@ -82,6 +82,7 @@ class SupplierLedgerService:
             reference_id=reference_id,
             performed_by=performed_by,
             branch_id=supplier.branch_id,
+            invoice_posting_id=invoice_posting_id,
         )
         supplier.current_balance = after
         supplier.save(update_fields=[
@@ -92,7 +93,8 @@ class SupplierLedgerService:
     @classmethod
     @transaction.atomic
     def _post(cls, supplier_id, txn_type, amount, *, source_account='', fee=0,
-              reference_type='', reference_id=None, note='', performed_by=None):
+              reference_type='', reference_id=None, note='', performed_by=None,
+              invoice_posting_id=None):
         supplier = Supplier.objects.select_for_update().filter(
             pk=supplier_id,
             is_deleted=False,
@@ -109,11 +111,12 @@ class SupplierLedgerService:
             reference_id=reference_id,
             note=note,
             performed_by=performed_by,
+            invoice_posting_id=invoice_posting_id,
         )
 
     @classmethod
     def record_purchase(cls, supplier_id, amount, reference_type='',
-                        reference_id=None, performed_by=None, note=''):
+                        reference_id=None, performed_by=None, note='', invoice_posting_id=None):
         return cls._post(
             supplier_id,
             SupplierTransaction.Type.PURCHASE,
@@ -122,11 +125,12 @@ class SupplierLedgerService:
             reference_id=reference_id,
             performed_by=performed_by,
             note=note,
+            invoice_posting_id=invoice_posting_id,
         )
 
     @classmethod
     def record_return(cls, supplier_id, amount, reference_type='',
-                      reference_id=None, performed_by=None, note=''):
+                      reference_id=None, performed_by=None, note='', invoice_posting_id=None):
         return cls._post(
             supplier_id,
             SupplierTransaction.Type.RETURN,
@@ -135,6 +139,7 @@ class SupplierLedgerService:
             reference_id=reference_id,
             performed_by=performed_by,
             note=note,
+            invoice_posting_id=invoice_posting_id,
         )
 
     @staticmethod

@@ -7,11 +7,17 @@ from stock.views import (
     order_views, ai_views,
     adjustment_request_views,
     inventory_control_views,
+    purchase_invoice_views,
 )
 
 app_name = 'stock'
 
 urlpatterns = [
+    path('suppliers/<int:supplier_id>/receivable-items/', purchase_invoice_views.receivable_items, name='supplier-receivable-items'),
+    path('purchase-invoices/', purchase_invoice_views.purchase_invoices, name='purchase-invoice-list'),
+    path('purchase-invoices/receive/', purchase_invoice_views.receive, name='purchase-invoice-receive'),
+    path('purchase-invoices/<int:invoice_id>/', purchase_invoice_views.purchase_invoice_detail, name='purchase-invoice-detail'),
+    path('purchase-invoices/<int:invoice_id>/reverse/', purchase_invoice_views.reverse, name='purchase-invoice-reverse'),
     path('inventory-control/', inventory_control_views.inventory_control,
          name='inventory-control'),
     # Settings & Alerts

@@ -347,6 +347,8 @@ class SupplierStockItemService:
             "unit_name": si.unit.name,
             "unit_short": si.unit.short_name,
             "price": str(si.price),
+            "price_is_known": si.price_is_known,
+            "price_source": si.price_source,
             "currency": si.currency,
             "min_order_qty": str(si.min_order_qty),
             "pack_size": str(si.pack_size),
@@ -399,6 +401,8 @@ class SupplierStockItemService:
             supplier_name=supplier_name or stock_item.name,
             unit=unit,
             price=to_decimal(price),
+            price_is_known=to_decimal(price) > 0,
+            price_source='CATALOG',
             currency=currency,
             min_order_qty=to_decimal(min_order_qty),
             pack_size=to_decimal(pack_size),
@@ -436,6 +440,10 @@ class SupplierStockItemService:
 
         if "price" in kwargs:
             si.last_price_update = timezone.now()
+            si.price_is_known = si.price > 0
+            si.price_source = 'CATALOG'
+            si.price_source_invoice_uuid = None
+            update_fields.extend(['price_is_known', 'price_source', 'price_source_invoice_uuid'])
             update_fields.append("last_price_update")
 
         if "is_preferred" in kwargs and kwargs["is_preferred"]:

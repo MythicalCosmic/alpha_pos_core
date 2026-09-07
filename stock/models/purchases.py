@@ -3,6 +3,10 @@ from django.db import models
 
 from base.models import SyncMixin, SyncManager
 
+class PurchaseDocumentType(models.TextChoices):
+    PURCHASE_ORDER = 'PURCHASE_ORDER', 'Planned purchase order'
+    DIRECT_INVOICE = 'DIRECT_INVOICE', 'Direct supplier invoice'
+
 class PurchaseOrder(SyncMixin, models.Model):
     class Status(models.TextChoices):
         DRAFT = "DRAFT", "Draft"
@@ -18,6 +22,8 @@ class PurchaseOrder(SyncMixin, models.Model):
         PAID = "PAID", "Paid"
 
 
+    source_type = models.CharField(max_length=20, choices=PurchaseDocumentType.choices,
+                                   default=PurchaseDocumentType.PURCHASE_ORDER, db_index=True)
     order_number = models.CharField(max_length=50, unique=True)
     supplier = models.ForeignKey(
         'stock.Supplier', on_delete=models.PROTECT, related_name="purchase_orders"
@@ -135,6 +141,23 @@ class PurchaseReceiving(SyncMixin, models.Model):
         COMPLETED = "COMPLETED", "Completed"
 
 
+    source_type = models.CharField(max_length=20, choices=PurchaseDocumentType.choices,
+                                   default=PurchaseDocumentType.PURCHASE_ORDER, db_index=True)
+    supplier = models.ForeignKey('stock.Supplier', on_delete=models.PROTECT,
+                                 null=True, blank=True, related_name='invoices')
+    supplier_invoice_number = models.CharField(max_length=100, blank=True, default='')
+    supplier_invoice_number_normalized = models.CharField(max_length=200, blank=True, default='')
+    invoice_date = models.DateField(null=True, blank=True, db_index=True)
+    posting_manifest = models.JSONField(default=dict, blank=True)
+    posted_by = models.ForeignKey('base.User', on_delete=models.PROTECT, null=True,
+                                  blank=True, related_name='posted_supplier_invoices')
+    reversed_at = models.DateTimeField(null=True, blank=True)
+    reversed_by = models.ForeignKey('base.User', on_delete=models.PROTECT, null=True,
+                                    blank=True, related_name='reversed_supplier_invoices')
+    reversal_reason = models.CharField(max_length=1000, blank=True, default='')
+    reversal_manifest = models.JSONField(default=dict, blank=True)
+    replaces = models.ForeignKey('self', on_delete=models.PROTECT, null=True,
+                                 blank=True, related_name='replacements')
     receiving_number = models.CharField(max_length=50, unique=True)
     purchase_order = models.ForeignKey(
         PurchaseOrder, on_delete=models.PROTECT, related_name="receivings"
@@ -182,11 +205,57 @@ class PurchaseReceiving(SyncMixin, models.Model):
 
     objects = SyncManager()
 
+    class Meta:
+        constraints = [models.UniqueConstraint(
+            fields=['branch_id', 'supplier', 'supplier_invoice_number_normalized'],
+            condition=models.Q(source_type='DIRECT_INVOICE') & ~models.Q(supplier_invoice_number_normalized=''),
+            name='uniq_direct_supplier_invoice_number',
+        )]
+        indexes = [models.Index(fields=['branch_id', 'source_type', 'invoice_date'])]
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            old = type(self).objects.filter(pk=self.pk, source_type='DIRECT_INVOICE').first()
+            if old is not None and old.posting_manifest:
+                fixed = ('uuid', 'created_at', 'quality_posting_policy',
+                         'over_receipt_approved_by_id', 'over_receipt_approved_at', 'over_receipt_reason',
+                         'source_type', 'supplier_id', 'location_id', 'purchase_order_id',
+                         'supplier_invoice_number', 'supplier_invoice_number_normalized',
+                         'invoice_date', 'received_date', 'receiving_number', 'status',
+                         'received_by_id', 'posted_by_id', 'completed_at', 'notes',
+                         'received_value_uzs', 'supplier_balance_before', 'supplier_balance_after',
+                         'supplier_transaction_id', 'completion_action_id', 'completion_idempotency_key',
+                         'posting_manifest', 'replaces_id', 'is_deleted', 'branch_id')
+                if any(getattr(self, name) != getattr(old, name) for name in fixed):
+                    raise TypeError('Posted supplier invoice is immutable')
+                if old.reversed_at and any(getattr(self, name) != getattr(old, name) for name in (
+                    'reversed_at', 'reversed_by_id', 'reversal_reason', 'reversal_manifest',
+                )):
+                    raise TypeError('Supplier invoice reversal is immutable')
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        if self._has_posted_direct_invoice():
+            raise TypeError('Posted supplier invoice cannot be deleted')
+        return super().delete(*args, **kwargs)
+
+    def hard_delete(self, *args, **kwargs):
+        if self._has_posted_direct_invoice():
+            raise TypeError('Posted supplier invoice cannot be deleted')
+        return super().hard_delete(*args, **kwargs)
+
+    def _has_posted_direct_invoice(self):
+        return type(self).objects.filter(pk=self.pk, source_type='DIRECT_INVOICE').exclude(posting_manifest={}).exists()
+
     def to_sync_dict(self):
         data = super().to_sync_dict()
         data['purchase_order_uuid'] = str(self.purchase_order.uuid) if self.purchase_order else None
         data['location_uuid'] = str(self.location.uuid) if self.location else None
         data['received_by_uuid'] = str(self.received_by.uuid) if self.received_by else None
+        data['supplier_uuid'] = str(self.supplier.uuid) if self.supplier else None
+        data['posted_by_uuid'] = str(self.posted_by.uuid) if self.posted_by else None
+        data['reversed_by_uuid'] = str(self.reversed_by.uuid) if self.reversed_by else None
+        data['replaces_invoice_uuid'] = str(self.replaces.uuid) if self.replaces else None
         data['over_receipt_approved_by_uuid'] = (
             str(self.over_receipt_approved_by.uuid)
             if self.over_receipt_approved_by else None
@@ -217,6 +286,14 @@ class PurchaseReceivingItem(SyncMixin, models.Model):
     stock_item = models.ForeignKey(
         'stock.StockItem', on_delete=models.PROTECT, related_name="+"
     )
+    supplier_stock_item = models.ForeignKey('stock.SupplierStockItem', on_delete=models.PROTECT,
+                                            null=True, blank=True, related_name='invoice_lines')
+    line_total_uzs = models.DecimalField(max_digits=15, decimal_places=0, null=True, blank=True)
+    is_free = models.BooleanField(default=False)
+    free_reason = models.CharField(max_length=1000, blank=True, default='')
+    invoice_snapshot = models.JSONField(default=dict, blank=True)
+    stock_transaction = models.OneToOneField('stock.StockTransaction', on_delete=models.PROTECT,
+                                             null=True, blank=True, related_name='invoice_line')
     quantity_received = models.DecimalField(max_digits=15, decimal_places=4)
     unit = models.ForeignKey('stock.StockUnit', on_delete=models.PROTECT, related_name="+")
     conversion_to_base_snapshot = models.DecimalField(
@@ -253,6 +330,29 @@ class PurchaseReceivingItem(SyncMixin, models.Model):
 
     objects = SyncManager()
 
+    def _posted_direct_invoice(self):
+        original = type(self).objects.filter(pk=self.pk).values_list('receiving_id', flat=True).first() if self.pk else None
+        return PurchaseReceiving.objects.filter(
+            pk__in=[self.receiving_id, original], source_type='DIRECT_INVOICE', status='COMPLETED',
+        ).exists()
+
+    def save(self, *args, **kwargs):
+        if self._posted_direct_invoice():
+            from base.services.sync.context import is_authoritative_cloud_pull
+            if not (self._state.adding and kwargs.get('_syncing') and is_authoritative_cloud_pull()):
+                raise TypeError('Posted supplier invoice line is immutable')
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        if self._posted_direct_invoice():
+            raise TypeError('Posted supplier invoice line cannot be deleted')
+        return super().delete(*args, **kwargs)
+
+    def hard_delete(self, *args, **kwargs):
+        if self._posted_direct_invoice():
+            raise TypeError('Posted supplier invoice line cannot be deleted')
+        return super().hard_delete(*args, **kwargs)
+
     def to_sync_dict(self):
         data = super().to_sync_dict()
         data['receiving_uuid'] = str(self.receiving.uuid) if self.receiving else None
@@ -261,6 +361,8 @@ class PurchaseReceivingItem(SyncMixin, models.Model):
         data['unit_uuid'] = str(self.unit.uuid) if self.unit else None
         data['base_unit_uuid'] = str(self.base_unit.uuid) if self.base_unit else None
         data['batch_created_uuid'] = str(self.batch_created.uuid) if self.batch_created else None
+        data['supplier_stock_item_uuid'] = str(self.supplier_stock_item.uuid) if self.supplier_stock_item else None
+        data['stock_transaction_uuid'] = str(self.stock_transaction.uuid) if self.stock_transaction else None
         return data
 
     def __str__(self):

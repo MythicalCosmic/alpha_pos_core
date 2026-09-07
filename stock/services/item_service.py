@@ -48,6 +48,7 @@ class StockItemService:
             "reorder_point": str(item.reorder_point),
 
             "cost_price": str(item.cost_price),
+            "current_inventory_cost_uzs": str(item.avg_cost_price),
             "avg_cost_price": str(item.avg_cost_price),
             "last_cost_price": str(item.last_cost_price),
 

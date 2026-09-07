@@ -75,6 +75,7 @@ class SupplierTransaction(SyncMixin, models.Model):
         BANK = 'BANK', 'Bank'
         DRAWER = 'DRAWER', 'Shift drawer'
 
+    invoice_posting_id = models.UUIDField(null=True, blank=True, unique=True)
     supplier = models.ForeignKey(
         Supplier, on_delete=models.CASCADE, related_name='ledger',
     )
@@ -106,6 +107,11 @@ class SupplierTransaction(SyncMixin, models.Model):
 
     class Meta:
         ordering = ['-created_at']
+        constraints = [models.UniqueConstraint(
+            fields=['branch_id', 'reference_type', 'reference_id', 'type'],
+            condition=models.Q(invoice_posting_id__isnull=False),
+            name='uniq_supplier_invoice_ledger_reference',
+        )]
         indexes = [
             models.Index(fields=['supplier', 'type', 'created_at']),
             models.Index(fields=['branch_id', 'reference_type', 'reference_id']),
@@ -124,6 +130,13 @@ class SupplierTransaction(SyncMixin, models.Model):
         if self.pk:
             raise TypeError('SupplierTransaction is append-only and cannot be updated')
         return super().save(*args, **kwargs)
+
+    @classmethod
+    def from_sync_dict(cls, data, branch_id=None):
+        existing = cls.objects.filter(uuid=data.get('uuid')).first()
+        if existing is not None:
+            return existing, 'skipped'
+        return super().from_sync_dict(data, branch_id=branch_id)
 
     def delete(self, *args, **kwargs):
         raise TypeError('SupplierTransaction is append-only and cannot be deleted')
@@ -257,6 +270,11 @@ class SupplierStockItem(SyncMixin, models.Model):
         help_text="What the supplier calls this item",
     )
     unit = models.ForeignKey('stock.StockUnit', on_delete=models.PROTECT, related_name="+")
+    is_active = models.BooleanField(default=True)
+    price_is_known = models.BooleanField(default=False)
+    price_source = models.CharField(max_length=20, blank=True, default='')
+    # Scalar event identity avoids a catalog -> receiving -> catalog sync cycle.
+    price_source_invoice_uuid = models.UUIDField(null=True, blank=True)
     price = models.DecimalField(max_digits=15, decimal_places=4)
     currency = models.CharField(max_length=3, default="UZS")
     min_order_qty = models.DecimalField(

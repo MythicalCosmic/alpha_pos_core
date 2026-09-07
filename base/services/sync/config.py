@@ -25,9 +25,9 @@ SYNC_ORDER = [
     # at either a production order or transfer. Sending the children first
     # permanently dead-lettered otherwise-valid inventory rows on a new hub.
     'productionorder', 'stocktransfer', 'stockbatch',
-    'purchasereceivingitem', 'productionorderingredient',
+    'productionorderingredient',
     'productionorderoutput', 'productionorderstep',
-    'stocktransferitem', 'stocktransaction', 'stockadjustmentrequest',
+    'stocktransferitem', 'stocktransaction', 'purchasereceivingitem', 'stockadjustmentrequest',
     'variancereasoncode', 'stockcount', 'stockcountitem',
     'stocksettings', 'stockalertconfig',
     # HR models
@@ -176,6 +176,9 @@ FK_UUID_MAPPINGS = {
     'approved_by_uuid': ('base', 'User', 'approved_by'),
     'assigned_to_uuid': ('base', 'User', 'assigned_to'),
     'received_by_uuid': ('base', 'User', 'received_by'),
+    'posted_by_uuid': ('base', 'User', 'posted_by'),
+    'reversed_by_uuid': ('base', 'User', 'reversed_by'),
+    'replaces_invoice_uuid': ('stock', 'PurchaseReceiving', 'replaces'),
     'requested_by_uuid': ('base', 'User', 'requested_by'),
     'shipped_by_uuid': ('base', 'User', 'shipped_by'),
     'counted_by_uuid': ('base', 'User', 'counted_by'),

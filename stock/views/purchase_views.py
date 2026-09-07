@@ -74,6 +74,7 @@ def purchase_orders(request):
             date_from=date_from,
             date_to=date_to,
             branch_id=branch_id,
+            source_type=request.GET.get('source_type', 'PURCHASE_ORDER'),
         )
         return JsonResponse(result, status=status_code)
 
@@ -210,10 +211,15 @@ def purchase_receiving(request, po_id):
     if request.method == 'GET':
         if denied := _deny(request, 'stock.purchase.view'):
             return denied
+        from stock.models import PurchaseOrder
+        if not PurchaseOrder.objects.filter(pk=po_id, branch_id=branch_id,
+                                            is_deleted=False, source_type='PURCHASE_ORDER').exists():
+            return JsonResponse({'success': False, 'code': 'NOT_FOUND', 'message': 'Purchase order not found'}, status=404)
         rows = PurchaseReceiving.objects.filter(
             purchase_order_id=po_id,
             branch_id=branch_id,
             is_deleted=False,
+            source_type='PURCHASE_ORDER',
         ).select_related('purchase_order__supplier', 'location', 'received_by')
         return JsonResponse({'success': True, 'data': {
             'receivings': [PurchaseReceivingService.serialize(row) for row in rows],
@@ -255,6 +261,7 @@ def purchase_receiving_items(request, receiving_id):
             id=receiving_id,
             branch_id=branch_id,
             is_deleted=False,
+            source_type='PURCHASE_ORDER',
         ).first()
         if not receiving:
             return JsonResponse({'success': False, 'message': 'Receiving not found'}, status=404)

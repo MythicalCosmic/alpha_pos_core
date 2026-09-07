@@ -23,6 +23,9 @@ PERMISSIONS = [
     ('stock.supplier.balance.view', 'View supplier balances and ledgers', 'Money control'),
     ('stock.supplier.pay', 'Pay suppliers from Treasury', 'Money control'),
     ('stock.purchase.view', 'View purchase orders', 'Warehouse'),
+    ('stock.purchase_invoice.view', 'View supplier invoices', 'Warehouse'),
+    ('stock.purchase_invoice.receive', 'Receive supplier invoices', 'Warehouse'),
+    ('stock.purchase_invoice.correct', 'Reverse supplier invoices', 'Warehouse approvals'),
     ('stock.receiving.create', 'Create receiving drafts', 'Warehouse'),
     ('stock.receiving.update_draft', 'Edit assigned receiving drafts', 'Warehouse'),
     ('stock.receiving.complete', 'Complete receiving', 'Warehouse'),
@@ -81,6 +84,8 @@ VALID_KEYS = {p[0] for p in PERMISSIONS}
 DEFAULT_ROLE_PERMISSIONS = {
     'ADMIN': ['*'],
     'MANAGER': [
+        'stock.catalog.view', 'stock.purchase_invoice.view', 'stock.purchase_invoice.receive',
+        'stock.purchase_invoice.correct',
         'order.create', 'order.update', 'order.pay', 'order.cancel', 'order.stats',
         'discount.apply', 'product.create', 'product.update', 'product.delete',
         'category.create', 'category.update', 'category.delete',
@@ -102,6 +107,7 @@ DEFAULT_ROLE_PERMISSIONS = {
     ],
     'CHEF': [],
     'WAREHOUSE': [
+        'stock.purchase_invoice.view', 'stock.purchase_invoice.receive',
         'stock.catalog.view', 'stock.level.view', 'stock.batch.view',
         'stock.supplier.view', 'stock.supplier.balance.view', 'stock.purchase.view',
         'stock.receiving.create', 'stock.receiving.update_draft',
