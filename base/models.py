@@ -558,13 +558,15 @@ class SyncMixin(models.Model):
 
     @classmethod
     def _sync_frozen_from_branch_fields(cls, instance, *, mode=None):
-        """Concrete field names/attnames frozen after financial settlement."""
+        """Protect write-once identities in both directions and settled money."""
         effective_mode = mode or getattr(settings, 'DEPLOYMENT_MODE', 'local')
-        if effective_mode != 'cloud' or not getattr(instance, 'is_paid', False):
-            return frozenset()
-        frozen = set(getattr(
-            cls, 'SYNC_IMMUTABLE_FROM_BRANCH_WHEN_PAID', frozenset(),
-        ))
+        frozen = set()
+        for name in getattr(cls, 'SYNC_IMMUTABLE_FROM_BRANCH_AFTER_SET', frozenset()):
+            field = cls._meta.get_field(name)
+            if getattr(instance, field.attname, None) not in (None, '', {}, []):
+                frozen.add(name)
+        if effective_mode == 'cloud' and getattr(instance, 'is_paid', False):
+            frozen.update(getattr(cls, 'SYNC_IMMUTABLE_FROM_BRANCH_WHEN_PAID', frozenset()))
         expanded = set(frozen)
         for name in frozen:
             try:
@@ -1536,6 +1538,13 @@ class Order(SyncMixin, models.Model):
         blank=True,
         related_name="handled_orders",
     )
+    # Service attribution is independent from the cashier who settles payment.
+    waiter = models.ForeignKey(User, on_delete=models.PROTECT, null=True, blank=True,
+                               related_name='served_orders', editable=False)
+    waiter_shift = models.ForeignKey('Shift', on_delete=models.PROTECT, null=True, blank=True,
+                                     related_name='served_orders', editable=False)
+    waiter_policy_snapshot = models.JSONField(default=dict, blank=True, editable=False)
+
     # The client this order is for (desktop: by phone; Telegram: reconciled from
     # smartfood.Customer at dispatch). Nullable — legacy/walk-in orders have none.
     customer = models.ForeignKey(
@@ -1672,7 +1681,7 @@ class Order(SyncMixin, models.Model):
     # A rolling-upgrade retry may backfill a previously blank action identity,
     # but an established identity is immutable even before header repair marks
     # the order paid.
-    SYNC_IMMUTABLE_FROM_BRANCH_AFTER_SET = frozenset({'payment_action_id'})
+    SYNC_IMMUTABLE_FROM_BRANCH_AFTER_SET = frozenset({'payment_action_id', 'waiter', 'waiter_shift', 'waiter_policy_snapshot'})
 
     @classmethod
     def branch_sync_create_allowed(cls, *, uuid_val, values, resolved_fks):
@@ -1698,6 +1707,8 @@ class Order(SyncMixin, models.Model):
         data.pop('accounting_recorded_at', None)
         data['user_uuid'] = str(self.user.uuid) if self.user else None
         data['cashier_uuid'] = str(self.cashier.uuid) if self.cashier else None
+        data['waiter_uuid'] = str(self.waiter.uuid) if self.waiter else None
+        data['waiter_shift_uuid'] = str(self.waiter_shift.uuid) if self.waiter_shift else None
         data['delivery_person_uuid'] = str(self.delivery_person.uuid) if self.delivery_person else None
         data['place_uuid'] = str(self.place.uuid) if self.place else None
         data['table_uuid'] = str(self.table.uuid) if self.table else None
@@ -2342,8 +2353,15 @@ def _default_business_close():
 
 
 class AppSettings(models.Model):
+    class WaiterPaymentMode(models.TextChoices):
+        CASHIER_HANDOFF = 'CASHIER_HANDOFF', 'Cashier collects payment'
+        PERMITTED_WAITER = 'PERMITTED_WAITER', 'Waiter with payment permission may collect'
+
     hr_enabled = models.BooleanField(default=False)
     waiter_enabled = models.BooleanField(default=False)
+    waiter_payment_mode = models.CharField(max_length=24, choices=WaiterPaymentMode.choices,
+                                          default=WaiterPaymentMode.CASHIER_HANDOFF)
+    waiter_require_shift = models.BooleanField(default=False)
     # Operating-day cutover: stats/dashboards treat [business_day_start, next
     # business_day_start) as ONE business day, so a 01:00 sale counts toward the
     # night before. Per-restaurant; default 03:00. See base.services.business_day.
@@ -2369,6 +2387,7 @@ class AppSettings(models.Model):
         # Bust the per-process cache so the next reader sees the new state.
         from django.core.cache import cache
         cache.delete(self._CACHE_KEY)
+        transaction.on_commit(lambda: cache.delete(self._CACHE_KEY))
 
     @classmethod
     def load(cls):
@@ -2379,7 +2398,9 @@ class AppSettings(models.Model):
         if cached is not None:
             return cached
         obj, _ = cls.objects.get_or_create(pk=1)
-        cache.set(cls._CACHE_KEY, obj, cls._CACHE_TTL)
+        from django.db import connection
+        if not connection.in_atomic_block:
+            cache.set(cls._CACHE_KEY, obj, cls._CACHE_TTL)
         return obj
 
     def __str__(self):
@@ -2599,6 +2620,10 @@ class AuditLog(SyncMixin, models.Model):
         DISCOUNT_CREATE = "DISCOUNT_CREATE", "Discount created"
         DISCOUNT_UPDATE = "DISCOUNT_UPDATE", "Discount updated"
         DISCOUNT_DELETE = "DISCOUNT_DELETE", "Discount deleted"
+        DISCOUNT_APPLY = "DISCOUNT_APPLY", "Discount applied to order"
+        DISCOUNT_REMOVE = "DISCOUNT_REMOVE", "Discount removed from order"
+        WAITER_POLICY_UPDATE = "WAITER_POLICY_UPDATE", "Waiter policy updated"
+        TABLE_STATUS_UPDATE = "TABLE_STATUS_UPDATE", "Table status updated"
         LOYALTY_REDEEM = "LOYALTY_REDEEM", "Loyalty stamps redeemed"
         TREASURY_TRANSFER = "TREASURY_TRANSFER", "Treasury transfer"
         TREASURY_EXPENSE = "TREASURY_EXPENSE", "Treasury expense"

@@ -90,6 +90,11 @@ def login_required(view_func):
                 {"success": False, "message": "Session client mismatch"},
                 status=401,
             )
+        if session.user_id.role == 'WAITER' and not request.path_info.endswith(('auth-logout', 'auth-sessions')):
+            from base.services.waiter_policy import authorize_waiter
+            denied = authorize_waiter(session.user_id)
+            if denied:
+                return JsonResponse(denied[0], status=denied[1])
         request.user = session.user_id
         request.session_key = session_key
         request.session_credential_source = credential_source

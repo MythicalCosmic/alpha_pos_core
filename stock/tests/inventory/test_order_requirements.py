@@ -1,5 +1,7 @@
 from decimal import Decimal
 
+import pytest
+
 from stock.models import (
     ProductStockLink,
     RecipeIngredient,
@@ -172,4 +174,26 @@ def test_later_reservation_failure_rolls_back_earlier_ingredient(
     c.level.refresh_from_db()
     salt_level.refresh_from_db()
     assert c.level.reserved_quantity == salt_level.reserved_quantity == 0
+    assert StockTransaction.objects.count() == before
+
+
+@pytest.mark.parametrize('quantities', [(2, 1), (1, 2)])
+def test_multi_line_stock_failure_returns_error_and_rolls_back(
+    inventory_catalog, admin_user, quantities,
+):
+    from base.models import Order
+
+    c = inventory_catalog
+    c.level.quantity = Decimal('150')
+    c.level.save(update_fields=['quantity'])
+    order = Order.objects.create(user=admin_user, status='PREPARING')
+    before = StockTransaction.objects.count()
+    result, status = OrderStockService.deduct_for_order(
+        order.pk,
+        [{'product_id': c.product.pk, 'quantity': quantity} for quantity in quantities],
+        c.location.pk, admin_user.pk,
+    )
+    assert status == 400, result
+    c.level.refresh_from_db()
+    assert c.level.quantity == Decimal('150')
     assert StockTransaction.objects.count() == before

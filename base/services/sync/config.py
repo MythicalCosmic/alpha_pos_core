@@ -8,9 +8,10 @@ SYNC_ORDER = [
     # Base models (synced first - other models depend on these)
     'user', 'category', 'deliveryperson', 'place', 'table', 'product',
     'customer',  # before 'order' — Order.customer FK depends on it
+    'shifttemplate', 'shift',  # waiter service shift must precede its orders
     'order', 'orderitem', 'orderpayment', 'externalorderpayment',
     'cashregister', 'inkassa',
-    'shifttemplate', 'shift', 'orderrefund', 'cashreconciliation',
+    'orderrefund', 'cashreconciliation',
     # Stock models (synced after base, respecting FK dependencies)
     'stocklocation', 'stockunit', 'stockcategory', 'stockitem',
     'stockitemunit', 'supplier', 'supplierstockitem', 'suppliertransaction',
@@ -137,6 +138,8 @@ FK_UUID_MAPPINGS = {
     # Base FK mappings
     'user_uuid': ('base', 'User', 'user'),
     'cashier_uuid': ('base', 'User', 'cashier'),
+    'waiter_uuid': ('base', 'User', 'waiter'),
+    'waiter_shift_uuid': ('base', 'Shift', 'waiter_shift'),
     'delivery_person_uuid': ('base', 'DeliveryPerson', 'delivery_person'),
     'customer_uuid': ('base', 'Customer', 'customer'),
     'category_uuid': ('base', 'Category', 'category'),

@@ -13,6 +13,13 @@ from .product_link_service import ProductStockLinkService
 from .conversions import UnitConversions
 
 
+def deduction_due(configured_status, old_status, new_status):
+    """Creation may immediately pass PREPARING for all-instant products."""
+    return (new_status == configured_status
+            or (old_status is None and configured_status == 'CREATED')
+            or (old_status is None and configured_status == 'PREPARING' and new_status == 'READY'))
+
+
 class OrderStockService:
 
     # reference_type marker stamped on full order-cancellation reversals so
@@ -39,7 +46,8 @@ class OrderStockService:
                          order_items: List[Dict],
                          location_id: int,
                          user_id: int,
-                         order_status: str = None) -> Tuple[Dict[str, Any], int]:
+                         order_status: str = None,
+                         creation: bool = False) -> Tuple[Dict[str, Any], int]:
 
         settings = StockSettingsRepository.load()
 
@@ -49,11 +57,19 @@ class OrderStockService:
                 "reason": "Stock system disabled"
             })
 
-        if order_status and order_status != settings.deduct_on_order_status:
+        if order_status and not deduction_due(settings.deduct_on_order_status,
+                                             None if creation else 'EXISTING', order_status):
             return ServiceResponse.success(data={
                 "skipped": True,
                 "reason": f"Deduction happens at {settings.deduct_on_order_status}, not {order_status}"
             })
+
+        from base.models import Order
+        # Serialize against status, cancellation, and item edits. Existing
+        # movements are also the safe adoption evidence for older terminals.
+        Order.objects.select_for_update().filter(pk=order_id).first()
+        if StockTransactionRepository.filter(order_id=order_id, movement_type='SALE_OUT').exists():
+            return ServiceResponse.success(data={'skipped': True, 'reason': 'Order already deducted'})
 
         deductions = []
         errors = []
@@ -77,22 +93,13 @@ class OrderStockService:
             if status < 400:
                 deductions.extend(result.get("data", {}).get("deductions", []))
             else:
-                if settings.allow_negative_stock:
-                    deductions.append({
-                        "product_id": product_id,
-                        "warning": result.get("message", "Stock error")
-                    })
-                else:
-                    errors.append({
-                        "product_id": product_id,
-                        "error": result.get("message", "Stock error")
-                    })
-
-        if errors and not settings.allow_negative_stock:
-            # Roll back any deductions already applied in this transaction so the
-            # order's stock state is all-or-nothing.
-            transaction.set_rollback(True)
-            return ServiceResponse.error(f"Stock deduction failed: {errors}")
+                # A component failure may already mark this transaction for
+                # rollback. Stop before querying the next product, and undo any
+                # earlier deductions in the same order.
+                errors.append({"product_id": product_id,
+                               "error": result.get("message", "Stock error")})
+                transaction.set_rollback(True)
+                return ServiceResponse.error(f"Stock deduction failed: {errors}")
 
         return ServiceResponse.success(data={
             "order_id": order_id,
@@ -157,6 +164,8 @@ class OrderStockService:
                           reason: str = "Order cancelled") -> Tuple[Dict[str, Any], int]:
 
 
+        from base.models import Order
+        Order.objects.select_for_update().filter(pk=order_id).first()
         settings = StockSettingsRepository.load()
 
         if not settings.stock_enabled:
@@ -527,7 +536,7 @@ class OrderStatusHandler:
                 return response, status
             result["actions"].append({"action": "reserve", "result": response})
 
-        if new_status == settings.deduct_on_order_status:
+        if deduction_due(settings.deduct_on_order_status, old_status, new_status):
             if settings.reserve_on_order_create:
                 response, status = OrderStockService.release_reservation(
                     order_id, user_id,
@@ -540,7 +549,8 @@ class OrderStatusHandler:
                 })
 
             response, status = OrderStockService.deduct_for_order(
-                order_id, order_items, location_id, user_id, new_status
+                order_id, order_items, location_id, user_id, new_status,
+                creation=old_status is None,
             )
             if status >= 400:
                 transaction.set_rollback(True)

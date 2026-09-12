@@ -40,7 +40,8 @@ def maybe_accrue(order):
     settings = LoyaltySettings.load()
     if not settings.is_enabled:
         return None
-    if order.status != 'COMPLETED' or not order.is_paid:
+    if (order.status != 'COMPLETED' or not order.is_paid or order.is_deleted
+            or order.paid_at is None or order.order_origin == 'TELEGRAM'):
         return None
 
     phone = _normalize_phone(order.phone_number)
@@ -53,6 +54,20 @@ def maybe_accrue(order):
 
     try:
         with transaction.atomic():
+            from django.apps import apps
+            from base.models import Order
+            from base.services.tender import tender_integrity_issues
+            locked_order = Order.objects.select_for_update().filter(pk=order.pk).first()
+            if (locked_order is None or locked_order.is_deleted or not locked_order.is_paid
+                    or locked_order.status != 'COMPLETED' or locked_order.paid_at is None
+                    or locked_order.order_origin == 'TELEGRAM'
+                    or locked_order.refunds.filter(is_deleted=False).exists()
+                    or tender_integrity_issues(Order.objects.filter(pk=order.pk), require_concrete=True)):
+                return None
+            if apps.is_installed('smartfood'):
+                point_ledger = apps.get_model('smartfood', 'LoyaltyTransaction')
+                if point_ledger.objects.filter(pos_order_id=order.pk, kind='EARN_SCAN').exists():
+                    return None
             # Insert the credit row first; if a concurrent caller already
             # credited this order, IntegrityError fires and we bail out
             # without touching the balance.

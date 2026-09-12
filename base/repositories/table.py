@@ -7,12 +7,12 @@ class TableRepository(BaseSyncRepository):
 
     @classmethod
     def get_active(cls):
-        return cls.model.objects.filter(is_deleted=False, is_active=True).order_by('place', 'sort_order', 'number')
+        return cls.model.objects.filter(is_deleted=False, is_active=True, place__is_deleted=False, place__is_active=True).order_by('place', 'sort_order', 'number')
 
     @classmethod
     def get_for_place(cls, place_id):
         return cls.model.objects.filter(
-            place_id=place_id, is_deleted=False
+            place_id=place_id, is_deleted=False, is_active=True, place__is_deleted=False, place__is_active=True
         ).order_by('sort_order', 'number')
 
     @classmethod
