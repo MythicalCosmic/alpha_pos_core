@@ -30,6 +30,27 @@ def _provider_result(monkeypatch, error):
     return AIStockAssistant.process_query('How are sales?')
 
 
+def test_ai_query_accepts_10000_characters(monkeypatch):
+    monkeypatch.setattr(llm, 'can_use_tools', lambda: False)
+    monkeypatch.setattr(llm, 'call_ai', lambda *args, **kwargs: ('Accepted', None))
+    monkeypatch.setattr(AIStockAssistant, '_get_all_stock_data', lambda *args: {})
+    monkeypatch.setattr(AIStockAssistant, '_get_sales_data', lambda *args: {})
+    monkeypatch.setattr(AIStockAssistant, '_needs_analytics', lambda query: False)
+
+    result = AIStockAssistant.process_query('x' * 10_000)
+
+    assert result['success'] is True
+    assert result['response'] == 'Accepted'
+
+
+def test_ai_query_rejects_more_than_10000_characters():
+    result = AIStockAssistant.process_query('x' * 10_001)
+
+    assert result['success'] is False
+    assert result['error'] == 'query_too_long'
+    assert '10000-character limit' in result['message']
+
+
 @pytest.mark.parametrize('provider_error', [
     'Error code: 429 - rate_limit_error',
     'RESOURCE_EXHAUSTED: too many requests',

@@ -1691,7 +1691,7 @@ class AIStockAssistant:
         ]
         return any(kw in q for kw in analytics_keywords)
 
-    MAX_QUERY_LENGTH = 2000
+    MAX_QUERY_LENGTH = 10_000
     DAILY_QUOTA_PER_USER = 100  # configurable via settings.AI_DAILY_QUOTA_PER_USER
 
     @classmethod
