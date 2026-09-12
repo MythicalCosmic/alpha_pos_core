@@ -31,13 +31,20 @@ pytestmark = pytest.mark.django_db
 
 class TestLoyaltyServiceAccrual:
     def _completed_paid_order(self, user, phone='998900000001'):
-        from base.models import Order
-        return Order.objects.create(
+        from base.models import Order, OrderPayment
+        from django.utils import timezone
+        from uuid import uuid4
+        action = uuid4()
+        order = Order.objects.create(
             user=user, phone_number=phone, order_type='PICKUP',
             status='COMPLETED', is_paid=True,
             total_amount='25000', subtotal='25000',
-            display_id=1,
+            display_id=1, paid_at=timezone.now(), payment_method='CASH',
+            payment_action_id=action,
         )
+        OrderPayment.objects.create(order=order, method='CASH', amount='25000',
+                                    payment_action_id=action, line_index=0)
+        return order
 
     def test_accrue_creates_account_and_credits(self, regular_user):
         order = self._completed_paid_order(regular_user)

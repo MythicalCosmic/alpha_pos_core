@@ -1,4 +1,9 @@
 PERMISSIONS = [
+    ('loyalty.member.view', 'View loyalty members', 'Loyalty'),
+    ('loyalty.award', 'Award verified receipt points', 'Loyalty'),
+    ('loyalty.adjust', 'Adjust loyalty points', 'Loyalty'),
+    ('loyalty.fulfill', 'Fulfill loyalty rewards', 'Loyalty'),
+    ('loyalty.correct', 'Cancel loyalty rewards', 'Loyalty'),
     ('order.create',     'Create orders',          'Orders'),
     ('order.update',     'Edit orders',            'Orders'),
     ('order.pay',        'Take payment',           'Orders'),
@@ -85,6 +90,8 @@ VALID_KEYS = {p[0] for p in PERMISSIONS}
 DEFAULT_ROLE_PERMISSIONS = {
     'ADMIN': ['*'],
     'MANAGER': [
+        'loyalty.member.view', 'loyalty.award', 'loyalty.adjust',
+        'loyalty.fulfill', 'loyalty.correct',
         'stock.catalog.view', 'stock.purchase_invoice.view', 'stock.purchase_invoice.receive',
         'stock.purchase_invoice.correct',
         'order.create', 'order.update', 'order.pay', 'order.cancel', 'order.stats',

@@ -65,7 +65,7 @@ def product_link_to_recipe(request, product_id):
     result, status = ProductStockLinkService.link_to_recipe(
         product_id=product_id,
         recipe_id=data["recipe_id"],
-        deduct_on_status=data.get("deduct_on_status", "PREPARING"),
+        deduct_on_status=data.get("deduct_on_status"),
     )
     return JsonResponse(result, status=status)
 
@@ -83,7 +83,7 @@ def product_link_to_item(request, product_id):
         stock_item_id=data["stock_item_id"],
         quantity_per_sale=data.get("quantity_per_sale", 1),
         unit_id=data.get("unit_id"),
-        deduct_on_status=data.get("deduct_on_status", "PREPARING"),
+        deduct_on_status=data.get("deduct_on_status"),
     )
     return JsonResponse(result, status=status)
 
@@ -99,7 +99,7 @@ def product_link_with_components(request, product_id):
     result, status = ProductStockLinkService.link_with_components(
         product_id=product_id,
         components=data["components"],
-        deduct_on_status=data.get("deduct_on_status", "PREPARING"),
+        deduct_on_status=data.get("deduct_on_status"),
     )
     return JsonResponse(result, status=status)
 

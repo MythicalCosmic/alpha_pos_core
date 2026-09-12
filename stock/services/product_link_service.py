@@ -15,6 +15,13 @@ from stock.repositories import (
 )
 
 
+def _timing_error(value):
+    if value is not None and value != StockSettingsRepository.load().deduct_on_order_status:
+        return ServiceResponse.validation_error(errors={
+            'deduct_on_status': 'Change deduction timing in stock settings; it applies to every product.'})
+    return None
+
+
 def _pagination_data(page_obj, paginator):
     return {
         "page": page_obj.number,
@@ -60,6 +67,7 @@ class ProductStockLinkService:
 
     @classmethod
     def serialize(cls, link: ProductStockLink, include_components: bool = False) -> Dict[str, Any]:
+        timing = StockSettingsRepository.load().deduct_on_order_status
         data = {
             "id": link.id,
             "uuid": str(link.uuid),
@@ -78,8 +86,9 @@ class ProductStockLinkService:
             "unit_id": link.unit_id,
             "unit_short": link.unit.short_name if link.unit else None,
 
-            "deduct_on_status": link.deduct_on_status,
-            "deduct_on_status_display": link.get_deduct_on_status_display(),
+            "deduct_on_status": timing,
+            "deduction_timing_scope": "GLOBAL",
+            "deduct_on_status_display": timing,
 
             "is_active": link.is_active,
             "created_at": link.created_at.isoformat(),
@@ -119,7 +128,8 @@ class ProductStockLinkService:
             "links": [cls.serialize(link) for link in page_obj],
             "pagination": _pagination_data(page_obj, paginator),
             "link_types": [{"value": c[0], "label": c[1]} for c in ProductStockLink.LinkType.choices],
-            "deduct_statuses": [{"value": c[0], "label": c[1]} for c in ProductStockLink.DeductOn.choices],
+            "deduct_statuses": [],
+            "deduction_timing_scope": "GLOBAL",
         })
 
     @classmethod
@@ -152,7 +162,7 @@ class ProductStockLinkService:
     def link_to_recipe(cls,
                        product_id: int,
                        recipe_id: int,
-                       deduct_on_status: str = "PREPARING") -> Tuple[Dict[str, Any], int]:
+                       deduct_on_status: str = None) -> Tuple[Dict[str, Any], int]:
 
         if ProductStockLinkRepository.product_has_link(product_id):
             return ServiceResponse.error("Product already has a stock link. Remove existing link first.")
@@ -163,11 +173,11 @@ class ProductStockLinkService:
         if not recipe.is_active:
             return ServiceResponse.error("Recipe is not active")
 
-        valid_statuses = [c[0] for c in ProductStockLink.DeductOn.choices]
-        if deduct_on_status not in valid_statuses:
-            return ServiceResponse.validation_error(
-                errors={"deduct_on_status": f"Invalid status. Valid: {valid_statuses}"}
-            )
+        error = _timing_error(deduct_on_status)
+        if error:
+            return error
+        # Legacy field retained for sync compatibility; global settings govern timing.
+        deduct_on_status = ProductStockLink.DeductOn.PREPARING
 
         link = ProductStockLinkRepository.create(
             product_id=product_id,
@@ -190,7 +200,7 @@ class ProductStockLinkService:
                      stock_item_id: int,
                      quantity_per_sale: Decimal = Decimal("1"),
                      unit_id: int = None,
-                     deduct_on_status: str = "PREPARING") -> Tuple[Dict[str, Any], int]:
+                     deduct_on_status: str = None) -> Tuple[Dict[str, Any], int]:
 
         if ProductStockLinkRepository.product_has_link(product_id):
             return ServiceResponse.error("Product already has a stock link. Remove existing link first.")
@@ -210,11 +220,11 @@ class ProductStockLinkService:
         else:
             unit = stock_item.base_unit
 
-        valid_statuses = [c[0] for c in ProductStockLink.DeductOn.choices]
-        if deduct_on_status not in valid_statuses:
-            return ServiceResponse.validation_error(
-                errors={"deduct_on_status": f"Invalid status. Valid: {valid_statuses}"}
-            )
+        error = _timing_error(deduct_on_status)
+        if error:
+            return error
+        # Legacy field retained for sync compatibility; global settings govern timing.
+        deduct_on_status = ProductStockLink.DeductOn.PREPARING
 
         link = ProductStockLinkRepository.create(
             product_id=product_id,
@@ -235,7 +245,7 @@ class ProductStockLinkService:
     def link_with_components(cls,
                              product_id: int,
                              components: List[Dict],
-                             deduct_on_status: str = "PREPARING") -> Tuple[Dict[str, Any], int]:
+                             deduct_on_status: str = None) -> Tuple[Dict[str, Any], int]:
 
         if ProductStockLinkRepository.product_has_link(product_id):
             return ServiceResponse.error("Product already has a stock link. Remove existing link first.")
@@ -245,11 +255,11 @@ class ProductStockLinkService:
                 errors={"components": "At least one component required"}
             )
 
-        valid_statuses = [c[0] for c in ProductStockLink.DeductOn.choices]
-        if deduct_on_status not in valid_statuses:
-            return ServiceResponse.validation_error(
-                errors={"deduct_on_status": f"Invalid status. Valid: {valid_statuses}"}
-            )
+        error = _timing_error(deduct_on_status)
+        if error:
+            return error
+        # Legacy field retained for sync compatibility; global settings govern timing.
+        deduct_on_status = ProductStockLink.DeductOn.PREPARING
 
         link = ProductStockLinkRepository.create(
             product_id=product_id,
@@ -271,6 +281,7 @@ class ProductStockLinkService:
                 price_modifier=comp_data.get("price_modifier", 0),
             )
             if status >= 400:
+                transaction.set_rollback(True)
                 return result, status
 
         return ServiceResponse.created(data={
@@ -291,14 +302,9 @@ class ProductStockLinkService:
             link.quantity_per_sale = to_decimal(kwargs["quantity_per_sale"])
             update_fields.append("quantity_per_sale")
 
-        if "deduct_on_status" in kwargs:
-            valid_statuses = [c[0] for c in ProductStockLink.DeductOn.choices]
-            if kwargs["deduct_on_status"] not in valid_statuses:
-                return ServiceResponse.validation_error(
-                    errors={"deduct_on_status": f"Invalid status. Valid: {valid_statuses}"}
-                )
-            link.deduct_on_status = kwargs["deduct_on_status"]
-            update_fields.append("deduct_on_status")
+        error = _timing_error(kwargs.get('deduct_on_status'))
+        if error:
+            return error
 
         if "is_active" in kwargs:
             link.is_active = kwargs["is_active"]
@@ -467,7 +473,7 @@ class ProductStockLinkService:
         if not link:
             return False
 
-        return link.deduct_on_status == order_status
+        return settings.deduct_on_order_status == order_status
 
 
 class ProductComponentService:

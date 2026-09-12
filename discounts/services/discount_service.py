@@ -8,7 +8,29 @@ from discounts.repositories import (
 )
 from discounts.models import DiscountType, Discount
 from base.repositories import OrderRepository
+from base.models import User, AuditLog
+from base.services.waiter_policy import authorize_waiter, owns_order
 from base.helpers.response import ServiceResponse
+
+
+def _waiter_discount_error(order, user_id):
+    actor = User.objects.filter(pk=user_id, is_deleted=False).first() if user_id else None
+    if actor is None or actor.role != 'WAITER':
+        return None
+    denied = authorize_waiter(actor, 'discount.apply')
+    if denied:
+        return denied
+    if not owns_order(order, actor.pk):
+        return ServiceResponse.forbidden('You can only change discounts on your own orders')
+    return None
+
+
+def _discount_audit(order, user_id, action, discount_id):
+    AuditLog.objects.create(actor_id=user_id, action=action, target_type='Order',
+                            target_id=order.pk, branch_id=order.branch_id,
+                            metadata={'discount_id': discount_id,
+                                      'discount_amount': str(order.discount_amount),
+                                      'order_total': str(order.total_amount)})
 
 
 def _serialize_discount(discount):
@@ -417,6 +439,9 @@ class DiscountService:
         order = OrderRepository.get_for_update(order_id)
         if not order:
             return ServiceResponse.not_found("Order not found")
+        denied = _waiter_discount_error(order, user_id)
+        if denied:
+            return denied
 
         if order.is_paid:
             return ServiceResponse.error("Cannot apply discount to a paid order")
@@ -519,6 +544,7 @@ class DiscountService:
         order.total_amount = max(Decimal('0'), order.subtotal - order.discount_amount)
         order.save(update_fields=['discount_amount', 'total_amount'])
 
+        _discount_audit(order, user_id, AuditLog.Action.DISCOUNT_APPLY, discount.pk)
         return ServiceResponse.success(
             data={
                 'order_discount_id': order_discount.id,
@@ -538,6 +564,9 @@ class DiscountService:
         order = OrderRepository.get_for_update(order_id)
         if not order:
             return ServiceResponse.not_found("Order not found")
+        denied = _waiter_discount_error(order, user_id)
+        if denied:
+            return denied
 
         # Removing a discount from a paid order raises `total_amount` but
         # has no path to also bump the cash register, so the drawer would
@@ -593,6 +622,7 @@ class DiscountService:
         order.total_amount = max(Decimal('0'), order.subtotal - order.discount_amount)
         order.save(update_fields=['discount_amount', 'total_amount'])
 
+        _discount_audit(order, user_id, AuditLog.Action.DISCOUNT_REMOVE, discount.pk)
         return ServiceResponse.success(
             data={
                 'order_total': str(order.total_amount),

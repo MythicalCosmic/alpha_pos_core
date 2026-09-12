@@ -5,7 +5,7 @@ from bisect import bisect_right
 from decimal import Decimal, InvalidOperation
 from django.conf import settings
 from django.db import IntegrityError, transaction
-from django.db.models import Sum, Count, DecimalField
+from django.db.models import Sum, Count, DecimalField, Q
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 from base.repositories.shift import ShiftTemplateRepository, ShiftRepository, CashReconciliationRepository
@@ -653,13 +653,13 @@ def _unpaid_monetary_orders(shift, evidence_end):
     return (
         Order.objects.filter(
             is_deleted=False,
-            cashier_id=shift.user_id,
             branch_id=shift.branch_id,
             created_at__gte=shift.start_time,
             created_at__lt=evidence_end,
             is_paid=False,
             total_amount__gt=0,
         )
+        .filter(Q(cashier_id=shift.user_id) | Q(waiter_shift_id=shift.pk))
         .exclude(status=Order.Status.CANCELED)
     )
 
@@ -1275,6 +1275,9 @@ class ShiftService:
         data = ShiftService._serialize_shift(shift)
         if reuse_existing:
             data['resumed'] = False
+        if user.role == 'WAITER':
+            from hr.services import AttendanceService
+            transaction.on_commit(lambda: AttendanceService.auto_check_in(user_id), robust=True)
         return ServiceResponse.created(data=data)
 
     @staticmethod
@@ -1480,6 +1483,9 @@ class ShiftService:
         # The shift is ENDED and persisted above. Serializing the response must
         # NOT be able to revert that: an exception in get_with_relations /
         # _serialize_shift here propagates out of the outer @transaction.atomic
+        if shift.user.role == 'WAITER':
+            from hr.services import AttendanceService
+            transaction.on_commit(lambda: AttendanceService.auto_check_out(shift.user_id), robust=True)
         # and rolls back the ENDED write — so the till could never close on a
         # serialization hiccup. Catch it and return a minimal payload; the shift
         # is closed regardless (the caller re-reads it via /shifts/current).
