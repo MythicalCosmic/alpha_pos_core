@@ -21,6 +21,7 @@ urlpatterns = [
 
     # Expenses
     path('expenses/', expense_views.expenses, name='expense-list'),
+    path('expenses/reclassify/', expense_views.expense_reclassify, name='expense-reclassify'),
     path('expenses/stats/', expense_views.expense_stats, name='expense-stats'),
     path('expenses/<int:expense_id>/', expense_views.expense_detail, name='expense-detail'),
     path('expenses/<int:expense_id>/approve/', expense_views.expense_approve, name='expense-approve'),

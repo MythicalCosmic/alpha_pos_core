@@ -3,7 +3,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_http_methods, require_POST
 
 from base.helpers.request import parse_json_body, safe_page, safe_per_page
-from base.helpers.response import json_response
+from base.helpers.response import ServiceResponse, json_response
 from base.security.idempotency import idempotent
 from base.security.audit import audit
 from base.security.permissions import (
@@ -46,11 +46,25 @@ def expense_categories(request):
             per_page=safe_per_page(request, 20),
             search=query_value(request, 'search'),
             is_active=query_bool(request, 'is_active', 'status'),
+            parent_id=query_int(request, 'parent_id'),
+            cost_behavior=query_value(request, 'cost_behavior'),
+            roots_only=bool(query_bool(request, 'roots_only')),
+            actor=request.user,
         )
         return JsonResponse(result, status=status)
     data, error = parse_json_body(request)
     if error:
         return json_response(error)
+    allowed = {
+        'name', 'code', 'description', 'budget_limit', 'is_active',
+        'reporting_group', 'parent_id', 'cost_behavior', 'sort_order',
+        'allowed_sources', 'requires_receipt', 'requires_description',
+    }
+    unknown = sorted(set(data) - allowed)
+    if unknown:
+        return json_response(ServiceResponse.validation_error({
+            field: ['Unknown field.'] for field in unknown
+        }))
     result, status = ExpenseCategoryService.create(actor=request.user, **data)
     if result.get('success'):
         category = result['data']['category']
@@ -79,7 +93,10 @@ def expense_category_detail(request, category_id):
     if denied := permission_denied_response(request, permission):
         return denied
     if request.method == 'GET':
-        result, status = ExpenseCategoryService.get(category_id)
+        result, status = ExpenseCategoryService.get(
+            category_id,
+            actor=request.user,
+        )
     elif request.method == 'DELETE':
         result, status = ExpenseCategoryService.deactivate(
             category_id,
@@ -137,11 +154,57 @@ def expenses(request):
         per_page=safe_per_page(request, 20),
         status=query_enum(request, 'status'),
         category_id=query_int(request, 'category_id', 'category', 'type'),
+        category_parent_id=query_int(request, 'category_parent_id'),
+        include_subcategories=bool(query_bool(request, 'include_subcategories')),
+        cost_behavior=query_value(request, 'cost_behavior'),
+        reporting_group=query_value(request, 'reporting_group'),
+        source_account=query_value(request, 'source_account', 'requested_source'),
         date_from=date_from,
         date_to=date_to,
         search=query_value(request, 'search'),
         actor=request.user,
         view_all=view_all,
+    )
+    return JsonResponse(result, status=status)
+
+
+@csrf_exempt
+@require_POST
+@backoffice_required
+@idempotent(
+    'expense.request.reclassify.compat',
+    required=True,
+    expose_action_id=True,
+    recover_inflight_after_seconds=5,
+)
+def expense_reclassify(request):
+    for permission in ('expense.category.manage', 'expense.request.approve'):
+        if denied := permission_denied_response(request, permission):
+            return denied
+    data, error = parse_json_body(request)
+    if error:
+        return json_response(error)
+    allowed = {
+        'expense_ids', 'category_id', 'expected_category_id',
+        'reason', 'dry_run',
+    }
+    unknown = sorted(set(data) - allowed)
+    if unknown:
+        return json_response(ServiceResponse.validation_error({
+            field: ['Unknown field.'] for field in unknown
+        }))
+    result, status = ExpenseService.reclassify_pending(
+        expense_ids=data.get('expense_ids'),
+        category_id=data.get('category_id'),
+        expected_category_id=data.get('expected_category_id'),
+        reason=data.get('reason', ''),
+        dry_run=data.get('dry_run', True),
+        actor=request.user,
+        action_id=getattr(request, 'idempotency_action_id', None),
+        idempotency_key=getattr(request, 'idempotency_key', ''),
+    )
+    result.get('data', {}).get('reclassification', {}).pop(
+        '_applied_now', None,
     )
     return JsonResponse(result, status=status)
 

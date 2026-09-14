@@ -61,7 +61,7 @@ def cashbox_categories(request):
     if denied := permission_denied_response(request, permission):
         return denied
     if request.method == "GET":
-        result, status_code = CashboxCategoryService.list()
+        result, status_code = CashboxCategoryService.list(actor=request.user)
         return JsonResponse(result, status=status_code)
     data, error = parse_json_body(request)
     if error:

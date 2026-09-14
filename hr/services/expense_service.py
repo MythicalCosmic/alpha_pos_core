@@ -6,6 +6,7 @@ from django.db.models import Count, DecimalField, F, Q, Sum
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 
+from base.financial import EXPENSE_REPORTING_GROUPS
 from base.helpers.response import ServiceResponse
 from base.models import TreasuryTransaction, User
 from base.money import (
@@ -60,6 +61,12 @@ def _transition(
         'category_id': expense.category_id,
         'category_code': expense.category_code_snapshot or None,
         'category_name': expense.category_name_snapshot or None,
+        'category_parent_code': expense.category_parent_code_snapshot or None,
+        'category_parent_name': expense.category_parent_name_snapshot or None,
+        'category_cost_behavior': expense.category_cost_behavior_snapshot,
+        'category_reporting_group': (
+            expense.category_reporting_group_snapshot or None
+        ),
         **(metadata or {}),
     }
     return ExpenseTransition.objects.create(
@@ -82,16 +89,127 @@ def _cashbox_payment(expense):
         return None
 
 
+def _category_snapshot(category):
+    parent = category.parent if category.parent_id else None
+    return {
+        'category': category,
+        'category_code_snapshot': category.code,
+        'category_name_snapshot': category.name,
+        'category_allowed_sources_snapshot': [
+            str(value).upper() for value in (category.allowed_sources or [])
+        ],
+        'category_parent_code_snapshot': parent.code if parent else '',
+        'category_parent_name_snapshot': parent.name if parent else '',
+        'category_cost_behavior_snapshot': category.cost_behavior,
+        'category_reporting_group_snapshot': category.reporting_group,
+    }
+
+
+def _expense_category_evidence(expense):
+    return {
+        'category_id': expense.category_id,
+        'code': expense.category_code_snapshot or None,
+        'name': expense.category_name_snapshot or None,
+        'parent_code': expense.category_parent_code_snapshot or None,
+        'parent_name': expense.category_parent_name_snapshot or None,
+        'cost_behavior': expense.category_cost_behavior_snapshot,
+        'reporting_group': expense.category_reporting_group_snapshot or None,
+    }
+
+
+def _category_assignment_evidence(category):
+    parent = category.parent if category.parent_id else None
+    return {
+        'category_id': category.id,
+        'code': category.code,
+        'name': category.name,
+        'parent_code': parent.code if parent else None,
+        'parent_name': parent.name if parent else None,
+        'cost_behavior': category.cost_behavior,
+        'reporting_group': category.reporting_group,
+    }
+
+
+def _reclassification_summary(
+    expenses,
+    requested_ids,
+    target,
+    before_by_expense,
+    *,
+    dry_run,
+    mutation_applied,
+):
+    by_source = {}
+    by_category = {}
+    amount = Decimal('0')
+    for expense in expenses:
+        amount += expense.amount
+        by_source[expense.requested_source] = (
+            by_source.get(expense.requested_source, 0) + 1
+        )
+        before = before_by_expense[expense.id]
+        key = str(before.get('category_id') or '')
+        row = by_category.setdefault(key, {
+            'category_id': before.get('category_id'),
+            'category_name': before.get('name'),
+            'count': 0,
+            'amount_uzs': 0,
+        })
+        row['count'] += 1
+        row['amount_uzs'] += uzs_int(expense.amount)
+    return {
+        'dry_run': dry_run,
+        'mutation_applied': mutation_applied,
+        'expense_count': len(expenses),
+        'amount_uzs': uzs_int(amount),
+        'expense_ids': requested_ids,
+        'target_category': {
+            'id': target['category_id'],
+            'code': target['code'],
+            'name': target['name'],
+            'path': [
+                *([target['parent_name']] if target.get('parent_name') else []),
+                target['name'],
+            ],
+            'cost_behavior': target['cost_behavior'],
+            'reporting_group': target['reporting_group'],
+        },
+        'current_categories': list(by_category.values()),
+        'by_source': by_source,
+    }
+
+
 class ExpenseService:
     @classmethod
     def serialize(cls, expense, *, include_transitions=False):
         category = None
         if expense.category_id:
+            parent = None
+            if (
+                expense.category_parent_code_snapshot
+                or expense.category_parent_name_snapshot
+            ):
+                parent = {
+                    'code': expense.category_parent_code_snapshot or None,
+                    'name': expense.category_parent_name_snapshot or None,
+                }
+            category_name = (
+                expense.category_name_snapshot or expense.category.name
+            )
             category = {
                 'id': expense.category_id,
                 'code': expense.category_code_snapshot or expense.category.code,
-                'name': expense.category_name_snapshot or expense.category.name,
-                'reporting_group': expense.category.reporting_group,
+                'name': category_name,
+                'parent': parent,
+                'path': [
+                    *([parent['name']] if parent and parent['name'] else []),
+                    category_name,
+                ],
+                'cost_behavior': expense.category_cost_behavior_snapshot,
+                'reporting_group': (
+                    expense.category_reporting_group_snapshot
+                    or expense.category.reporting_group
+                ),
                 'is_active': expense.category.is_active,
             }
         elif expense.category_name_snapshot or expense.category_code_snapshot:
@@ -99,7 +217,24 @@ class ExpenseService:
                 'id': None,
                 'code': expense.category_code_snapshot or None,
                 'name': expense.category_name_snapshot or None,
-                'reporting_group': None,
+                'parent': ({
+                    'code': expense.category_parent_code_snapshot or None,
+                    'name': expense.category_parent_name_snapshot or None,
+                } if (
+                    expense.category_parent_code_snapshot
+                    or expense.category_parent_name_snapshot
+                ) else None),
+                'path': [
+                    *(
+                        [expense.category_parent_name_snapshot]
+                        if expense.category_parent_name_snapshot else []
+                    ),
+                    expense.category_name_snapshot,
+                ],
+                'cost_behavior': expense.category_cost_behavior_snapshot,
+                'reporting_group': (
+                    expense.category_reporting_group_snapshot or None
+                ),
                 'is_active': False,
             }
         cashbox = _cashbox_payment(expense)
@@ -123,6 +258,18 @@ class ExpenseService:
             'category_id': expense.category_id,
             'category_code_snapshot': expense.category_code_snapshot,
             'category_name_snapshot': expense.category_name_snapshot,
+            'category_parent_code_snapshot': (
+                expense.category_parent_code_snapshot
+            ),
+            'category_parent_name_snapshot': (
+                expense.category_parent_name_snapshot
+            ),
+            'category_cost_behavior_snapshot': (
+                expense.category_cost_behavior_snapshot
+            ),
+            'category_reporting_group_snapshot': (
+                expense.category_reporting_group_snapshot
+            ),
             'amount': str(expense.amount),
             'amount_uzs': uzs_int(expense.amount),
             'fee_uzs': uzs_int(expense.fee_uzs),
@@ -204,6 +351,11 @@ class ExpenseService:
         per_page=20,
         status=None,
         category_id=None,
+        category_parent_id=None,
+        include_subcategories=False,
+        cost_behavior=None,
+        reporting_group=None,
+        source_account=None,
         date_from=None,
         date_to=None,
         search=None,
@@ -217,6 +369,10 @@ class ExpenseService:
             return ServiceResponse.failure(
                 'BRANCH_SCOPE_REQUIRED', 'Expense branch could not be resolved.', 403,
             )
+        if not isinstance(include_subcategories, bool):
+            return ServiceResponse.validation_error({
+                'include_subcategories': ['Use a JSON boolean.'],
+            })
         queryset = cls._queryset().filter(branch_id=branch_id)
         if not view_all:
             queryset = queryset.filter(created_by=actor)
@@ -232,7 +388,41 @@ class ExpenseService:
                 })
             queryset = queryset.filter(status__in=statuses)
         if category_id is not None:
-            queryset = queryset.filter(category_id=category_id)
+            category_filter = Q(category_id=category_id)
+            if include_subcategories:
+                category_filter |= Q(category__parent_id=category_id)
+            queryset = queryset.filter(category_filter)
+        if category_parent_id is not None:
+            queryset = queryset.filter(category__parent_id=category_parent_id)
+        if cost_behavior:
+            normalized_behavior = str(cost_behavior).strip().upper()
+            if normalized_behavior not in ExpenseCategory.CostBehavior.values:
+                return ServiceResponse.validation_error({
+                    'cost_behavior': ['Unknown cost behavior.'],
+                })
+            queryset = queryset.filter(
+                category_cost_behavior_snapshot=normalized_behavior,
+            )
+        if reporting_group:
+            normalized_group = str(reporting_group).strip().upper()
+            if normalized_group not in EXPENSE_REPORTING_GROUPS:
+                return ServiceResponse.validation_error({
+                    'reporting_group': ['Unknown financial reporting group.'],
+                })
+            queryset = queryset.filter(
+                Q(category_reporting_group_snapshot=normalized_group)
+                | Q(
+                    category_reporting_group_snapshot='',
+                    category__reporting_group=normalized_group,
+                )
+            )
+        if source_account:
+            normalized_source = str(source_account).strip().upper()
+            if normalized_source not in Expense.Source.values:
+                return ServiceResponse.validation_error({
+                    'source_account': ['Must be DRAWER, SAFE, or BANK.'],
+                })
+            queryset = queryset.filter(requested_source=normalized_source)
         if date_from:
             queryset = queryset.filter(expense_date__gte=date_from)
         if date_to:
@@ -357,10 +547,12 @@ class ExpenseService:
                 422,
                 errors={'category_id': ['This field is required.']},
             )
-        category = ExpenseCategory.objects.filter(
+        category = ExpenseCategory.objects.select_for_update(
+            of=('self',),
+        ).filter(
             pk=category_id,
             is_deleted=False,
-        ).first()
+        ).select_related('parent').first()
         if category is None:
             return ServiceResponse.not_found('Expense category not found')
         if not category.is_active:
@@ -369,6 +561,17 @@ class ExpenseService:
                 'Inactive categories cannot be used for new expenses.',
                 422,
                 errors={'category_id': ['Category is inactive.']},
+            )
+        if ExpenseCategory.objects.filter(
+            parent_id=category.id,
+            is_deleted=False,
+            is_active=True,
+        ).exists():
+            return ServiceResponse.failure(
+                'EXPENSE_CATEGORY_GROUP_ONLY',
+                'Choose a subcategory for this expense.',
+                422,
+                errors={'category_id': ['This category contains subcategories.']},
             )
         source = str(requested_source or '').strip().upper()
         if not source and payment_method:
@@ -448,10 +651,7 @@ class ExpenseService:
             else Expense.PaymentMethod.BANK_TRANSFER
         )
         expense = Expense.objects.create(
-            category=category,
-            category_code_snapshot=category.code,
-            category_name_snapshot=category.name,
-            category_allowed_sources_snapshot=allowed_sources,
+            **_category_snapshot(category),
             amount=amount_value,
             description=description,
             expense_date=parsed_date,
@@ -889,7 +1089,9 @@ class ExpenseService:
             return ServiceResponse.failure(
                 'BRANCH_SCOPE_REQUIRED', 'Expense branch could not be resolved.', 403,
             )
-        expense = Expense.objects.select_for_update().filter(
+        expense = Expense.objects.select_for_update(
+            of=('self',),
+        ).select_related('category').filter(
             pk=expense_id,
             branch_id=branch_id,
             is_deleted=False,
@@ -901,6 +1103,36 @@ class ExpenseService:
         if expense.status != Expense.Status.PENDING:
             return cls._state_conflict(expense, Expense.Status.PENDING)
         allowed = {'description', 'expense_date', 'receipt_number', 'notes'}
+        unknown = sorted(set(values) - allowed)
+        if unknown:
+            return ServiceResponse.validation_error({
+                field: ['Unknown field.'] for field in unknown
+            })
+        if 'expense_date' in values:
+            parsed_date = _parse_date(values['expense_date'])
+            if parsed_date is None:
+                return ServiceResponse.validation_error({
+                    'expense_date': ['Use YYYY-MM-DD.'],
+                })
+            values['expense_date'] = parsed_date
+        for field in ('description', 'receipt_number', 'notes'):
+            if field in values:
+                values[field] = str(values[field] or '').strip()
+        category = expense.category
+        next_description = values.get('description', expense.description)
+        next_receipt = values.get('receipt_number', expense.receipt_number)
+        if category and category.requires_description and not next_description:
+            return ServiceResponse.validation_error({
+                'description': ['Description is required by this category.'],
+            })
+        if (
+            category
+            and category.requires_receipt
+            and not (next_receipt or expense.receipt_file)
+        ):
+            return ServiceResponse.validation_error({
+                'receipt_number': ['Receipt evidence is required by this category.'],
+            })
         changed = []
         for field in allowed:
             if field in values:
@@ -908,6 +1140,306 @@ class ExpenseService:
                 changed.append(field)
         expense.save(update_fields=[*changed, 'updated_at'])
         return ServiceResponse.success(data={'expense': cls.serialize(expense)})
+
+    @classmethod
+    @transaction.atomic
+    def reclassify_pending(
+        cls,
+        *,
+        expense_ids,
+        category_id,
+        actor,
+        reason='',
+        dry_run=True,
+        expected_category_id=None,
+        action_id=None,
+        idempotency_key='',
+    ):
+        if not isinstance(dry_run, bool):
+            return ServiceResponse.validation_error({
+                'dry_run': ['Use a JSON boolean.'],
+            })
+        if not isinstance(expense_ids, list) or not expense_ids:
+            return ServiceResponse.validation_error({
+                'expense_ids': ['Choose at least one expense.'],
+            })
+        if len(expense_ids) > 500:
+            return ServiceResponse.validation_error({
+                'expense_ids': ['At most 500 expenses may be reviewed at once.'],
+            })
+        if any(
+            isinstance(value, bool)
+            or not str(value).isascii()
+            or not str(value).isdigit()
+            or int(value) < 1
+            for value in expense_ids
+        ):
+            return ServiceResponse.validation_error({
+                'expense_ids': ['Use positive integer expense IDs.'],
+            })
+        normalized_ids = [int(value) for value in expense_ids]
+        if len(set(normalized_ids)) != len(normalized_ids):
+            return ServiceResponse.validation_error({
+                'expense_ids': ['Duplicate expense IDs are not allowed.'],
+            })
+        if (
+            isinstance(category_id, bool)
+            or not str(category_id).isascii()
+            or not str(category_id).isdigit()
+            or int(category_id) < 1
+        ):
+            return ServiceResponse.validation_error({
+                'category_id': ['Use a positive category ID.'],
+            })
+        if expected_category_id not in (None, '') and (
+            isinstance(expected_category_id, bool)
+            or not str(expected_category_id).isascii()
+            or not str(expected_category_id).isdigit()
+            or int(expected_category_id) < 1
+        ):
+            return ServiceResponse.validation_error({
+                'expected_category_id': ['Use a positive category ID or null.'],
+            })
+        reason = str(reason or '').strip()
+        if not dry_run and not reason:
+            return ServiceResponse.validation_error({
+                'reason': ['A reason is required to apply reclassification.'],
+            })
+        if len(reason) > 1000:
+            return ServiceResponse.validation_error({
+                'reason': ['Maximum length is 1000.'],
+            })
+        branch_id = str(resolve_actor_branch(actor) or '').strip()
+        if not branch_id:
+            return ServiceResponse.failure(
+                'BRANCH_SCOPE_REQUIRED',
+                'Expense branch could not be resolved.',
+                403,
+            )
+        expenses = list(
+            Expense.objects.select_for_update(of=('self',)).filter(
+                id__in=normalized_ids,
+                branch_id=branch_id,
+                is_deleted=False,
+            ).select_related('category').order_by('id')
+        )
+        found_ids = {expense.id for expense in expenses}
+        missing_ids = sorted(set(normalized_ids) - found_ids)
+        if missing_ids:
+            return ServiceResponse.failure(
+                'EXPENSE_RECLASSIFICATION_SCOPE_MISMATCH',
+                'One or more expenses were not found in the authorized branch.',
+                404,
+                details={'missing_expense_ids': missing_ids},
+            )
+        invalid_status = [
+            expense.id for expense in expenses
+            if expense.status != Expense.Status.PENDING
+        ]
+        if invalid_status:
+            return ServiceResponse.conflict(
+                'EXPENSE_RECLASSIFICATION_STATE_CONFLICT',
+                'Only pending expenses can be reclassified.',
+                details={'expense_ids': invalid_status},
+            )
+
+        action_token = str(action_id or '').strip()
+        if not dry_run and action_token:
+            recovery_events = list(ExpenseTransition.objects.filter(
+                expense_id__in=normalized_ids,
+                branch_id=branch_id,
+                actor_id=getattr(actor, 'id', None),
+                metadata__event='CATEGORY_RECLASSIFIED',
+                metadata__action_id=action_token,
+            ).order_by('expense_id', 'id'))
+            if recovery_events:
+                event_by_expense = {
+                    event.expense_id: event for event in recovery_events
+                }
+                if (
+                    len(event_by_expense) != len(expenses)
+                    or len(recovery_events) != len(expenses)
+                    or any(
+                        not isinstance(event.metadata.get('category_before'), dict)
+                        or not isinstance(event.metadata.get('category_after'), dict)
+                        for event in recovery_events
+                    )
+                ):
+                    return ServiceResponse.conflict(
+                        'EXPENSE_RECLASSIFICATION_RECOVERY_CONFLICT',
+                        'Reclassification recovery evidence is incomplete.',
+                        details={'expense_ids': normalized_ids},
+                    )
+                before_by_expense = {
+                    expense_id: event.metadata.get('category_before')
+                    for expense_id, event in event_by_expense.items()
+                }
+                target_evidence = recovery_events[0].metadata.get('category_after')
+                same_target = all(
+                    event.metadata.get('category_after', {}).get('category_id')
+                    == int(category_id)
+                    for event in recovery_events
+                )
+                if not same_target:
+                    return ServiceResponse.conflict(
+                        'EXPENSE_RECLASSIFICATION_RECOVERY_CONFLICT',
+                        'Idempotent action targets a different category.',
+                        details={'expense_ids': normalized_ids},
+                    )
+                if expected_category_id not in (None, ''):
+                    expected_id = int(expected_category_id)
+                    if any(
+                        evidence.get('category_id') != expected_id
+                        for evidence in before_by_expense.values()
+                    ):
+                        return ServiceResponse.conflict(
+                            'EXPENSE_RECLASSIFICATION_RECOVERY_CONFLICT',
+                            'Idempotent action has different source evidence.',
+                            details={'expense_ids': normalized_ids},
+                        )
+                response = _reclassification_summary(
+                    expenses,
+                    normalized_ids,
+                    target_evidence,
+                    before_by_expense,
+                    dry_run=False,
+                    mutation_applied=True,
+                )
+                return ServiceResponse.success(
+                    data={'reclassification': response},
+                    message='Pending expenses reclassified',
+                )
+
+        category = ExpenseCategory.objects.select_for_update(
+            of=('self',),
+        ).filter(
+            pk=int(category_id),
+            is_deleted=False,
+        ).select_related('parent').first()
+        if category is None:
+            return ServiceResponse.not_found('Expense category not found')
+        if not category.is_active:
+            return ServiceResponse.failure(
+                'EXPENSE_CATEGORY_INACTIVE',
+                'Inactive categories cannot be assigned.',
+                422,
+                errors={'category_id': ['Category is inactive.']},
+            )
+        if ExpenseCategory.objects.filter(
+            parent_id=category.id,
+            is_deleted=False,
+            is_active=True,
+        ).exists():
+            return ServiceResponse.failure(
+                'EXPENSE_CATEGORY_GROUP_ONLY',
+                'Choose a subcategory for these expenses.',
+                422,
+                errors={'category_id': ['This category contains subcategories.']},
+            )
+        if expected_category_id not in (None, ''):
+            expected_category_id = int(expected_category_id)
+            changed_elsewhere = [
+                expense.id for expense in expenses
+                if expense.category_id != expected_category_id
+            ]
+            if changed_elsewhere:
+                return ServiceResponse.conflict(
+                    'EXPENSE_RECLASSIFICATION_STALE_SELECTION',
+                    'Some expenses no longer have the expected category.',
+                    details={'expense_ids': changed_elsewhere},
+                )
+        unchanged_ids = [
+            expense.id for expense in expenses
+            if expense.category_id == category.id
+        ]
+        if unchanged_ids:
+            return ServiceResponse.conflict(
+                'EXPENSE_RECLASSIFICATION_NO_CHANGE',
+                'One or more expenses already use the target category.',
+                details={'expense_ids': unchanged_ids},
+            )
+        allowed_sources = set(
+            _category_snapshot(category)['category_allowed_sources_snapshot']
+        )
+        source_mismatches = [
+            expense.id for expense in expenses
+            if expense.requested_source not in allowed_sources
+        ]
+        if source_mismatches:
+            return ServiceResponse.failure(
+                'EXPENSE_SOURCE_NOT_ALLOWED',
+                'The target category does not allow every requested source.',
+                422,
+                errors={'category_id': ['Payment source is incompatible.']},
+                details={'expense_ids': source_mismatches},
+            )
+        missing_descriptions = [
+            expense.id for expense in expenses
+            if category.requires_description and not expense.description.strip()
+        ]
+        missing_receipts = [
+            expense.id for expense in expenses
+            if category.requires_receipt
+            and not (expense.receipt_number.strip() or expense.receipt_file)
+        ]
+        if missing_descriptions or missing_receipts:
+            errors = {}
+            if missing_descriptions:
+                errors['description'] = ['Description evidence is missing.']
+            if missing_receipts:
+                errors['receipt_number'] = ['Receipt evidence is missing.']
+            return ServiceResponse.failure(
+                'EXPENSE_RECLASSIFICATION_EVIDENCE_MISSING',
+                'Some expenses do not satisfy the target category rules.',
+                422,
+                errors=errors,
+                details={
+                    'missing_description_expense_ids': missing_descriptions,
+                    'missing_receipt_expense_ids': missing_receipts,
+                },
+            )
+        before_by_expense = {
+            expense.id: _expense_category_evidence(expense)
+            for expense in expenses
+        }
+        target_evidence = _category_assignment_evidence(category)
+        response = _reclassification_summary(
+            expenses,
+            normalized_ids,
+            target_evidence,
+            before_by_expense,
+            dry_run=dry_run,
+            mutation_applied=False,
+        )
+        if dry_run:
+            return ServiceResponse.success(data={'reclassification': response})
+        snapshot = _category_snapshot(category)
+        snapshot_fields = list(snapshot)
+        for expense in expenses:
+            before = before_by_expense[expense.id]
+            for field, value in snapshot.items():
+                setattr(expense, field, value)
+            expense.save(update_fields=[*snapshot_fields, 'updated_at'])
+            _transition(
+                expense,
+                Expense.Status.PENDING,
+                Expense.Status.PENDING,
+                actor,
+                reason=reason,
+                idempotency_key=idempotency_key,
+                metadata={
+                    'event': 'CATEGORY_RECLASSIFIED',
+                    'action_id': action_token or None,
+                    'category_before': before,
+                    'category_after': _expense_category_evidence(expense),
+                },
+            )
+        response['mutation_applied'] = True
+        response['_applied_now'] = True
+        return ServiceResponse.success(
+            data={'reclassification': response},
+            message='Pending expenses reclassified',
+        )
 
     @classmethod
     def delete(cls, expense_id, actor=None):

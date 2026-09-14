@@ -223,6 +223,7 @@ FK_UUID_MAPPINGS = {
     'department_uuid': ('hr', 'Department', 'department'),
     'employee_uuid': ('hr', 'Employee', 'employee'),
     'attendance_uuid': ('hr', 'Attendance', 'attendance'),
+    'expense_parent_uuid': ('hr', 'ExpenseCategory', 'parent'),
     'expense_category_uuid': ('hr', 'ExpenseCategory', 'category'),
     'expense_uuid': ('hr', 'Expense', 'expense'),
     'subject_user_uuid': ('base', 'User', 'subject_user'),

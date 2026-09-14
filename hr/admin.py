@@ -24,9 +24,13 @@ class EmployeeAdmin(admin.ModelAdmin):
 
 @admin.register(ExpenseCategory)
 class ExpenseCategoryAdmin(admin.ModelAdmin):
-    list_display = ('id', 'name', 'budget_limit', 'is_active')
-    list_filter = ('is_active',)
-    search_fields = ('name',)
+    list_display = (
+        'id', 'name', 'parent', 'cost_behavior', 'reporting_group',
+        'budget_limit', 'is_active',
+    )
+    list_filter = ('is_active', 'cost_behavior', 'reporting_group')
+    list_select_related = ('parent',)
+    search_fields = ('name', 'code', 'parent__name')
 
 
 @admin.register(Expense)

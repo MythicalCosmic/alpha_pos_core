@@ -108,10 +108,30 @@ class Employee(SyncMixin, models.Model):
 
 
 class ExpenseCategory(SyncMixin, models.Model):
+    class CostBehavior(models.TextChoices):
+        UNCLASSIFIED = 'UNCLASSIFIED', 'Unclassified'
+        FIXED = 'FIXED', 'Fixed'
+        VARIABLE = 'VARIABLE', 'Variable'
+        MIXED = 'MIXED', 'Mixed'
+        ONE_TIME = 'ONE_TIME', 'One-time'
+
     SYNC_PULL_SCOPE = 'global'
     code = models.CharField(max_length=64, unique=True)
     name = models.CharField(max_length=100)
     description = models.TextField(blank=True, default='')
+    parent = models.ForeignKey(
+        'self',
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='subcategories',
+    )
+    cost_behavior = models.CharField(
+        max_length=16,
+        choices=CostBehavior.choices,
+        default=CostBehavior.UNCLASSIFIED,
+        db_index=True,
+    )
     budget_limit = models.DecimalField(
         max_digits=12, decimal_places=2, null=True, blank=True,
     )
@@ -144,12 +164,62 @@ class ExpenseCategory(SyncMixin, models.Model):
     class Meta:
         verbose_name_plural = 'expense categories'
         ordering = ['sort_order', 'name', 'id']
+        constraints = [
+            models.CheckConstraint(
+                condition=~models.Q(parent=models.F('id')),
+                name='hr_expcat_parent_not_self',
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=['parent', 'is_active', 'sort_order'],
+                name='hr_expcat_tree_idx',
+            ),
+        ]
 
     def to_sync_dict(self):
         data = super().to_sync_dict()
+        data['expense_parent_uuid'] = (
+            str(self.parent.uuid) if self.parent else None
+        )
         data['created_by_uuid'] = str(self.created_by.uuid) if self.created_by else None
         data['updated_by_uuid'] = str(self.updated_by.uuid) if self.updated_by else None
         return data
+
+    def _validate_hierarchy(self):
+        errors = {}
+        if self.parent_id:
+            if self.pk and self.parent_id == self.pk:
+                errors['parent'] = 'A category cannot be its own parent.'
+            else:
+                parent = type(self).objects.filter(pk=self.parent_id).only(
+                    'id', 'parent_id', 'is_active', 'is_deleted',
+                ).first()
+                if parent is None or parent.is_deleted:
+                    errors['parent'] = 'Parent category does not exist.'
+                elif parent.parent_id:
+                    errors['parent'] = 'Only one subcategory level is supported.'
+                elif self.is_active and not parent.is_active:
+                    errors['parent'] = 'An active category requires an active parent.'
+        if self.pk and self.parent_id:
+            has_children = type(self).objects.filter(
+                parent_id=self.pk,
+                is_deleted=False,
+            ).exists()
+            if has_children:
+                errors['parent'] = 'A category with subcategories cannot become a subcategory.'
+        if self.pk and not self.is_active:
+            has_active_children = type(self).objects.filter(
+                parent_id=self.pk,
+                is_deleted=False,
+                is_active=True,
+            ).exists()
+            if has_active_children:
+                errors['is_active'] = (
+                    'Deactivate active subcategories before deactivating their parent.'
+                )
+        if errors:
+            raise ValidationError(errors)
 
     def save(self, *args, **kwargs):
         if self.pk:
@@ -167,6 +237,7 @@ class ExpenseCategory(SyncMixin, models.Model):
             if type(self).objects.filter(code=candidate).exists():
                 candidate = f'{stem}_{self.uuid.hex[:8].upper()}'
             self.code = candidate
+        self._validate_hierarchy()
         return super().save(*args, **kwargs)
 
     def __str__(self):
@@ -204,6 +275,21 @@ class Expense(SyncMixin, models.Model):
     category_code_snapshot = models.CharField(max_length=64, blank=True, default='')
     category_name_snapshot = models.CharField(max_length=100, blank=True, default='')
     category_allowed_sources_snapshot = models.JSONField(default=list, blank=True)
+    category_parent_code_snapshot = models.CharField(
+        max_length=64, blank=True, default='',
+    )
+    category_parent_name_snapshot = models.CharField(
+        max_length=100, blank=True, default='',
+    )
+    category_cost_behavior_snapshot = models.CharField(
+        max_length=16,
+        choices=ExpenseCategory.CostBehavior.choices,
+        default=ExpenseCategory.CostBehavior.UNCLASSIFIED,
+        db_index=True,
+    )
+    category_reporting_group_snapshot = models.CharField(
+        max_length=32, blank=True, default='', db_index=True,
+    )
     amount = models.DecimalField(max_digits=12, decimal_places=2)
     description = models.TextField(blank=True, default='')
     expense_date = models.DateField()

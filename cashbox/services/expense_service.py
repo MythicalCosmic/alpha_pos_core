@@ -315,10 +315,13 @@ class CashboxExpenseService:
 
 class CashboxCategoryService:
     @staticmethod
-    def list():
+    def list(actor=None):
         from hr.services.expense_category_service import ExpenseCategoryService
 
-        result, status = ExpenseCategoryService.list(per_page=100)
+        result, status = ExpenseCategoryService.list(
+            per_page=100,
+            actor=actor,
+        )
         if status >= 400:
             return result, status
         return ServiceResponse.success(data=result['data']['categories'])
