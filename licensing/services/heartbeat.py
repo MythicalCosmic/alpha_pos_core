@@ -671,6 +671,60 @@ def do_heartbeat() -> Tuple[Dict[str, Any], int]:
     return body, 200
 
 
+_SHELL_STATE_MAX_BYTES = 64 * 1024
+
+
+def _desktop_shell_metrics() -> Dict[str, Any]:
+    """Tauri desktop shell diagnostics for the control-center support view.
+
+    Desktop tills only: the shell passes its own version, the WebView2 runtime
+    version and the path of its update-state file to the backend through the
+    environment. Everything is bounded, and a missing or malformed file never
+    affects the heartbeat itself.
+    """
+    shell: Dict[str, Any] = {}
+    for key, env_name in (
+        ('version', 'ALPHA_POS_SHELL_VERSION'),
+        ('webview2_version', 'ALPHA_POS_WEBVIEW2_VERSION'),
+    ):
+        value = str(os.environ.get(env_name) or '').strip()
+        if value:
+            shell[key] = value[:40]
+
+    state_file = str(os.environ.get('ALPHA_POS_SHELL_STATE_FILE') or '').strip()
+    if not state_file:
+        return shell
+    try:
+        with open(state_file, 'rb') as stream:
+            raw = stream.read(_SHELL_STATE_MAX_BYTES + 1)
+        if len(raw) > _SHELL_STATE_MAX_BYTES:
+            return shell
+        state = json.loads(raw.decode('utf-8'))
+    except FileNotFoundError:
+        return shell
+    except (OSError, ValueError, UnicodeDecodeError):
+        logger.debug('heartbeat: desktop shell state unreadable', exc_info=True)
+        return shell
+    if not isinstance(state, dict):
+        return shell
+
+    blocked = state.get('blocked_versions')
+    if isinstance(blocked, list):
+        shell['blocked_versions'] = [str(item)[:40] for item in blocked[:10]]
+    pending = state.get('pending_confirmation')
+    if isinstance(pending, str) and pending:
+        shell['pending_confirmation'] = pending[:40]
+    rollback = state.get('last_rollback')
+    if isinstance(rollback, dict):
+        shell['last_rollback'] = {
+            'from_version': str(rollback.get('from_version') or '')[:40],
+            'to_version': str(rollback.get('to_version') or '')[:40],
+            'reason': str(rollback.get('reason') or '')[:200],
+            'at_unix': rollback.get('at_unix') if isinstance(rollback.get('at_unix'), int) else None,
+        }
+    return shell
+
+
 def _collect_metrics() -> Dict[str, Any]:
     """Tiny diagnostic payload for the control-center support view.
     Bounded on purpose — never include PII or order content."""
@@ -692,6 +746,9 @@ def _collect_metrics() -> Dict[str, Any]:
         # loaded yet — skip rather than crash the heartbeat. Anything wider
         # would hide real bugs in the metrics path.
         logger.debug('heartbeat: metrics collection skipped', exc_info=True)
+    shell = _desktop_shell_metrics()
+    if shell:
+        metrics['desktop_shell'] = shell
     return metrics
 
 
