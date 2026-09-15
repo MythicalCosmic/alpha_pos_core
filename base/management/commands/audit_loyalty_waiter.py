@@ -3,7 +3,7 @@ import json
 
 from django.apps import apps
 from django.core.management.base import BaseCommand
-from django.db.models import Count, Exists, F, OuterRef, Q, Sum
+from django.db.models import Count, Exists, F, OuterRef, Sum
 from django.db.models.functions import Coalesce
 
 from base.models import AppSettings, Order, Table
