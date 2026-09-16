@@ -284,3 +284,29 @@ def supplier_ledger(request, supplier_id):
         source_reference=request.GET.get('source_reference'),
     )
     return JsonResponse(result, status=status_code)
+
+
+@require_http_methods(['GET'])
+@backoffice_required
+def supplier_purchases(request, supplier_id):
+    """Supplier purchases paid through expenses (Safe, Bank or till) for this supplier."""
+    if denied := permission_denied_response(request, 'stock.supplier.view'):
+        return denied
+    try:
+        page = positive_int(request.GET, 'page', 1)
+        per_page = positive_int(request.GET, 'per_page', 25, maximum=100)
+        date_from = iso_date(request.GET, 'date_from')
+        date_to = iso_date(request.GET, 'date_to')
+    except QueryValidationError as exc:
+        return JsonResponse({
+            'success': False,
+            'code': 'FILTER_VALIDATION_ERROR',
+            'message': 'One or more filters are invalid.',
+            'errors': exc.errors,
+        }, status=422)
+    from hr.services.expense_supplier_service import ExpenseSupplierService
+    result, status_code = ExpenseSupplierService.purchases(
+        supplier_id, actor=request.user, date_from=date_from, date_to=date_to,
+        page=page, per_page=per_page,
+    )
+    return JsonResponse(result, status=status_code)

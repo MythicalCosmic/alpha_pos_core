@@ -12,6 +12,7 @@ from base.security.permissions import (
     user_has_permission,
 )
 from hr.services import ExpenseCategoryService, ExpenseService
+from hr.services.expense_supplier_service import ExpenseSupplierService
 from base.models import AuditLog
 from hr.views.filters import (
     query_bool,
@@ -162,6 +163,8 @@ def expenses(request):
         date_from=date_from,
         date_to=date_to,
         search=query_value(request, 'search'),
+        supplier_purchases=query_value(request, 'supplier_purchases'),
+        supplier_id=query_int(request, 'supplier_id'),
         actor=request.user,
         view_all=view_all,
     )
@@ -310,4 +313,34 @@ def expense_stats(request):
     if denied := permission_denied_response(request, 'expense.request.view_all'):
         return denied
     result, status = ExpenseService.get_stats(actor=request.user)
+    return JsonResponse(result, status=status)
+
+
+@csrf_exempt
+@require_POST
+@backoffice_required
+def expense_supplier_links(request):
+    """Link supplier-purchase expenses to a supplier, or remove the links."""
+    for permission in ('expense.category.manage', 'stock.supplier.view'):
+        if denied := permission_denied_response(request, permission):
+            return denied
+    data, error = parse_json_body(request)
+    if error:
+        return json_response(error)
+    unknown = sorted(set(data) - {'action', 'expense_ids', 'supplier_id', 'note', 'dry_run'})
+    if unknown:
+        return json_response(ServiceResponse.validation_error({field: ['Unknown field.'] for field in unknown}))
+    action = data.get('action', 'link')
+    if action == 'unlink':
+        result, status = ExpenseSupplierService.unlink(expense_ids=data.get('expense_ids'), actor=request.user)
+    elif action == 'link':
+        result, status = ExpenseSupplierService.link(
+            expense_ids=data.get('expense_ids'),
+            supplier_id=data.get('supplier_id'),
+            note=data.get('note', ''),
+            dry_run=data.get('dry_run', False),
+            actor=request.user,
+        )
+    else:
+        result, status = ServiceResponse.validation_error({'action': ['Use link or unlink.']})
     return JsonResponse(result, status=status)

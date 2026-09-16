@@ -89,6 +89,7 @@ urlpatterns = [
          supplier_views.supplier_payment_reverse,
          name='supplier-payment-reverse'),
     path('suppliers/<int:supplier_id>/ledger/', supplier_views.supplier_ledger, name='supplier-ledger'),
+    path('suppliers/<int:supplier_id>/purchases/', supplier_views.supplier_purchases, name='supplier-purchases'),
 
     # Purchase Orders
     path('purchase-orders/', purchase_views.purchase_orders, name='po-list'),

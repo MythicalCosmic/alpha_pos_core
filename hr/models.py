@@ -403,6 +403,35 @@ class Expense(SyncMixin, models.Model):
         return f"Expense #{self.id} - {self.amount} ({self.status})"
 
 
+class ExpenseSupplierLink(models.Model):
+    """Attributes a supplier purchase recorded as an expense to its supplier.
+
+    Cloud-side bookkeeping only (not synced): the expense keeps its money
+    movement and profit effect, while the supplier page lists it as a paid
+    purchase and the Expenses page can leave it out.
+    """
+    expense = models.OneToOneField(
+        Expense, on_delete=models.CASCADE, related_name='supplier_link',
+    )
+    supplier = models.ForeignKey(
+        'stock.Supplier', on_delete=models.PROTECT, related_name='expense_links',
+    )
+    branch_id = models.CharField(max_length=50, db_index=True)
+    note = models.TextField(blank=True, default='')
+    linked_by = models.ForeignKey(
+        'base.User', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='expense_supplier_links',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [models.Index(fields=['branch_id', 'supplier'])]
+
+    def __str__(self):
+        return f"Expense {self.expense_id} -> supplier {self.supplier_id}"
+
+
 class ExpenseTransition(SyncMixin, models.Model):
     expense = models.ForeignKey(
         Expense, on_delete=models.PROTECT, related_name='transitions',

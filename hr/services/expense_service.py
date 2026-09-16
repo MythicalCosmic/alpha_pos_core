@@ -19,6 +19,7 @@ from base.money import (
 )
 from base.services.branch_scope import resolve_actor_branch
 from hr.models import Expense, ExpenseCategory, ExpenseTransition
+from hr.services.expense_supplier_service import supplier_data
 
 
 def _actor_snapshot(actor):
@@ -256,6 +257,7 @@ class ExpenseService:
             'uuid': str(expense.uuid),
             'category': category,
             'category_id': expense.category_id,
+            'supplier': supplier_data(expense),
             'category_code_snapshot': expense.category_code_snapshot,
             'category_name_snapshot': expense.category_name_snapshot,
             'category_parent_code_snapshot': (
@@ -341,7 +343,7 @@ class ExpenseService:
             'category', 'created_by', 'approved_by', 'paid_by',
             'canceled_by', 'voided_by', 'subject_user',
             'treasury_transaction', 'treasury_reversal',
-            'cashbox_payment',
+            'cashbox_payment', 'supplier_link__supplier',
         )
 
     @classmethod
@@ -359,6 +361,8 @@ class ExpenseService:
         date_from=None,
         date_to=None,
         search=None,
+        supplier_purchases=None,
+        supplier_id=None,
         *,
         actor=None,
         view_all=False,
@@ -423,6 +427,18 @@ class ExpenseService:
                     'source_account': ['Must be DRAWER, SAFE, or BANK.'],
                 })
             queryset = queryset.filter(requested_source=normalized_source)
+        if supplier_purchases:
+            mode = str(supplier_purchases).strip().lower()
+            if mode == 'exclude':
+                queryset = queryset.filter(supplier_link__isnull=True)
+            elif mode == 'only':
+                queryset = queryset.filter(supplier_link__isnull=False)
+            else:
+                return ServiceResponse.validation_error({
+                    'supplier_purchases': ['Use exclude or only.'],
+                })
+        if supplier_id is not None:
+            queryset = queryset.filter(supplier_link__supplier_id=supplier_id)
         if date_from:
             queryset = queryset.filter(expense_date__gte=date_from)
         if date_to:
