@@ -556,7 +556,18 @@ def changes(request):
     # Advancing past that would skip another model's still-pending rows.
     next_since = None
 
+    # Models added to the cloud after the tills' release. A till fails the whole
+    # page closed when the feed names a model it does not know
+    # ("unsupported nonempty model"), which stops every pull until it is
+    # upgraded. Hold these back until the tills ship them; they are cloud-side
+    # workflow records that no till reads.
+    hidden_from_branches = set(
+        getattr(settings, 'SYNC_MODELS_HIDDEN_FROM_BRANCHES', ()) or ()
+    )
+
     for name in SYNC_ORDER:
+        if name in hidden_from_branches:
+            continue
         model_class = models.get(name)
         if not model_class:
             continue

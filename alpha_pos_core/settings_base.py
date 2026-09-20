@@ -403,6 +403,19 @@ SYNC_MAX_QUEUE_ATTEMPTS = 25
 ALLOWED_BRANCH_TOKENS = [
     t.strip() for t in os.environ.get('ALLOWED_BRANCH_TOKENS', '').split(',') if t.strip()
 ]
+# Models the cloud must not put in a branch change feed yet. A till rejects a
+# whole feed page that names a model its release does not know, so a cloud
+# upgrade that adds a synced model silently stops every till's pull until the
+# tills catch up. List those names here (comma separated) and drop them once
+# the tills ship the model.
+SYNC_MODELS_HIDDEN_FROM_BRANCHES = [
+    m.strip() for m in os.environ.get(
+        'SYNC_MODELS_HIDDEN_FROM_BRANCHES',
+        'attendanceadjustmentrequest,attendanceexcuse,employeeworkschedule,'
+        'expensetransition,purchasereceivingcorrection,stockadjustmentrequest',
+    ).split(',') if m.strip()
+]
+
 ALLOWED_BRANCH_IDS = [
     b.strip() for b in os.environ.get('ALLOWED_BRANCH_IDS', '').split(',') if b.strip()
 ]
