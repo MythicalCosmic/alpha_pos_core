@@ -156,6 +156,16 @@ if os.environ.get('DB_ENGINE'):
             'CONN_HEALTH_CHECKS': True,
         }
     }
+    # Opt-in connection pool (needs psycopg_pool). Under uvicorn each request
+    # runs in its own thread, so without a pool every API call opens and closes
+    # a PostgreSQL connection (~25 ms each). Unset or 0 keeps that behaviour.
+    _db_pool_max = int(os.environ.get('DB_POOL_MAX_SIZE', '0') or 0)
+    if _db_pool_max > 0:
+        DATABASES['default']['OPTIONS']['pool'] = {
+            'min_size': min(int(os.environ.get('DB_POOL_MIN_SIZE', '2') or 2), _db_pool_max),
+            'max_size': _db_pool_max,
+            'timeout': int(os.environ.get('DB_POOL_TIMEOUT', '10') or 10),
+        }
 else:
     DATABASES = {
         'default': {

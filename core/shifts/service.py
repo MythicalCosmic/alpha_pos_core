@@ -60,6 +60,12 @@ class _ShiftWindowIndex:
         limit = bisect_right(self._starts, timestamp) - 1
         if limit < 0:
             return None
+        # The answer is the right-most window at or before ``limit`` that is
+        # still open at ``timestamp``. Shifts rarely overlap, so the latest
+        # started window almost always contains it; only fall back to the tree
+        # search when it does not.
+        if self._ends[limit] is not None and self._ends[limit] > timestamp:
+            return self._shift_ids[limit]
 
         def rightmost(node, left, right):
             if left > limit:
@@ -2536,23 +2542,29 @@ class ShiftService:
             paid_cnt = defaultdict(int)
             revenue_acc = defaultdict(lambda: Decimal('0.00'))
             order_cnt = defaultdict(int)
-            money_rows = list(Order.objects.filter(
+            money_orders = Order.objects.filter(
                 is_deleted=False, cashier_id__in=cashier_ids, is_paid=True,
                 branch_id__in=branch_ids,
                 paid_at__gte=min_start, paid_at__lt=max_end,
-            ).values_list(
+            )
+            money_rows = list(money_orders.values_list(
                 'id', 'branch_id', 'cashier_id', 'paid_at',
                 'total_amount', 'payment_method', 'payment_action_id'))
+            # Child rows are fetched with the same filter as a subquery: a list
+            # of every paid order id made each lookup ship tens of thousands of
+            # parameters. Rows of orders outside money_rows are never read.
+            money_order_ids = money_orders.values('id')
             _ops = defaultdict(list)
+            _courier = {}
             if money_rows:
                 for _oid, _m, _a, _action, _line_index in OrderPayment.objects.filter(
-                        is_deleted=False, order_id__in=[r[0] for r in money_rows],
+                        is_deleted=False, order_id__in=money_order_ids,
                 ).values_list(
                     'order_id', 'method', 'amount',
                     'payment_action_id', 'line_index',
                 ):
                     _ops[_oid].append((_m, _a, _action, _line_index))
-            _courier = _courier_rows_by_order([r[0] for r in money_rows])
+                _courier = _courier_rows_by_order(money_order_ids)
             for (
                 oid, branch_id, cid, paid_at, amt, method, payment_action_id,
             ) in money_rows:

@@ -33,6 +33,7 @@ would absorb the defect invisibly.
 """
 import logging
 from decimal import Decimal
+from functools import lru_cache
 
 logger = logging.getLogger(__name__)
 
@@ -76,12 +77,29 @@ def configured_electronic_methods():
     )
 
 
-def concrete_payment_methods(electronic_methods=()):
+def _build_concrete_payment_methods(electronic_methods):
     return KNOWN_METHODS | {
         str(method).strip().upper()
         for method in electronic_methods
         if str(method).strip().upper() not in {CASH, 'MIXED'}
     }
+
+
+@lru_cache(maxsize=64)
+def _cached_concrete_payment_methods(electronic_methods):
+    return _build_concrete_payment_methods(electronic_methods)
+
+
+def concrete_payment_methods(electronic_methods=()):
+    # Called once per payment row in list and report passes, always with the
+    # same configured set. The result is an immutable frozenset, so hashable
+    # inputs (the configured frozenset, tuples) share one cached value.
+    if isinstance(electronic_methods, (frozenset, tuple)):
+        try:
+            return _cached_concrete_payment_methods(electronic_methods)
+        except TypeError:  # unhashable members
+            pass
+    return _build_concrete_payment_methods(electronic_methods)
 
 
 def settlement_payment_methods(electronic_methods=None):
@@ -405,11 +423,18 @@ def _courier_rows_by_order(order_ids):
     for historical rows created before that event existed; once its external_id
     has a canonical mirror, only the synced row is counted.
     """
-    if not order_ids:
-        return {}
+    from django.db.models import QuerySet
+
     from base.models import ExternalOrderPayment
 
-    ids = list(order_ids)
+    if isinstance(order_ids, QuerySet):
+        # A queryset is used as a subquery in both lookups below instead of
+        # shipping every id to the database twice.
+        ids = order_ids
+    else:
+        if not order_ids:
+            return {}
+        ids = list(order_ids)
     out = {}
     mirrored = set()
     for oid, method, amount, source_id in ExternalOrderPayment.objects.filter(
