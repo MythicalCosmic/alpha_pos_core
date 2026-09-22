@@ -1,4 +1,5 @@
 import logging
+import time
 from hashlib import sha256
 from decimal import Decimal
 from uuid import UUID
@@ -909,7 +910,35 @@ class CloudReceiver:
         model_label = model_class.__name__
         affected_order_ids = set()
         affected_record_uuids = set()
-        for record_data, rec_uuid in zip(records, submitted_uuids):
+        # Answer inside the sender's request timeout (30 s on the tills). A
+        # backlog batch of 500 orders takes over a minute; the till gave up,
+        # resent the same batch and never saw an acknowledgement. Records not
+        # reached in time are returned as retryable (no attempt is consumed)
+        # and arrive in the next round. The first record always applies.
+        budget = float(getattr(settings, 'SYNC_RECEIVE_TIME_BUDGET_SECONDS', 0) or 0)
+        started = time.monotonic()
+        for index, (record_data, rec_uuid) in enumerate(zip(records, submitted_uuids)):
+            if budget and index and time.monotonic() - started > budget:
+                pending = submitted_uuids[index:]
+                reason = (
+                    f'Not applied in this request: the {budget:g}s receive '
+                    'time budget was reached. Resend.'
+                )
+                for pending_uuid in pending:
+                    result['retryable_uuids'].append(pending_uuid)
+                    result['record_results'].append({
+                        'uuid': pending_uuid,
+                        'action': 'deferred',
+                        'disposition': 'retryable',
+                        'reason_code': 'RECEIVE_TIME_BUDGET',
+                        'reason': reason,
+                    })
+                result['errors'].append(f'{len(pending)} record(s) deferred: {reason}')
+                logger.info(
+                    'Receive time budget: %s applied %d of %d, deferred %d',
+                    model_label, index, len(records), len(pending),
+                )
+                break
             try:
                 if model_class._meta.label_lower == 'base.user':
                     apply_result = cls._create_or_update(

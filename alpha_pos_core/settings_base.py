@@ -404,6 +404,9 @@ SYNC_RETRY_INTERVAL = 60
 SYNC_TIMEOUT = 30
 SYNC_MAX_RETRIES = 5
 SYNC_BATCH_SIZE = 500
+# Cloud receiver: stop applying a pushed batch after this many seconds and
+# return the rest as retryable, so the answer beats the tills' 30 s timeout.
+SYNC_RECEIVE_TIME_BUDGET_SECONDS = float(os.environ.get('SYNC_RECEIVE_TIME_BUDGET_SECONDS', '12'))
 # After this many failed delivery attempts, a queued record is dead-lettered:
 # it stays in the table (visible via the queue/status endpoints) but is no
 # longer re-sent every cycle, so a permanently-rejected row can't spin forever.
