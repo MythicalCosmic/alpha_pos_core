@@ -4,19 +4,20 @@ net = base_amount + Σ bonuses − Σ deductions, recomputed whenever the base o
 child row changes. The scalar SalaryPayment.bonus/deduction are kept as the sums
 for back-compat with existing serializers/reports.
 """
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 
 from django.db import transaction
 from django.db.models import Sum
 
 from base.helpers.response import ServiceResponse
 from hr.models import SalaryPayment, SalaryBonus, SalaryDeduction
+from hr.services.salary_amounts import salary_amount
 
 
 def _to_dec(value):
     try:
-        return Decimal(str(value)).quantize(Decimal('0.01'))
-    except (InvalidOperation, TypeError, ValueError):
+        return salary_amount(value)
+    except ValueError:
         return None
 
 
@@ -26,12 +27,24 @@ class SalaryItemService:
     def _recompute(salary):
         b = salary.bonuses.filter(is_deleted=False).aggregate(s=Sum('amount'))['s'] or Decimal('0')
         d = salary.deductions.filter(is_deleted=False).aggregate(s=Sum('amount'))['s'] or Decimal('0')
-        salary.bonus = b
-        salary.deduction = d
-        salary.net_amount = (salary.base_amount or Decimal('0')) + b - d
+        salary.bonus = salary_amount(b)
+        salary.deduction = salary_amount(d)
+        salary.net_amount = salary_amount(
+            (salary.base_amount or Decimal('0')) + b - d, allow_negative=True,
+        )
         salary.save(update_fields=['bonus', 'deduction', 'net_amount',
                                    'synced_at', 'sync_version'])
         return salary
+
+    @classmethod
+    def _recompute_or_error(cls, salary):
+        try:
+            cls._recompute(salary)
+        except ValueError as exc:
+            # Undo the child/base change as well as the rejected aggregate.
+            transaction.set_rollback(True)
+            return ServiceResponse.validation_error(errors={'amount': str(exc)})
+        return None
 
     @classmethod
     def _locked(cls, salary_id):
@@ -50,7 +63,8 @@ class SalaryItemService:
         if amt is None or amt <= 0:
             return ServiceResponse.validation_error(errors={'amount': 'Must be > 0'})
         SalaryBonus.objects.create(salary=salary, amount=amt, reason=reason or '')
-        cls._recompute(salary)
+        if error := cls._recompute_or_error(salary):
+            return error
         return ServiceResponse.created(data={
             'net_amount': str(salary.net_amount), 'bonus_total': str(salary.bonus)})
 
@@ -66,7 +80,8 @@ class SalaryItemService:
         if amt is None or amt <= 0:
             return ServiceResponse.validation_error(errors={'amount': 'Must be > 0'})
         SalaryDeduction.objects.create(salary=salary, amount=amt, reason=reason or '')
-        cls._recompute(salary)
+        if error := cls._recompute_or_error(salary):
+            return error
         return ServiceResponse.created(data={
             'net_amount': str(salary.net_amount), 'deduction_total': str(salary.deduction)})
 
@@ -83,7 +98,8 @@ class SalaryItemService:
             return ServiceResponse.validation_error(errors={'amount': 'Must be >= 0'})
         salary.base_amount = amt
         salary.save(update_fields=['base_amount', 'synced_at', 'sync_version'])
-        cls._recompute(salary)
+        if error := cls._recompute_or_error(salary):
+            return error
         return ServiceResponse.success(data={'net_amount': str(salary.net_amount)})
 
     @classmethod
@@ -97,7 +113,8 @@ class SalaryItemService:
         row = SalaryBonus.objects.filter(id=bonus_id, salary=salary, is_deleted=False).first()
         if row:
             row.delete()  # SyncMixin soft-delete + tombstone
-        cls._recompute(salary)
+        if error := cls._recompute_or_error(salary):
+            return error
         return ServiceResponse.success(data={'net_amount': str(salary.net_amount)})
 
     @classmethod
@@ -111,7 +128,8 @@ class SalaryItemService:
         row = SalaryDeduction.objects.filter(id=deduction_id, salary=salary, is_deleted=False).first()
         if row:
             row.delete()
-        cls._recompute(salary)
+        if error := cls._recompute_or_error(salary):
+            return error
         return ServiceResponse.success(data={'net_amount': str(salary.net_amount)})
 
     @staticmethod
