@@ -7,6 +7,7 @@ from django.utils import timezone
 from base.helpers.response import ServiceResponse
 from hr.models import SalaryPayment
 from hr.repositories import SalaryPaymentRepository, EmployeeRepository
+from hr.services.salary_amounts import salary_amount
 
 
 def _pagination_data(page_obj, paginator):
@@ -175,26 +176,13 @@ class SalaryService:
                 errors={"period": f"Salary record already exists for {period_year}/{period_month}"},
             )
 
-        if base_amount is None:
-            base_amount = employee.base_salary
-        else:
-            base_amount = Decimal(str(base_amount))
-
-        bonus = Decimal(str(bonus))
-        deduction = Decimal(str(deduction))
-        # All three components must be non-negative. A negative `deduction`
-        # would inflate `net_amount = base + bonus - deduction` and let an
-        # admin (or anyone with salary.create) drain the cash drawer at
-        # pay-time. Same logic for negative bonus or base.
-        if base_amount < 0 or bonus < 0 or deduction < 0:
-            return ServiceResponse.validation_error(
-                errors={
-                    'base_amount': 'must be non-negative' if base_amount < 0 else None,
-                    'bonus': 'must be non-negative' if bonus < 0 else None,
-                    'deduction': 'must be non-negative' if deduction < 0 else None,
-                },
-            )
-        net_amount = base_amount + bonus - deduction
+        try:
+            base_amount = salary_amount(employee.base_salary if base_amount is None else base_amount)
+            bonus = salary_amount(bonus)
+            deduction = salary_amount(deduction)
+            net_amount = salary_amount(base_amount + bonus - deduction, allow_negative=True)
+        except ValueError as exc:
+            return ServiceResponse.validation_error(errors={'amount': str(exc)})
 
         salary = SalaryPaymentRepository.create(
             employee_id=employee_id,
@@ -293,7 +281,7 @@ class SalaryService:
     @classmethod
     @transaction.atomic
     def update(cls, salary_id: int, **kwargs) -> Tuple[Dict[str, Any], int]:
-        salary = SalaryPaymentRepository.get_with_relations(salary_id)
+        salary = SalaryPaymentRepository.get_for_update(salary_id)
         if not salary:
             return ServiceResponse.not_found(
                 f"Salary payment with id {salary_id} not found"
@@ -309,19 +297,22 @@ class SalaryService:
             if field in kwargs:
                 value = kwargs[field]
                 if field in ["base_amount", "bonus", "deduction"]:
-                    value = Decimal(str(value))
-                    # Same invariant as create(): non-negative. Without this,
-                    # PATCH /salaries/<id> {"deduction":"-100000"} inflates
-                    # net_amount and drains the cash register on pay.
-                    if value < 0:
+                    try:
+                        value = salary_amount(value)
+                    except ValueError as exc:
                         return ServiceResponse.validation_error(
-                            errors={field: 'must be non-negative'},
+                            errors={field: str(exc)},
                         )
                 setattr(salary, field, value)
                 update_fields.append(field)
 
         if any(f in kwargs for f in ["base_amount", "bonus", "deduction"]):
-            salary.net_amount = salary.base_amount + salary.bonus - salary.deduction
+            try:
+                salary.net_amount = salary_amount(
+                    salary.base_amount + salary.bonus - salary.deduction, allow_negative=True,
+                )
+            except ValueError as exc:
+                return ServiceResponse.validation_error(errors={'net_amount': str(exc)})
             if "net_amount" not in update_fields:
                 update_fields.append("net_amount")
 
@@ -337,7 +328,7 @@ class SalaryService:
     @classmethod
     @transaction.atomic
     def delete(cls, salary_id: int) -> Tuple[Dict[str, Any], int]:
-        salary = SalaryPaymentRepository.get_by_id(salary_id)
+        salary = SalaryPaymentRepository.get_for_update(salary_id)
         if not salary:
             return ServiceResponse.not_found(
                 f"Salary payment with id {salary_id} not found"
@@ -386,12 +377,12 @@ class SalaryService:
                     year: int,
                     month: int,
                     approved_by_id: int) -> Tuple[Dict[str, Any], int]:
-        pending = SalaryPayment.objects.filter(
+        pending = SalaryPayment.objects.select_for_update().filter(
             period_year=year,
             period_month=month,
             status=SalaryPayment.Status.PENDING,
             is_deleted=False,
-        )
+        ).order_by('pk')
 
         # Iterate and save() per row instead of bulk .update(), otherwise
         # SyncMixin's save() is bypassed: sync_version isn't bumped and
