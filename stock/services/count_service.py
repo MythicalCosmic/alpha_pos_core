@@ -10,7 +10,7 @@ from stock.models import (
     StockCount, StockCountItem, VarianceReasonCode,
     StockLevel
 )
-from stock.services.base_service import to_decimal, round_decimal, generate_number
+from stock.services.base_service import to_decimal, round_decimal, generate_number, validated_quantity
 from stock.repositories import (
     StockCountRepository, StockCountItemRepository,
     VarianceReasonCodeRepository, StockLocationRepository, StockCategoryRepository,
@@ -203,7 +203,7 @@ class StockCountService:
         }
 
         if include_items:
-            items = count.items.select_related(
+            items = count.items.filter(is_deleted=False).select_related(
                 "stock_item", "batch", "reason_code"
             ).order_by("stock_item__name")
 
@@ -244,9 +244,12 @@ class StockCountService:
              status: str = None,
              count_type: str = None,
              date_from: date = None,
-             date_to: date = None) -> Tuple[Dict[str, Any], int]:
+             date_to: date = None,
+             branch_id: str = None) -> Tuple[Dict[str, Any], int]:
         queryset = StockCountRepository.get_all().select_related("location", "category_filter")
 
+        if branch_id:
+            queryset = queryset.filter(branch_id=branch_id)
         if location_id:
             queryset = queryset.filter(location_id=location_id)
 
@@ -306,12 +309,17 @@ class StockCountService:
                category_id: int = None,
                auto_adjust: bool = False,
                notes: str = "",
-               include_zero_stock: bool = True) -> Tuple[Dict[str, Any], int]:
-        location = StockLocationRepository.get_by_id(location_id)
+               include_zero_stock: bool = True,
+               branch_id: str = None) -> Tuple[Dict[str, Any], int]:
+        location = StockLocationRepository.get_for_update(location_id)
         if not location:
             return ServiceResponse.not_found(f"Location with id {location_id} not found")
         if not location.is_active:
             return ServiceResponse.error("Location is not active")
+        if branch_id and location.branch_id != branch_id:
+            return ServiceResponse.forbidden('Count location is outside the authorized branch')
+        if not isinstance(auto_adjust, bool) or not isinstance(include_zero_stock, bool):
+            return ServiceResponse.validation_error({'auto_adjust': 'Count flags must be JSON booleans'})
 
         # Validate count type
         valid_types = [c[0] for c in StockCount.CountType.choices]
@@ -349,6 +357,7 @@ class StockCountService:
             counted_by_id=counted_by_id,
             auto_adjust=auto_adjust,
             notes=notes,
+            branch_id=location.branch_id,
         )
 
         items_created = cls._populate_count_items(count, include_zero_stock)
@@ -381,6 +390,9 @@ class StockCountService:
                 batches = StockBatchRepository.get_available(
                     stock_item_id=level.stock_item_id,
                     location_id=count.location_id,
+                    # Expired stock still exists physically and must remain
+                    # visible to counts even though it cannot be consumed.
+                    include_expired=True,
                 )
 
                 for batch in batches:
@@ -404,7 +416,7 @@ class StockCountService:
     @classmethod
     @transaction.atomic
     def start(cls, count_id: int) -> Tuple[Dict[str, Any], int]:
-        count = StockCountRepository.get_by_id(count_id)
+        count = StockCountRepository.get_for_update(count_id)
         if not count:
             return ServiceResponse.not_found(f"Stock count with id {count_id} not found")
 
@@ -427,23 +439,21 @@ class StockCountService:
                      counted_quantity: Decimal,
                      reason_code_id: int = None,
                      notes: str = "") -> Tuple[Dict[str, Any], int]:
-        count = StockCountRepository.get_by_id(count_id)
+        count = StockCountRepository.get_for_update(count_id)
         if not count:
             return ServiceResponse.not_found(f"Stock count with id {count_id} not found")
 
         if count.status not in ["DRAFT", "IN_PROGRESS"]:
             return ServiceResponse.error(f"Cannot record counts for {count.status} count")
 
-        item = StockCountItemRepository.get_by_id(item_id)
+        item = StockCountItemRepository.get_for_update(item_id)
         if not item or item.stock_count_id != count.id:
             return ServiceResponse.not_found(f"Count item with id {item_id} not found")
 
-        if count.status == "DRAFT":
-            count.status = StockCount.Status.IN_PROGRESS
-            count.started_at = timezone.now()
-            count.save(update_fields=["status", "started_at", "updated_at"])
-
-        counted_quantity = to_decimal(counted_quantity)
+        try:
+            counted_quantity = validated_quantity(counted_quantity, allow_zero=True)
+        except ValueError as exc:
+            return ServiceResponse.validation_error({'counted_quantity': str(exc)})
 
         variance = counted_quantity - item.system_quantity
         variance_percentage = Decimal("0")
@@ -461,6 +471,11 @@ class StockCountService:
             if not reason_code.is_active:
                 return ServiceResponse.error("Reason code is not active")
 
+        if count.status == "DRAFT":
+            count.status = StockCount.Status.IN_PROGRESS
+            count.started_at = timezone.now()
+            count.save(update_fields=["status", "started_at", "updated_at"])
+
         item.counted_quantity = counted_quantity
         item.variance = variance
         item.variance_percentage = round_decimal(variance_percentage, 2)
@@ -476,14 +491,14 @@ class StockCountService:
     @classmethod
     @transaction.atomic
     def complete(cls, count_id: int) -> Tuple[Dict[str, Any], int]:
-        count = StockCountRepository.get_by_id(count_id)
+        count = StockCountRepository.get_for_update(count_id)
         if not count:
             return ServiceResponse.not_found(f"Stock count with id {count_id} not found")
 
         if count.status != "IN_PROGRESS":
             return ServiceResponse.error("Can only complete IN_PROGRESS counts")
 
-        uncounted = count.items.filter(counted_quantity__isnull=True).count()
+        uncounted = count.items.filter(is_deleted=False).filter(counted_quantity__isnull=True).count()
         if uncounted > 0:
             return ServiceResponse.error(f"{uncounted} item(s) not yet counted")
 
@@ -508,7 +523,9 @@ class StockCountService:
     @classmethod
     @transaction.atomic
     def approve(cls, count_id: int, approved_by_id: int, apply_adjustments: bool = True) -> Tuple[Dict[str, Any], int]:
-        count = StockCountRepository.get_by_id(count_id)
+        if not isinstance(apply_adjustments, bool):
+            return ServiceResponse.validation_error({'apply_adjustments': 'Use a JSON boolean'})
+        count = StockCountRepository.get_for_update(count_id)
         if not count:
             return ServiceResponse.not_found(f"Stock count with id {count_id} not found")
 
@@ -543,7 +560,7 @@ class StockCountService:
         # Every counted item is reconciled (not only those whose snapshot variance
         # was non-zero): a snapshot variance of zero can still be wrong now if the
         # live level drifted after the snapshot was taken.
-        items = count.items.filter(counted_quantity__isnull=False).select_related(
+        items = count.items.filter(is_deleted=False).filter(counted_quantity__isnull=False).select_related(
             "stock_item", "batch"
         )
 
@@ -608,7 +625,7 @@ class StockCountService:
 
         levels = StockLevel.objects.filter(
             location=count.location,
-            stock_item__in=count.items.values("stock_item")
+            stock_item__in=count.items.filter(is_deleted=False).values("stock_item")
         )
         counted_at = timezone.now()
         for level in levels.select_for_update():
@@ -618,7 +635,7 @@ class StockCountService:
     @classmethod
     @transaction.atomic
     def cancel(cls, count_id: int, reason: str = "") -> Tuple[Dict[str, Any], int]:
-        count = StockCountRepository.get_by_id(count_id)
+        count = StockCountRepository.get_for_update(count_id)
         if not count:
             return ServiceResponse.not_found(f"Stock count with id {count_id} not found")
 

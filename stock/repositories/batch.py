@@ -1,4 +1,5 @@
 from django.utils import timezone
+from django.db.models import Q
 from datetime import timedelta
 from base.repositories.base import BaseSyncRepository
 from stock.models import StockBatch
@@ -37,14 +38,19 @@ class StockBatchRepository(BaseSyncRepository):
         ).select_related('stock_item', 'location').order_by('-created_at')
 
     @classmethod
-    def get_available(cls, stock_item_id, location_id):
-        return cls.model.objects.filter(
+    def get_available(cls, stock_item_id, location_id, *, include_expired=False):
+        queryset = cls.model.objects.filter(
             stock_item_id=stock_item_id,
             location_id=location_id,
             current_quantity__gt=0,
             status='AVAILABLE',
             is_deleted=False,
-        ).select_related('stock_item', 'location')
+        )
+        if not include_expired:
+            queryset = queryset.filter(
+                Q(expiry_date__isnull=True) | Q(expiry_date__gte=timezone.localdate())
+            )
+        return queryset.select_related('stock_item', 'location')
 
     @classmethod
     def get_available_fifo(cls, stock_item_id, location_id):

@@ -1,3 +1,5 @@
+from stock.views.scope import stock_branch_required
+from stock.models import StockCount
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods, require_GET, require_POST
@@ -10,6 +12,7 @@ from stock.services import StockCountService, VarianceReasonCodeService
 @csrf_exempt
 @require_http_methods(["GET", "POST"])
 @admin_required
+@stock_branch_required()
 def stock_counts(request):
     if request.method == "GET":
         result, status = StockCountService.list(
@@ -18,6 +21,7 @@ def stock_counts(request):
             status=request.GET.get("status"),
             location_id=safe_int(request, "location_id"),
             count_type=request.GET.get("type"),
+            branch_id=request.stock_branch_id,
         )
         return JsonResponse(result, status=status)
 
@@ -28,6 +32,7 @@ def stock_counts(request):
     # The acting user is always the authenticated admin — never trust a
     # client-supplied counted_by_id (actor spoofing + downstream approval
     # attribution).
+    data["branch_id"] = request.stock_branch_id
     data.pop("counted_by_id", None)
     result, status = StockCountService.create(**data, counted_by_id=request.user.id)
     return JsonResponse(result, status=status)
@@ -36,6 +41,7 @@ def stock_counts(request):
 @csrf_exempt
 @require_GET
 @admin_required
+@stock_branch_required(StockCount, "count_id")
 def stock_count_detail(request, count_id):
     result, status = StockCountService.get(count_id)
     return JsonResponse(result, status=status)
@@ -44,12 +50,16 @@ def stock_count_detail(request, count_id):
 @csrf_exempt
 @require_POST
 @admin_required
+@stock_branch_required(StockCount, "count_id")
 def stock_count_action(request, count_id, action):
     data, error = parse_json_body(request)
     if error:
         return json_response(error)
 
     user_id = request.user.id
+    if (action in {"start", "complete"} and request.user.role != "ADMIN"
+            and request.stock_document.counted_by_id != user_id):
+        return JsonResponse({"success": False, "message": "Count is not assigned to you"}, status=403)
 
     if action == "start":
         result, status = StockCountService.start(count_id)
@@ -72,6 +82,7 @@ def stock_count_action(request, count_id, action):
 @csrf_exempt
 @require_POST
 @admin_required
+@stock_branch_required(StockCount, "count_id")
 def stock_count_record(request, count_id):
     data, error = parse_json_body(request)
     if error:

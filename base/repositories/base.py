@@ -53,6 +53,11 @@ class BaseRepository:
 
 
 class BaseSyncRepository(BaseRepository):
+    @classmethod
+    def get_for_update(cls, pk):
+        """Lock a live workflow header before inspecting or changing its state."""
+        return cls.model.objects.select_for_update().filter(pk=pk, is_deleted=False).first()
+
     @staticmethod
     def sync_update_queryset(queryset, **values):
         """Update a small synchronized set without bypassing SyncMixin.save().
