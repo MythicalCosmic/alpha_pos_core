@@ -9,7 +9,9 @@ from django.core.management.base import CommandError
 from django.utils import timezone
 
 
-pytestmark = pytest.mark.django_db
+# The command sets SERIALIZABLE before its first query; it must own the
+# transaction, not run inside pytest's already-active rollback wrapper.
+pytestmark = pytest.mark.django_db(transaction=True)
 
 
 def _datetime_text(value):
