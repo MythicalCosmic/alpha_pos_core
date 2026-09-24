@@ -1051,18 +1051,21 @@ class ExpenseService:
         if status >= 400:
             transaction.set_rollback(True)
             return result, status
-        return cls.pay(
+        result, status = cls.pay(
             expense_id,
             actor=actor,
             source_account=(
                 payload.get('source_account') or payload.get('requested_source')
             ),
-            fee_uzs=payload.get('fee_uzs', payload.get('fee', 0)),
+            fee_uzs=payload.get('fee_uzs', payload.get('fee')),
             fee_percent=payload.get('fee_percent'),
             note=payload.get('note', payload.get('description', '')),
             action_id=action_id,
             idempotency_key=idempotency_key,
         )
+        if status >= 400:
+            transaction.set_rollback(True)
+        return result, status
 
     @classmethod
     def mark_paid(cls, expense_id, paid_by_id, payment_method='CASH'):

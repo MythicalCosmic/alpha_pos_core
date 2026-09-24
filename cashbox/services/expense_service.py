@@ -196,6 +196,11 @@ class CashboxExpenseService:
         auth_error = _authorize_shift(shift, actor)
         if auth_error:
             return auth_error
+        if shift.status != Shift.Status.ACTIVE:
+            return ServiceResponse.conflict(
+                'DRAWER_SHIFT_CLOSED',
+                'A closed shift cannot receive a retroactive expense reversal.',
+            )
         register = CashRegisterRepository.get_or_create_current(
             shift.branch_id,
             for_update=True,

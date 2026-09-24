@@ -1417,6 +1417,17 @@ class CloudReceiver:
         if not uuid_val:
             raise ValueError('Record missing UUID')
 
+        from hr.services.expense_sync import branch_write_forbidden as expense_write_forbidden
+        expense_guarded = model_class._meta.label_lower in {'hr.expense', 'hr.expensetransition'}
+        expense_existing = (
+            model_class._base_manager.filter(uuid=uuid_val).first() if expense_guarded else None
+        )
+        if expense_guarded and expense_write_forbidden(model_class, data, existing=expense_existing):
+            return _rejected(
+                expense_existing, 'EXPENSE_COMMAND_REQUIRED',
+                'Canonical expense workflow and treasury records require an authorized expense command',
+            )
+
         # Invoice documents are created only by the atomic admin command.
         # Reject stale terminal copies before resolving new invoice-only FKs.
         from stock.services.purchase_invoices.sync import branch_write_forbidden
@@ -1602,6 +1613,11 @@ class CloudReceiver:
             )
             try:
                 instance = model_class.objects.select_for_update().get(uuid=uuid_val)
+                if expense_guarded and expense_write_forbidden(model_class, data, existing=instance):
+                    return _rejected(
+                        instance, 'EXPENSE_COMMAND_REQUIRED',
+                        'Canonical expense workflow and treasury records require an authorized expense command',
+                    )
                 if invoice_guarded and branch_write_forbidden(model_class, data, existing=instance):
                     return _rejected(instance,
                                      'SUPPLIER_OPENING_COMMAND_REQUIRED' if model_class._meta.label_lower == 'stock.suppliertransaction' and not data.get('invoice_posting_id') else 'INVOICE_COMMAND_REQUIRED',
