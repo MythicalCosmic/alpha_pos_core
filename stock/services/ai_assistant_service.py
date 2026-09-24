@@ -1095,7 +1095,7 @@ class AIStockAssistant:
             item_weeks[sid]["weekly_values"].append(abs(float(row["week_qty"] or 0)))
 
         items = []
-        for sid, data in item_weeks.items():
+        for data in item_weeks.values():
             values = data["weekly_values"]
             while len(values) < num_weeks:
                 values.append(0)

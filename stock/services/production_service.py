@@ -10,7 +10,8 @@ from stock.models import (
     ProductionOrder, ProductionOrderIngredient, ProductionOrderOutput, ProductionOrderStep,
     Recipe, StockBatch, StockSettings
 )
-from stock.services.base_service import to_decimal, round_decimal, generate_number
+from stock.services.base_service import round_decimal, generate_number, validated_quantity
+from stock.services.conversions import UnitConversions
 from stock.repositories import (
     ProductionOrderRepository, ProductionOrderIngredientRepository,
     ProductionOrderOutputRepository, ProductionOrderStepRepository,
@@ -94,19 +95,19 @@ class ProductionOrderService:
         if include_ingredients:
             data["ingredients"] = [
                 ProductionOrderIngredientService.serialize(ing)
-                for ing in po.ingredients.select_related("stock_item", "unit")
+                for ing in po.ingredients.filter(is_deleted=False).select_related("stock_item", "unit")
             ]
 
         if include_outputs:
             data["outputs"] = [
                 ProductionOrderOutputService.serialize(out)
-                for out in po.outputs.select_related("stock_item", "unit")
+                for out in po.outputs.filter(is_deleted=False).select_related("stock_item", "unit")
             ]
 
         if include_steps:
             data["steps"] = [
                 ProductionOrderStepService.serialize(step)
-                for step in po.steps.select_related("recipe_step").order_by("recipe_step__step_number")
+                for step in po.steps.filter(is_deleted=False).select_related("recipe_step").order_by("recipe_step__step_number")
             ]
 
         return data
@@ -236,7 +237,10 @@ class ProductionOrderService:
             "output_item", "output_unit", "production_location"
         ).get(id=recipe_id)
 
-        batch_multiplier = to_decimal(batch_multiplier)
+        try:
+            batch_multiplier = validated_quantity(batch_multiplier)
+        except ValueError as exc:
+            return ServiceResponse.validation_error({'batch_multiplier': str(exc)})
 
         if recipe.min_batch_size and batch_multiplier < recipe.min_batch_size:
             return ServiceResponse.validation_error(
@@ -292,7 +296,7 @@ class ProductionOrderService:
             notes=notes,
         )
 
-        for recipe_ing in recipe.ingredients.select_related("stock_item", "unit"):
+        for recipe_ing in recipe.ingredients.filter(is_deleted=False).select_related("stock_item", "unit"):
             if recipe_ing.is_scalable:
                 planned_qty = recipe_ing.quantity * batch_multiplier
             else:
@@ -310,7 +314,7 @@ class ProductionOrderService:
                 status=ProductionOrderIngredient.IngredientStatus.PENDING,
             )
 
-        for recipe_step in recipe.steps.all():
+        for recipe_step in recipe.steps.filter(is_deleted=False):
             ProductionOrderStepRepository.create(
                 production_order=po,
                 recipe_step=recipe_step,
@@ -334,7 +338,7 @@ class ProductionOrderService:
     @classmethod
     @transaction.atomic
     def plan(cls, po_id: int, planned_start: int = None) -> Tuple[Dict[str, Any], int]:
-        po = ProductionOrderRepository.get_by_id(po_id)
+        po = ProductionOrderRepository.get_for_update(po_id)
         if not po:
             return ServiceResponse.not_found(f"Production order with id {po_id} not found")
 
@@ -365,7 +369,7 @@ class ProductionOrderService:
     @classmethod
     @transaction.atomic
     def start(cls, po_id: int, user_id: int = None) -> Tuple[Dict[str, Any], int]:
-        po = ProductionOrderRepository.get_by_id(po_id)
+        po = ProductionOrderRepository.get_for_update(po_id)
         if not po:
             return ServiceResponse.not_found(f"Production order with id {po_id} not found")
 
@@ -388,19 +392,23 @@ class ProductionOrderService:
         }, message="Production started")
 
     @classmethod
+    @transaction.atomic
     def complete(cls, po_id: int,
                  actual_output_qty: Decimal,
                  user_id: int,
                  quality_status: str = "PASSED",
                  notes: str = "") -> Tuple[Dict[str, Any], int]:
-        po = ProductionOrderRepository.get_by_id(po_id)
+        po = ProductionOrderRepository.get_for_update(po_id)
         if not po:
             return ServiceResponse.not_found(f"Production order with id {po_id} not found")
 
         if po.status != ProductionOrder.Status.IN_PROGRESS:
             return ServiceResponse.error(f"Cannot complete order in {po.status} status")
 
-        actual_output_qty = to_decimal(actual_output_qty)
+        try:
+            actual_output_qty = validated_quantity(actual_output_qty)
+        except ValueError as exc:
+            return ServiceResponse.validation_error({'actual_output_qty': str(exc)})
         if actual_output_qty <= 0:
             # Zero/negative output would create a zero-quantity batch (rejected
             # downstream) and a meaningless zero-cost PRODUCTION_IN. Reject up
@@ -441,19 +449,20 @@ class ProductionOrderService:
     @classmethod
     @transaction.atomic
     def cancel(cls, po_id: int, reason: str = "") -> Tuple[Dict[str, Any], int]:
-        po = ProductionOrderRepository.get_by_id(po_id)
+        po = ProductionOrderRepository.get_for_update(po_id)
         if not po:
             return ServiceResponse.not_found(f"Production order with id {po_id} not found")
 
         if po.status in [ProductionOrder.Status.COMPLETED, ProductionOrder.Status.CANCELED]:
             return ServiceResponse.error(f"Cannot cancel order in {po.status} status")
 
-        if po.status in [ProductionOrder.Status.PLANNED, ProductionOrder.Status.IN_PROGRESS]:
-            try:
-                cls._release_ingredients(po_id)
-            except _ProductionStepError as e:
-                transaction.set_rollback(True)
-                return e.result, e.status
+        # Allocations also survive ON_HOLD and may exist on auto-allocated
+        # drafts. The ingredient ledger, not the header status, owns them.
+        try:
+            cls._release_ingredients(po_id)
+        except _ProductionStepError as e:
+            transaction.set_rollback(True)
+            return e.result, e.status
 
         po.status = ProductionOrder.Status.CANCELED
         if reason:
@@ -468,7 +477,7 @@ class ProductionOrderService:
     @classmethod
     @transaction.atomic
     def hold(cls, po_id: int, reason: str = "") -> Tuple[Dict[str, Any], int]:
-        po = ProductionOrderRepository.get_by_id(po_id)
+        po = ProductionOrderRepository.get_for_update(po_id)
         if not po:
             return ServiceResponse.not_found(f"Production order with id {po_id} not found")
 
@@ -488,7 +497,7 @@ class ProductionOrderService:
     @classmethod
     @transaction.atomic
     def resume(cls, po_id: int) -> Tuple[Dict[str, Any], int]:
-        po = ProductionOrderRepository.get_by_id(po_id)
+        po = ProductionOrderRepository.get_for_update(po_id)
         if not po:
             return ServiceResponse.not_found(f"Production order with id {po_id} not found")
 
@@ -516,9 +525,17 @@ class ProductionOrderService:
         availability = []
         all_available = True
 
-        for ing in po.ingredients.select_related("stock_item", "unit"):
+        ingredients = list(po.ingredients.filter(is_deleted=False).select_related('stock_item__base_unit', 'unit'))
+        conversions = UnitConversions.for_ingredients(ingredients)
+        required_by_item = {}
+        for ing in ingredients:
+            if ing.status != ProductionOrderIngredient.IngredientStatus.ALLOCATED:
+                required_by_item[ing.stock_item_id] = required_by_item.get(ing.stock_item_id, Decimal('0')) + conversions.convert(
+                    ing.stock_item_id, ing.planned_quantity, ing.unit_id,
+                )
+        for ing in ingredients:
             available = StockLevelService.get_available(ing.stock_item_id, po.source_location_id)
-            required = ing.planned_quantity
+            required = required_by_item.get(ing.stock_item_id, Decimal('0'))
 
             is_available = available >= required
             if not is_available:
@@ -547,11 +564,14 @@ class ProductionOrderService:
 
         from .level_service import StockLevelService
 
-        for ing in po.ingredients.filter(status=ProductionOrderIngredient.IngredientStatus.PENDING):
+        ingredients = list(po.ingredients.filter(is_deleted=False, status=ProductionOrderIngredient.IngredientStatus.PENDING)
+                           .select_related('stock_item__base_unit', 'unit').order_by('stock_item_id', 'id'))
+        conversions = UnitConversions.for_ingredients(ingredients)
+        for ing in ingredients:
             result, status = StockLevelService.reserve(
                 stock_item_id=ing.stock_item_id,
                 location_id=po.source_location_id,
-                quantity=ing.planned_quantity,
+                quantity=conversions.convert(ing.stock_item_id, ing.planned_quantity, ing.unit_id),
                 user_id=po.created_by_id,
                 reference_type="ProductionOrder",
                 reference_id=po_id,
@@ -577,11 +597,14 @@ class ProductionOrderService:
 
         from .level_service import StockLevelService
 
-        for ing in po.ingredients.filter(status=ProductionOrderIngredient.IngredientStatus.ALLOCATED):
+        ingredients = list(po.ingredients.filter(is_deleted=False, status=ProductionOrderIngredient.IngredientStatus.ALLOCATED)
+                           .select_related('stock_item__base_unit', 'unit').order_by('stock_item_id', 'id'))
+        conversions = UnitConversions.for_ingredients(ingredients)
+        for ing in ingredients:
             result, status = StockLevelService.release_reservation(
                 stock_item_id=ing.stock_item_id,
                 location_id=po.source_location_id,
-                quantity=ing.planned_quantity,
+                quantity=conversions.convert(ing.stock_item_id, ing.planned_quantity, ing.unit_id),
                 user_id=po.created_by_id,
                 notes=f"Released from cancelled production: {po.order_number}"
             )
@@ -608,8 +631,13 @@ class ProductionOrderService:
 
         from .level_service import StockLevelService
 
-        for ing in po.ingredients.select_related("stock_item"):
-            actual_qty = ing.actual_quantity or ing.planned_quantity
+        ingredients = list(po.ingredients.filter(is_deleted=False).select_related('stock_item__base_unit', 'unit')
+                           .order_by('stock_item_id', 'id'))
+        conversions = UnitConversions.for_ingredients(ingredients)
+        for ing in ingredients:
+            actual_qty = conversions.convert(ing.stock_item_id,
+                ing.actual_quantity if ing.actual_quantity is not None else ing.planned_quantity,
+                ing.unit_id)
 
             # Release any reservation _allocate_ingredients created before
             # we deduct quantity. Without this, reserved_quantity climbs
@@ -620,7 +648,7 @@ class ProductionOrderService:
                 rel_result, rel_status = StockLevelService.release_reservation(
                     stock_item_id=ing.stock_item_id,
                     location_id=po.source_location_id,
-                    quantity=ing.planned_quantity,
+                    quantity=conversions.convert(ing.stock_item_id, ing.planned_quantity, ing.unit_id),
                     user_id=user_id,
                     notes=f"Released for consumption: {po.order_number}",
                 )
@@ -629,6 +657,11 @@ class ProductionOrderService:
                 if rel_status >= 400:
                     raise _ProductionStepError(rel_result, rel_status)
 
+            if actual_qty == 0:
+                ing.status = ProductionOrderIngredient.IngredientStatus.CONSUMED
+                ing.variance = -ing.planned_quantity
+                ing.save(update_fields=['status', 'variance'])
+                continue
             if settings.track_batches or ing.stock_item.track_batches:
                 from .batch_service import StockBatchService
                 result, status = StockBatchService.auto_consume(
@@ -676,11 +709,17 @@ class ProductionOrderService:
 
         settings = StockSettings.load()
 
+        ingredients = list(po.ingredients.filter(is_deleted=False).select_related('stock_item__base_unit', 'unit'))
+        conversions = UnitConversions.for_ingredients(ingredients)
         total_cost = sum(
-            (ing.actual_quantity or ing.planned_quantity) * ing.stock_item.avg_cost_price
-            for ing in po.ingredients.select_related("stock_item")
+            conversions.convert(ing.stock_item_id,
+                ing.actual_quantity if ing.actual_quantity is not None else ing.planned_quantity,
+                ing.unit_id) * ing.stock_item.avg_cost_price
+            for ing in ingredients
         )
-        unit_cost = total_cost / quantity if quantity > 0 else Decimal("0")
+        output_conversions = UnitConversions([po.recipe.output_item], [po.output_unit])
+        base_quantity = output_conversions.convert(po.recipe.output_item_id, quantity, po.output_unit_id)
+        unit_cost = total_cost / base_quantity if base_quantity > 0 else Decimal('0')
 
         batch = None
         if settings.track_batches or po.recipe.output_item.track_batches:
@@ -688,7 +727,7 @@ class ProductionOrderService:
             batch_result, batch_status = StockBatchService.create(
                 stock_item_id=po.recipe.output_item_id,
                 location_id=po.output_location_id,
-                quantity=quantity,
+                quantity=base_quantity,
                 unit_cost=unit_cost,
                 production_order_id=po_id,
                 quality_status=quality_status,
@@ -701,7 +740,7 @@ class ProductionOrderService:
         result, status = StockLevelService.adjust(
             stock_item_id=po.recipe.output_item_id,
             location_id=po.output_location_id,
-            quantity=quantity,
+            quantity=base_quantity,
             movement_type="PRODUCTION_IN",
             user_id=user_id,
             batch_id=batch.id if batch else None,
@@ -722,7 +761,7 @@ class ProductionOrderService:
             quality_status=quality_status,
         )
 
-        for bp in po.recipe.by_products.select_related("stock_item", "unit"):
+        for bp in po.recipe.by_products.filter(is_deleted=False).select_related("stock_item", "unit"):
             bp_qty = bp.expected_quantity * po.batch_multiplier
 
             ProductionOrderOutputRepository.create(
@@ -740,6 +779,7 @@ class ProductionOrderService:
                     stock_item_id=bp.stock_item_id,
                     location_id=po.output_location_id,
                     quantity=bp_qty,
+                    unit_id=bp.unit_id,
                     movement_type="PRODUCTION_IN",
                     user_id=user_id,
                     production_order_id=po_id,
@@ -818,14 +858,24 @@ class ProductionOrderStepService:
         }
 
     @classmethod
-    @transaction.atomic
-    def start(cls, step_id: int) -> Tuple[Dict[str, Any], int]:
+    def _locked_step(cls, step_id):
         step = ProductionOrderStepRepository.get_by_id(step_id)
         if not step:
-            return ServiceResponse.not_found(f"Step with id {step_id} not found")
+            return None
+        parent = ProductionOrderRepository.get_for_update(step.production_order_id)
+        if not parent:
+            return None
+        step = ProductionOrderStepRepository.get_for_update(step_id)
+        if step:
+            step.production_order = parent
+        return step
 
-        # Need production_order relation
-        step = ProductionOrderStep.objects.select_related("production_order").get(id=step_id)
+    @classmethod
+    @transaction.atomic
+    def start(cls, step_id: int) -> Tuple[Dict[str, Any], int]:
+        step = cls._locked_step(step_id)
+        if not step:
+            return ServiceResponse.not_found(f"Step with id {step_id} not found")
 
         if step.production_order.status != ProductionOrder.Status.IN_PROGRESS:
             return ServiceResponse.error("Production must be in progress")
@@ -847,12 +897,14 @@ class ProductionOrderStepService:
                  completed_by_id: int,
                  checkpoint_passed: bool = None,
                  notes: str = "") -> Tuple[Dict[str, Any], int]:
-        step = ProductionOrderStepRepository.get_by_id(step_id)
+        step = cls._locked_step(step_id)
         if not step:
             return ServiceResponse.not_found(f"Step with id {step_id} not found")
 
-        # Need production_order and recipe_step relations
-        step = ProductionOrderStep.objects.select_related("production_order", "recipe_step").get(id=step_id)
+        if step.production_order.status != ProductionOrder.Status.IN_PROGRESS:
+            return ServiceResponse.error("Production must be in progress")
+        if checkpoint_passed is not None and not isinstance(checkpoint_passed, bool):
+            return ServiceResponse.validation_error({'checkpoint_passed': 'Use a JSON boolean'})
 
         if step.status not in [ProductionOrderStep.StepStatus.PENDING, ProductionOrderStep.StepStatus.IN_PROGRESS]:
             return ServiceResponse.error(f"Cannot complete step in {step.status} status")
@@ -880,12 +932,14 @@ class ProductionOrderStepService:
     @classmethod
     @transaction.atomic
     def skip(cls, step_id: int, reason: str = "") -> Tuple[Dict[str, Any], int]:
-        step = ProductionOrderStepRepository.get_by_id(step_id)
+        step = cls._locked_step(step_id)
         if not step:
             return ServiceResponse.not_found(f"Step with id {step_id} not found")
 
-        # Need recipe_step relation
-        step = ProductionOrderStep.objects.select_related("recipe_step").get(id=step_id)
+        if step.production_order.status != ProductionOrder.Status.IN_PROGRESS:
+            return ServiceResponse.error("Production must be in progress")
+        if step.status not in [ProductionOrderStep.StepStatus.PENDING, ProductionOrderStep.StepStatus.IN_PROGRESS]:
+            return ServiceResponse.error(f"Cannot skip step in {step.status} status")
 
         if step.recipe_step.is_checkpoint:
             return ServiceResponse.error("Cannot skip checkpoint steps")
