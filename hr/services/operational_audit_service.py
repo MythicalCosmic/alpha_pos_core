@@ -467,7 +467,7 @@ class AttendanceOperations:
     @classmethod
     @transaction.atomic
     def review_adjustment(cls, request_id, actor, approve, note):
-        row = AttendanceAdjustmentRequest.objects.select_for_update().select_related(
+        row = AttendanceAdjustmentRequest.objects.select_for_update(of=('self', 'attendance')).select_related(
             'attendance__employee__user', 'requested_by', 'reviewed_by',
         ).filter(id=request_id, is_deleted=False).first()
         if not row:
@@ -550,7 +550,7 @@ class AttendanceOperations:
     @classmethod
     @transaction.atomic
     def review_excuse(cls, excuse_id, payload, actor, approve):
-        row = AttendanceExcuse.objects.select_for_update().select_related(
+        row = AttendanceExcuse.objects.select_for_update(of=('self', 'attendance')).select_related(
             'attendance', 'submitted_by', 'reviewer',
         ).filter(id=excuse_id, is_deleted=False).first()
         if not row:
@@ -916,7 +916,7 @@ class DisciplineService:
     @classmethod
     @transaction.atomic
     def approve_case(cls, case_id, actor, note=''):
-        row = DisciplinaryCase.objects.select_for_update().select_related(
+        row = DisciplinaryCase.objects.select_for_update(of=('self',)).select_related(
             'employee__user', 'rule', 'created_by', 'reviewed_by',
             'attendance_excuse', 'salary_deduction',
         ).filter(id=case_id).first()
@@ -980,7 +980,7 @@ class DisciplineService:
     @staticmethod
     @transaction.atomic
     def reject_case(case_id, actor, reason):
-        row = DisciplinaryCase.objects.select_for_update().select_related(
+        row = DisciplinaryCase.objects.select_for_update(of=('self',)).select_related(
             'employee__user', 'rule', 'created_by', 'reviewed_by',
         ).filter(id=case_id).first()
         if not row:
@@ -1005,7 +1005,7 @@ class DisciplineService:
     @staticmethod
     @transaction.atomic
     def void_case(case_id, actor, reason):
-        row = DisciplinaryCase.objects.select_for_update().select_related(
+        row = DisciplinaryCase.objects.select_for_update(of=('self',)).select_related(
             'employee__user', 'rule', 'created_by', 'reviewed_by', 'salary_deduction__salary',
         ).filter(id=case_id).first()
         if not row:
@@ -1187,10 +1187,10 @@ class PreparationAuditService:
     @staticmethod
     @transaction.atomic
     def review(audit_id, payload, actor):
-        row = PreparationAudit.objects.select_for_update().select_related('order__cashier').filter(id=audit_id).first()
+        row = PreparationAudit.objects.select_for_update(of=('self',)).select_related('order__cashier').filter(id=audit_id).first()
         if not row:
             return ServiceResponse.not_found('Preparation audit not found')
-        current = PreparationAuditReview.objects.select_for_update().select_related(
+        current = PreparationAuditReview.objects.select_for_update(of=('self',)).select_related(
             'category', 'reviewed_by',
         ).filter(preparation_audit=row, is_current=True).first()
         if current:
@@ -1238,7 +1238,7 @@ class PreparationAuditService:
     @staticmethod
     @transaction.atomic
     def reopen(audit_id, actor, reason):
-        row = PreparationAudit.objects.select_for_update().select_related('order__cashier').filter(id=audit_id).first()
+        row = PreparationAudit.objects.select_for_update(of=('self',)).select_related('order__cashier').filter(id=audit_id).first()
         if not row:
             return ServiceResponse.not_found('Preparation audit not found')
         reason = str(reason or '').strip()

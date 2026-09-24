@@ -172,8 +172,8 @@ def test_provider_partial_then_cancel_reverses_units_and_order_count_once():
 
     order, _payment = _paid_order()
     category = Category.objects.create(
-        name=f'Combined refund category {uuid4().hex}',
-        slug=f'combined-refund-category-{uuid4().hex}',
+        name=f'Refund {uuid4().hex}',
+        slug=f'refund-{uuid4().hex}',
     )
     product = Product.objects.create(
         name=f'Combined refund product {uuid4().hex}',

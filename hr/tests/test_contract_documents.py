@@ -91,6 +91,9 @@ def _pdf(name="contract.pdf", content=b"%PDF-1.4\ncontract\n%%EOF"):
     return SimpleUploadedFile(name, content, content_type="application/pdf")
 
 
+# Closing FileResponse emits request_finished and closes the DB connection.
+# Use real transactions so subsequent requests can reopen it safely.
+@pytest.mark.django_db(transaction=True)
 def test_admin_uploads_lists_reads_and_securely_downloads_file(
     admin_client, admin_user, contract, private_media
 ):
