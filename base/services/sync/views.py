@@ -576,7 +576,15 @@ def changes(request):
             # branch feeds, even when it belongs to a different branch.
             continue
 
+        # Serializers emit related UUIDs, not local integer FK values. Load
+        # forward relations once per page instead of once per row/FK.
+        relations = [
+            field.name for field in model_class._meta.concrete_fields
+            if field.many_to_one or field.one_to_one
+        ]
         base_qs = model_class.objects.all()
+        if relations:
+            base_qs = base_qs.select_related(*relations)
         # Scope before the page cap. Transactional/history/command rows are
         # branch-owned: deliver only to their target branch (an own-push echo
         # is harmless and idempotent), never to peer branches. Shared catalog
