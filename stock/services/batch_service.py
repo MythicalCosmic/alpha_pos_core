@@ -381,6 +381,9 @@ class StockBatchService:
         if not batch:
             return ServiceResponse.not_found(f"Batch with id {batch_id} not found")
 
+        if batch.status != StockBatch.BatchStatus.AVAILABLE or cls._is_expired(batch):
+            return ServiceResponse.error('Only available, unexpired batches can be consumed')
+
         quantity = abs(to_decimal(quantity))
         available = batch.current_quantity - batch.reserved_quantity
 
@@ -411,6 +414,7 @@ class StockBatchService:
             notes=notes
         )
         if status >= 400:
+            transaction.set_rollback(True)
             return result, status
 
         return ServiceResponse.success(data={

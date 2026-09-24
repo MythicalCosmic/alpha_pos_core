@@ -7,7 +7,8 @@ from django.utils import timezone
 
 from base.helpers.response import ServiceResponse
 from stock.models import StockTransfer, StockTransferItem, StockSettings, StockBatch
-from stock.services.base_service import to_decimal, generate_number
+from stock.services.base_service import generate_number, validated_quantity
+from stock.services.conversions import UnitConversions
 from stock.repositories import (
     StockTransferRepository, StockTransferItemRepository,
     StockItemRepository, StockLocationRepository,
@@ -73,9 +74,9 @@ class StockTransferService:
         if include_items:
             data["items"] = [
                 StockTransferItemService.serialize(item)
-                for item in transfer.items.select_related("stock_item", "unit", "batch")
+                for item in transfer.items.filter(is_deleted=False).select_related("stock_item", "unit", "batch")
             ]
-            data["item_count"] = transfer.items.count()
+            data["item_count"] = len(data["items"])
 
         return data
 
@@ -99,10 +100,14 @@ class StockTransferService:
              status: str = None,
              transfer_type: str = None,
              date_from: date = None,
-             date_to: date = None) -> Tuple[Dict[str, Any], int]:
+             date_to: date = None,
+             branch_id: str = None) -> Tuple[Dict[str, Any], int]:
         queryset = StockTransferRepository.get_all().select_related(
             "from_location", "to_location"
         )
+
+        if branch_id:
+            queryset = queryset.filter(branch_id=branch_id)
 
         if from_location_id:
             queryset = queryset.filter(from_location_id=from_location_id)
@@ -194,7 +199,8 @@ class StockTransferService:
                requested_by_id: int,
                transfer_type: str = "INTERNAL",
                notes: str = "",
-               items: List[Dict] = None) -> Tuple[Dict[str, Any], int]:
+               items: List[Dict] = None,
+               branch_id: str = None) -> Tuple[Dict[str, Any], int]:
 
         from_location = StockLocationRepository.get_by_id(from_location_id)
         if not from_location or not from_location.is_active:
@@ -204,7 +210,11 @@ class StockTransferService:
         if not to_location or not to_location.is_active:
             return ServiceResponse.not_found(f"To location with id {to_location_id} not found")
 
-        if from_location_id == to_location_id:
+        if branch_id and (from_location.branch_id != branch_id or to_location.branch_id != branch_id):
+            return ServiceResponse.forbidden('Transfer locations are outside the authorized branch')
+        if from_location.branch_id != to_location.branch_id:
+            return ServiceResponse.validation_error({'to_location_id': 'Locations must belong to the same branch'})
+        if from_location.pk == to_location.pk:
             return ServiceResponse.validation_error(
                 errors={"to_location_id": "Cannot transfer to same location"}
             )
@@ -225,9 +235,16 @@ class StockTransferService:
             transfer_type=transfer_type,
             requested_by_id=requested_by_id,
             notes=notes,
+            branch_id=from_location.branch_id,
         )
 
         if items:
+            if not isinstance(items, list) or any(
+                not isinstance(item, dict) or 'stock_item_id' not in item or 'quantity' not in item
+                for item in items
+            ):
+                transaction.set_rollback(True)
+                return ServiceResponse.validation_error({'items': 'Provide item objects with stock_item_id and quantity'})
             for item_data in items:
                 result, status = StockTransferItemService.add_item(
                     transfer_id=transfer.id,
@@ -237,6 +254,7 @@ class StockTransferService:
                     batch_id=item_data.get("batch_id"),
                 )
                 if status >= 400:
+                    transaction.set_rollback(True)
                     return result, status
 
         return ServiceResponse.success(data={
@@ -249,7 +267,7 @@ class StockTransferService:
     @classmethod
     @transaction.atomic
     def update(cls, transfer_id: int, **kwargs) -> Tuple[Dict[str, Any], int]:
-        transfer = StockTransferRepository.get_by_id(transfer_id)
+        transfer = StockTransferRepository.get_for_update(transfer_id)
         if not transfer:
             return ServiceResponse.not_found(f"Transfer with id {transfer_id} not found")
 
@@ -280,6 +298,15 @@ class StockTransferService:
             transfer.notes = kwargs["notes"]
             update_fields.append("notes")
 
+        if transfer.from_location_id == transfer.to_location_id:
+            return ServiceResponse.validation_error({'to_location_id': 'Cannot transfer to same location'})
+        if any(location.branch_id != transfer.branch_id
+               for location in (transfer.from_location, transfer.to_location)):
+            return ServiceResponse.forbidden('Transfer locations are outside the document branch')
+        if transfer.items.filter(is_deleted=False, batch__isnull=False).exclude(
+            batch__location_id=transfer.from_location_id,
+        ).exists():
+            return ServiceResponse.validation_error({'from_location_id': 'Existing batches belong to a different source'})
         transfer.save(update_fields=update_fields)
 
         return ServiceResponse.success(data={
@@ -290,14 +317,14 @@ class StockTransferService:
     @classmethod
     @transaction.atomic
     def request(cls, transfer_id: int) -> Tuple[Dict[str, Any], int]:
-        transfer = StockTransferRepository.get_by_id(transfer_id)
+        transfer = StockTransferRepository.get_for_update(transfer_id)
         if not transfer:
             return ServiceResponse.not_found(f"Transfer with id {transfer_id} not found")
 
         if transfer.status != "DRAFT":
             return ServiceResponse.error("Can only request DRAFT transfers")
 
-        if not transfer.items.exists():
+        if not transfer.items.filter(is_deleted=False).exists():
             return ServiceResponse.error("Cannot request empty transfer")
 
         transfer.status = StockTransfer.Status.REQUESTED
@@ -311,7 +338,7 @@ class StockTransferService:
     @classmethod
     @transaction.atomic
     def approve(cls, transfer_id: int, approved_by_id: int) -> Tuple[Dict[str, Any], int]:
-        transfer = StockTransferRepository.get_by_id(transfer_id)
+        transfer = StockTransferRepository.get_for_update(transfer_id)
         if not transfer:
             return ServiceResponse.not_found(f"Transfer with id {transfer_id} not found")
 
@@ -320,7 +347,18 @@ class StockTransferService:
         if transfer.status not in ["DRAFT", "REQUESTED"]:
             return ServiceResponse.error(f"Cannot approve {transfer.status} transfer")
 
-        for item in transfer.items.all():
+        items = list(transfer.items.filter(is_deleted=False).select_related(
+            'stock_item__base_unit', 'unit',
+        ).order_by('stock_item_id', 'id'))
+        if not items:
+            return ServiceResponse.error('Cannot approve empty transfer')
+        conversions = UnitConversions.for_ingredients(items)
+        required_by_item = {}
+        for item in items:
+            required_by_item[item.stock_item_id] = required_by_item.get(item.stock_item_id, Decimal('0')) + conversions.convert(
+                item.stock_item_id, item.requested_qty, item.unit_id,
+            )
+        for item_id, required in sorted(required_by_item.items()):
             # Lock the source StockLevel rows under the SAME row lock that
             # ship() acquires (via StockLevelService.adjust ->
             # get_or_create_level_for_update). Without the lock the availability
@@ -330,7 +368,7 @@ class StockTransferService:
             # cannot be combined with select_for_update.
             locked_levels = list(
                 StockLevelRepository.filter(
-                    stock_item_id=item.stock_item_id,
+                    stock_item_id=item_id,
                     location=transfer.from_location,
                 ).select_for_update()
             )
@@ -341,12 +379,13 @@ class StockTransferService:
                 (lvl.available_quantity for lvl in locked_levels), Decimal("0")
             )
 
-            if item.requested_qty > available and not settings.allow_negative_stock:
+            if required > available and not settings.allow_negative_stock:
                 return ServiceResponse.error(
-                    f"Insufficient stock for {item.stock_item.name}: "
-                    f"required {item.requested_qty}, available {available}"
+                    f"Insufficient stock for item {item_id}: "
+                    f"required {required}, available {available}"
                 )
 
+        for item in items:
             item.approved_qty = item.requested_qty
             item.save(update_fields=["approved_qty"])
 
@@ -365,7 +404,7 @@ class StockTransferService:
     @transaction.atomic
     def ship(cls, transfer_id: int, shipped_by_id: int) -> Tuple[Dict[str, Any], int]:
         """Ship transfer (deduct from source location)"""
-        transfer = StockTransferRepository.get_by_id(transfer_id)
+        transfer = StockTransferRepository.get_for_update(transfer_id)
         if not transfer:
             return ServiceResponse.not_found(f"Transfer with id {transfer_id} not found")
 
@@ -374,8 +413,13 @@ class StockTransferService:
 
         from .level_service import StockLevelService
 
-        for item in transfer.items.select_related("stock_item", "unit", "batch"):
-            qty = item.approved_qty or item.requested_qty
+        items = list(transfer.items.filter(is_deleted=False).select_related(
+            'stock_item__base_unit', 'unit', 'batch',
+        ).order_by('stock_item_id', 'id'))
+        conversions = UnitConversions.for_ingredients(items)
+        for item in items:
+            qty = item.approved_qty if item.approved_qty is not None else item.requested_qty
+            base_qty = conversions.convert(item.stock_item_id, qty, item.unit_id)
 
             # Batch-tracked leg: debit the specific source batch so its
             # current_quantity stays in lockstep with the location level.
@@ -389,13 +433,13 @@ class StockTransferService:
                         f"Batch {item.batch_id} not found for transfer item {item.id}"
                     )
                 batch_available = batch.current_quantity - batch.reserved_quantity
-                if qty > batch_available:
+                if base_qty > batch_available:
                     transaction.set_rollback(True)
                     return ServiceResponse.error(
                         f"Insufficient quantity in batch {batch.batch_number}: "
-                        f"requested {qty}, available {batch_available}"
+                        f"requested {base_qty}, available {batch_available}"
                     )
-                batch.current_quantity -= qty
+                batch.current_quantity -= base_qty
                 if batch.current_quantity <= 0:
                     batch.status = StockBatch.BatchStatus.CONSUMED
                 batch.save(update_fields=["current_quantity", "status", "updated_at"])
@@ -404,6 +448,7 @@ class StockTransferService:
                 stock_item_id=item.stock_item_id,
                 location_id=transfer.from_location_id,
                 quantity=-qty,
+                unit_id=item.unit_id,
                 movement_type="TRANSFER_OUT",
                 user_id=shipped_by_id,
                 batch_id=item.batch_id,
@@ -430,7 +475,7 @@ class StockTransferService:
     @transaction.atomic
     def receive(cls, transfer_id: int, received_by_id: int,
                 received_quantities: Dict[int, Decimal] = None) -> Tuple[Dict[str, Any], int]:
-        transfer = StockTransferRepository.get_by_id(transfer_id)
+        transfer = StockTransferRepository.get_for_update(transfer_id)
         if not transfer:
             return ServiceResponse.not_found(f"Transfer with id {transfer_id} not found")
 
@@ -440,12 +485,30 @@ class StockTransferService:
         from .level_service import StockLevelService
         from .batch_service import StockBatchService
 
-        for item in transfer.items.select_related("stock_item", "unit", "batch"):
-            shipped = item.shipped_qty or item.approved_qty or item.requested_qty
-            if received_quantities and item.id in received_quantities:
-                qty = to_decimal(received_quantities[item.id])
-            else:
-                qty = shipped
+        items = list(transfer.items.filter(is_deleted=False).select_related(
+            'stock_item__base_unit', 'unit', 'batch',
+        ).order_by('stock_item_id', 'id'))
+        supplied = {} if received_quantities is None else received_quantities
+        if not isinstance(supplied, dict):
+            return ServiceResponse.validation_error({'received_quantities': 'Must be an object keyed by item ID'})
+        supplied = {str(key): value for key, value in supplied.items()}
+        if set(supplied) - {str(item.pk) for item in items}:
+            return ServiceResponse.validation_error({'received_quantities': 'Contains unknown transfer items'})
+        quantities = {}
+        for item in items:
+            shipped = item.shipped_qty
+            try:
+                qty = validated_quantity(supplied.get(str(item.pk), shipped), allow_zero=True)
+            except ValueError as exc:
+                return ServiceResponse.validation_error({f'item_{item.pk}': str(exc)})
+            if shipped is None or qty > shipped:
+                return ServiceResponse.validation_error({f'item_{item.pk}': 'Received quantity exceeds shipped quantity'})
+            quantities[item.pk] = qty
+        conversions = UnitConversions.for_ingredients(items)
+        for item in items:
+            shipped = item.shipped_qty
+            qty = quantities[item.pk]
+            base_qty = conversions.convert(item.stock_item_id, qty, item.unit_id)
 
             # Refuse impossible receipts. Without this guard, a caller can
             # claim to receive more than was shipped — fabricating stock at
@@ -470,7 +533,7 @@ class StockTransferService:
                 created, cstatus = StockBatchService.create(
                     stock_item_id=item.stock_item_id,
                     location_id=transfer.to_location_id,
-                    quantity=qty,
+                    quantity=base_qty,
                     unit_cost=src.unit_cost if src else None,
                     manufactured_date=src.manufactured_date if src else None,
                     expiry_date=src.expiry_date if src else None,
@@ -487,6 +550,7 @@ class StockTransferService:
                 stock_item_id=item.stock_item_id,
                 location_id=transfer.to_location_id,
                 quantity=qty,
+                unit_id=item.unit_id,
                 movement_type="TRANSFER_IN",
                 user_id=received_by_id,
                 batch_id=dest_batch_id,
@@ -516,7 +580,7 @@ class StockTransferService:
     @classmethod
     @transaction.atomic
     def cancel(cls, transfer_id: int, reason: str = "") -> Tuple[Dict[str, Any], int]:
-        transfer = StockTransferRepository.get_by_id(transfer_id)
+        transfer = StockTransferRepository.get_for_update(transfer_id)
         if not transfer:
             return ServiceResponse.not_found(f"Transfer with id {transfer_id} not found")
 
@@ -526,13 +590,30 @@ class StockTransferService:
         if transfer.status == "IN_TRANSIT":
             from .level_service import StockLevelService
 
-            for item in transfer.items.select_related("stock_item"):
-                qty = item.shipped_qty or item.approved_qty or item.requested_qty
+            items = list(transfer.items.filter(is_deleted=False).select_related(
+                'stock_item__base_unit', 'unit',
+            ).order_by('stock_item_id', 'id'))
+            conversions = UnitConversions.for_ingredients(items)
+            for item in items:
+                qty = item.shipped_qty
+                if item.batch_id:
+                    batch = StockBatchRepository.get_for_update(item.batch_id)
+                    if batch is None:
+                        transaction.set_rollback(True)
+                        return ServiceResponse.not_found('Source batch not found')
+                    batch.current_quantity += conversions.convert(item.stock_item_id, qty, item.unit_id)
+                    if batch.status == StockBatch.BatchStatus.CONSUMED:
+                        batch.status = (StockBatch.BatchStatus.EXPIRED
+                                        if batch.expiry_date and batch.expiry_date < timezone.localdate()
+                                        else StockBatch.BatchStatus.AVAILABLE)
+                    batch.save(update_fields=['current_quantity', 'status', 'updated_at'])
 
                 result, status = StockLevelService.adjust(
                     stock_item_id=item.stock_item_id,
                     location_id=transfer.from_location_id,
                     quantity=qty,
+                    unit_id=item.unit_id,
+                    batch_id=item.batch_id,
                     movement_type="TRANSFER_IN",
                     user_id=transfer.shipped_by_id or transfer.requested_by_id,
                     transfer_id=transfer.id,
@@ -561,12 +642,14 @@ class StockTransferService:
                        user_id: int,
                        unit_id: int = None,
                        batch_id: int = None,
-                       notes: str = "") -> Tuple[Dict[str, Any], int]:
+                       notes: str = "",
+                       branch_id: str = None) -> Tuple[Dict[str, Any], int]:
         result, status = cls.create(
             from_location_id=from_location_id,
             to_location_id=to_location_id,
             requested_by_id=user_id,
             notes=notes,
+            branch_id=branch_id,
             items=[{
                 "stock_item_id": stock_item_id,
                 "quantity": quantity,
@@ -575,20 +658,24 @@ class StockTransferService:
             }]
         )
         if status >= 400:
+            transaction.set_rollback(True)
             return result, status
 
         transfer_id = result["data"]["id"]
 
         result, status = cls.approve(transfer_id, user_id)
         if status >= 400:
+            transaction.set_rollback(True)
             return result, status
 
         result, status = cls.ship(transfer_id, user_id)
         if status >= 400:
+            transaction.set_rollback(True)
             return result, status
 
         result, status = cls.receive(transfer_id, user_id)
         if status >= 400:
+            transaction.set_rollback(True)
             return result, status
 
         return cls.get(transfer_id)
@@ -610,9 +697,9 @@ class StockTransferItemService:
             "batch_id": item.batch_id,
             "batch_number": item.batch.batch_number if item.batch else None,
             "requested_qty": str(item.requested_qty),
-            "approved_qty": str(item.approved_qty) if item.approved_qty else None,
-            "shipped_qty": str(item.shipped_qty) if item.shipped_qty else None,
-            "received_qty": str(item.received_qty) if item.received_qty else None,
+            "approved_qty": str(item.approved_qty) if item.approved_qty is not None else None,
+            "shipped_qty": str(item.shipped_qty) if item.shipped_qty is not None else None,
+            "received_qty": str(item.received_qty) if item.received_qty is not None else None,
             "unit_id": item.unit_id,
             "unit_short": item.unit.short_name,
             "variance_reason": item.variance_reason,
@@ -627,16 +714,22 @@ class StockTransferItemService:
                  unit_id: int = None,
                  batch_id: int = None) -> Tuple[Dict[str, Any], int]:
 
-        transfer = StockTransferRepository.get_by_id(transfer_id)
+        transfer = StockTransferRepository.get_for_update(transfer_id)
         if not transfer:
             return ServiceResponse.not_found(f"Transfer with id {transfer_id} not found")
 
         if transfer.status not in ["DRAFT", "REQUESTED"]:
             return ServiceResponse.error("Cannot add items to approved/shipped transfer")
 
+        try:
+            requested_qty = validated_quantity(requested_qty)
+        except ValueError as exc:
+            return ServiceResponse.validation_error({'requested_qty': str(exc)})
         stock_item = StockItemRepository.get_by_id(stock_item_id)
         if not stock_item:
             return ServiceResponse.not_found(f"Stock item with id {stock_item_id} not found")
+        if stock_item.branch_id != transfer.from_location.branch_id:
+            return ServiceResponse.forbidden('Stock item is outside the transfer branch')
 
         if unit_id:
             unit = StockUnitRepository.get_by_id(unit_id)
@@ -662,7 +755,12 @@ class StockTransferItemService:
         )
 
         if existing:
-            existing.requested_qty += to_decimal(requested_qty)
+            if existing.unit_id != unit.pk:
+                return ServiceResponse.validation_error({'unit_id': 'Use the existing transfer line unit'})
+            try:
+                existing.requested_qty = validated_quantity(existing.requested_qty + requested_qty)
+            except ValueError as exc:
+                return ServiceResponse.validation_error({'requested_qty': str(exc)})
             existing.save(update_fields=["requested_qty"])
             return ServiceResponse.success(data={
                 "item": cls.serialize(existing)
@@ -672,8 +770,9 @@ class StockTransferItemService:
             transfer=transfer,
             stock_item=stock_item,
             batch=batch,
-            requested_qty=to_decimal(requested_qty),
+            requested_qty=requested_qty,
             unit=unit,
+            branch_id=transfer.branch_id,
         )
 
         return ServiceResponse.success(data={
@@ -688,11 +787,19 @@ class StockTransferItemService:
         if not item:
             return ServiceResponse.not_found(f"Transfer item with id {item_id} not found")
 
-        if item.transfer.status not in ["DRAFT", "REQUESTED"]:
+        transfer = StockTransferRepository.get_for_update(item.transfer_id)
+        item = StockTransferItemRepository.get_for_update(item_id)
+        if not transfer or not item:
+            return ServiceResponse.not_found("Transfer item not found")
+
+        if transfer.status not in ["DRAFT", "REQUESTED"]:
             return ServiceResponse.error("Cannot update items on approved/shipped transfer")
 
         if "requested_qty" in kwargs:
-            item.requested_qty = to_decimal(kwargs["requested_qty"])
+            try:
+                item.requested_qty = validated_quantity(kwargs['requested_qty'])
+            except ValueError as exc:
+                return ServiceResponse.validation_error({'requested_qty': str(exc)})
 
         item.save()
 
@@ -707,7 +814,12 @@ class StockTransferItemService:
         if not item:
             return ServiceResponse.not_found(f"Transfer item with id {item_id} not found")
 
-        if item.transfer.status not in ["DRAFT", "REQUESTED"]:
+        transfer = StockTransferRepository.get_for_update(item.transfer_id)
+        item = StockTransferItemRepository.get_for_update(item_id)
+        if not transfer or not item:
+            return ServiceResponse.not_found("Transfer item not found")
+
+        if transfer.status not in ["DRAFT", "REQUESTED"]:
             return ServiceResponse.error("Cannot remove items from approved/shipped transfer")
 
         item.delete()

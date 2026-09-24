@@ -1,3 +1,4 @@
+from stock.views.scope import stock_branch_required
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods, require_POST
@@ -11,6 +12,7 @@ from stock.services import StockTransferService, StockTransferItemService
 @csrf_exempt
 @require_http_methods(["GET", "POST"])
 @backoffice_required
+@stock_branch_required()
 def transfers(request):
     if request.method == "GET":
         if denied := permission_denied_response(request, 'stock.transfer.view'):
@@ -22,6 +24,7 @@ def transfers(request):
             from_location_id=safe_int(request, "from_location_id"),
             to_location_id=safe_int(request, "to_location_id"),
             transfer_type=request.GET.get("type"),
+            branch_id=request.stock_branch_id,
         )
         return JsonResponse(result, status=status)
 
@@ -31,6 +34,7 @@ def transfers(request):
     if error:
         return json_response(error)
 
+    data["branch_id"] = request.stock_branch_id
     data["requested_by_id"] = request.user.id
     result, status = StockTransferService.create(**data)
     return JsonResponse(result, status=status)
@@ -39,6 +43,7 @@ def transfers(request):
 @csrf_exempt
 @require_http_methods(["GET", "PUT"])
 @backoffice_required
+@stock_branch_required(StockTransfer, "transfer_id")
 def transfer_detail(request, transfer_id):
     if request.method == "GET":
         if denied := permission_denied_response(request, 'stock.transfer.view'):
@@ -64,6 +69,7 @@ def transfer_detail(request, transfer_id):
 @csrf_exempt
 @require_POST
 @backoffice_required
+@stock_branch_required(StockTransfer, "transfer_id")
 def transfer_action(request, transfer_id, action):
     data, error = parse_json_body(request)
     if error:
@@ -109,6 +115,7 @@ def transfer_action(request, transfer_id, action):
 @csrf_exempt
 @require_POST
 @backoffice_required
+@stock_branch_required(StockTransfer, "transfer_id")
 def transfer_items(request, transfer_id):
     if denied := permission_denied_response(request, 'stock.transfer.create'):
         return denied
@@ -128,6 +135,7 @@ def transfer_items(request, transfer_id):
 @csrf_exempt
 @require_POST
 @backoffice_required
+@stock_branch_required()
 def quick_transfer(request):
     if denied := permission_denied_response(request, 'stock.manage'):
         return denied
@@ -135,6 +143,7 @@ def quick_transfer(request):
     if error:
         return json_response(error)
 
+    data["branch_id"] = request.stock_branch_id
     data["user_id"] = request.user.id
     result, status = StockTransferService.quick_transfer(**data)
     return JsonResponse(result, status=status)

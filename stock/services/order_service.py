@@ -1,5 +1,6 @@
 from typing import Dict, Any, List, Tuple
 from decimal import Decimal
+from collections import defaultdict
 from django.db import transaction
 
 from base.helpers.response import ServiceResponse
@@ -193,24 +194,41 @@ class OrderStockService:
                 "existing_reversals": existing_reversals.count(),
             })
 
-        transactions = StockTransactionRepository.filter(
+        transactions = list(StockTransactionRepository.filter(
             order_id=order_id,
             movement_type="SALE_OUT"
-        )
+        ).order_by('stock_item_id', 'location_id', 'batch_id', 'id'))
 
-        if not transactions.exists():
+        if not transactions:
             return ServiceResponse.success(data={
                 "skipped": True,
                 "reason": "No stock transactions found for order"
             })
 
+        # Item reductions have already returned part of the original debit.
+        # Consume that credit against matching sale rows before canceling the
+        # remainder. Keep lot/location boundaries so one item's return cannot
+        # cancel another location's or batch's debit.
+        returned = defaultdict(lambda: Decimal('0'))
+        for credit in StockTransactionRepository.filter(
+            order_id=order_id, movement_type='RETURN_FROM_CUSTOMER',
+        ):
+            key = (credit.stock_item_id, credit.location_id,
+                   credit.batch_id, credit.order_item_id)
+            returned[key] += credit.base_quantity
         reversals = []
 
         for trans in transactions:
+            key = (trans.stock_item_id, trans.location_id, trans.batch_id, trans.order_item_id)
+            credited = min(trans.base_quantity, returned[key])
+            returned[key] -= credited
+            remaining = trans.base_quantity - credited
+            if remaining <= 0:
+                continue
             result, status = StockLevelService.adjust(
                 stock_item_id=trans.stock_item_id,
                 location_id=trans.location_id,
-                quantity=trans.base_quantity,
+                quantity=remaining,
                 movement_type="RETURN_FROM_CUSTOMER",
                 user_id=user_id,
                 batch_id=trans.batch_id,
@@ -233,7 +251,7 @@ class OrderStockService:
                 "original_transaction_id": trans.id,
                 "reversal_transaction_id": result.get("data", {}).get("transaction_id"),
                 "stock_item_id": trans.stock_item_id,
-                "quantity": str(trans.base_quantity)
+                "quantity": str(remaining)
             })
 
         return ServiceResponse.success(data={
